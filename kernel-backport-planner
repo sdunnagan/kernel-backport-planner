@@ -33,7 +33,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 HEX40_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 FIXES_RE = re.compile(r"(?im)^Fixes:\s*([0-9a-f]{7,40})\b")
@@ -877,8 +877,8 @@ class Planner:
         Kernel commits normally carry a lore Link: for the posted patch.  git
         send-email/b4 message IDs commonly encode the patch number as the last
         numeric hyphen-delimited component before the sender suffix.  We only
-        group commits when at least two commits in the upstream range normalize
-        to the same key; ambiguous one-offs are ignored.
+        group commits when at least two commits reachable from the upstream
+        target normalize to the same key; ambiguous one-offs are ignored.
         """
         identities: list[tuple[str, int]] = []
         for msgid in LINK_MSGID_RE.findall(body):
@@ -889,12 +889,61 @@ class Planner:
             identities.append((f"{prefix}-N-{suffix}".lower(), int(patch_no_s)))
         return identities
 
+    @staticmethod
+    def _series_search_term(key: str) -> str | None:
+        """Return a fixed-string grep term that narrows history to one series.
+
+        _series_identity() replaces the numeric patch component with ``-n-``.
+        The prefix before that marker is shared by all messages in a normal
+        git-send-email series and is specific enough to make git-log's message
+        grep cheap.  Exact identity matching is still done after the grep, so a
+        prefix collision cannot merge unrelated series.
+        """
+        prefix, marker, _suffix = key.partition("-n-")
+        if not marker or not prefix:
+            return None
+        return prefix + "-"
+
     def build_series_index(self) -> None:
         self.info("Indexing patch-series relationships...")
-        raw = self.git.run([
+
+        # Series discovery is selected-commit driven.  Dependency discovery can
+        # legitimately pull a prerequisite from at/before --base into
+        # self.nodes, so restricting this index to base..target would hide that
+        # commit's posted series.  Start with the Lore identities of selected
+        # commits, then use one grep-filtered walk of all history reachable from
+        # --target to find their peers.  This gets cross-base series context
+        # without scanning every commit message in the repository.
+        selected = set(self.nodes)
+        selected_keys: dict[str, dict[str, int]] = collections.defaultdict(dict)
+        for sha in selected:
+            for key, patch_no in self._series_identity(self.body(sha)):
+                selected_keys[key][sha] = patch_no
+
+        self.series_groups.clear()
+        for node in self.nodes.values():
+            node.series_ids.clear()
+
+        if not selected_keys:
+            self.info("  found 0 patch series touching selected commits")
+            return
+
+        search_terms = sorted({
+            term
+            for key in selected_keys
+            if (term := self._series_search_term(key)) is not None
+        })
+        if not search_terms:
+            self.info("  found 0 patch series touching selected commits")
+            return
+
+        cmd = [
             "log", "--reverse", "--no-merges", "--format=%H%x00%B%x00",
-            f"{self.base}..{self.target}",
-        ])
+            "--fixed-strings", "--regexp-ignore-case",
+        ]
+        cmd.extend(f"--grep={term}" for term in search_terms)
+        cmd.append(self.target)
+        raw = self.git.run(cmd)
 
         grouped: dict[str, dict[str, int]] = collections.defaultdict(dict)
         upstream_order: dict[str, int] = {}
@@ -905,9 +954,16 @@ class Planner:
             upstream_order[sha] = pos
             self._body_cache.setdefault(sha, body)
             for key, patch_no in self._series_identity(body):
-                grouped[key][sha] = patch_no
+                if key in selected_keys:
+                    grouped[key][sha] = patch_no
 
-        selected = set(self.nodes)
+        # Selected commits should have been returned by the target-history grep
+        # when they are reachable from --target.  Keep them explicitly anyway:
+        # this makes the index robust to unusual Link formatting/search quirks
+        # while still requiring at least one peer before reporting a series.
+        for key, members in selected_keys.items():
+            grouped[key].update(members)
+
         relevant: list[tuple[int, str, list[tuple[int, str]]]] = []
         for key, members_by_sha in grouped.items():
             if len(members_by_sha) < 2:
@@ -923,7 +979,6 @@ class Planner:
             relevant.append((first_selected_pos, key, members))
 
         relevant.sort(key=lambda item: (item[0], item[1]))
-        self.series_groups.clear()
         for idx, (_pos, _key, members) in enumerate(relevant, 1):
             label = f"S{idx:03d}"
             self.series_groups[label] = members
@@ -1008,7 +1063,7 @@ class Planner:
             for label, members in self.series_groups.items():
                 selected_count = sum(1 for _patch_no, sha in members if sha in self.nodes)
                 lines.append(
-                    f"{label}: {len(members)} commits in upstream range; "
+                    f"{label}: {len(members)} commits found through upstream target; "
                     f"{selected_count} selected by planner"
                 )
                 missing_peers = 0
