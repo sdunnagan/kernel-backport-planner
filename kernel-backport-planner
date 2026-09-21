@@ -33,7 +33,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.3.2"
+VERSION = "0.3.4"
 
 HEX40_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 FIXES_RE = re.compile(r"(?im)^Fixes:\s*([0-9a-f]{7,40})\b")
@@ -138,6 +138,7 @@ class CommitNode:
     direct: bool = False
     reasons: set[str] = dataclasses.field(default_factory=set)
     required_by: set[str] = dataclasses.field(default_factory=set)
+    triggered_by: set[str] = dataclasses.field(default_factory=set)
     match: Match = dataclasses.field(default_factory=Match)
     files: list[str] = dataclasses.field(default_factory=list)
     aliases: set[str] = dataclasses.field(default_factory=set)
@@ -148,10 +149,18 @@ class CommitNode:
     subject_hints: list[str] = dataclasses.field(default_factory=list)
     series_ids: set[str] = dataclasses.field(default_factory=set)
 
-    def add_reason(self, reason: str, parent: str | None = None) -> None:
+    def add_reason(
+        self, reason: str, parent: str | None = None, *, tentative: bool = False
+    ) -> None:
         self.reasons.add(reason)
-        if parent:
-            self.required_by.add(parent)
+        if not parent:
+            return
+        if tentative:
+            if parent not in self.required_by:
+                self.triggered_by.add(parent)
+            return
+        self.required_by.add(parent)
+        self.triggered_by.discard(parent)
 
 
 @dataclasses.dataclass
@@ -196,6 +205,9 @@ class Planner:
                 "use --downstream-ref for the actual base of the working branch"
             )
         self.replay_start = self.git.rev_parse("HEAD" if args.include_local else self.downstream_ref)
+        self.replay_start_source = "HEAD, --include-local" if args.include_local else self.downstream_ref
+        self.replay_rounds_run = 0
+        self.replay_final_verification = False
         self.paths = self._load_paths(args)
         self.nodes: dict[str, CommitNode] = {}
         self.downstream_index = DownstreamIndex()
@@ -360,8 +372,9 @@ class Planner:
                 return m
 
         # The downstream index is intentionally bounded to downstream commits
-        # not already reachable from --base.  For dependency candidates that
-        # may predate --base, explicitly recognize an exact shared ancestor so
+        # not already reachable from --base.  For discovered prerequisites or
+        # provenance candidates that may predate --base, explicitly recognize
+        # an exact shared ancestor so
         # old common history is not misreported as a missing prerequisite.
         # Direct focus candidates skip these extra Git ancestry probes.
         if check_ancestry:
@@ -400,8 +413,35 @@ class Planner:
             self.nodes[sha] = node
         node.direct = node.direct or direct
         if reason:
-            node.add_reason(reason, required_by)
+            node.add_reason(
+                reason, required_by, tentative=self.is_tentative_dependency_reason(reason)
+            )
         return node
+
+    def is_tentative_dependency_reason(self, reason: str) -> bool:
+        """Return true for context-only provenance evidence.
+
+        Nearby blame context can explain why a textual conflict exists, but it
+        does not by itself establish prerequisite semantics.  A larger context
+        score makes the lead more interesting; it never upgrades context-only
+        evidence into a selected dependency.
+        """
+        return bool(re.fullmatch(r"(?:conflict-)?hunk-context:\d+", reason))
+
+    @classmethod
+    def is_actionable_node(cls, node: CommitNode) -> bool:
+        """Return true when a node belongs to the proposed backport plan."""
+        return node.direct or cls.dependency_kind(node) == "dependency"
+
+    @staticmethod
+    def dependency_kind(node: CommitNode) -> str:
+        if node.direct:
+            return "direct"
+        if node.required_by:
+            return "dependency"
+        if node.triggered_by:
+            return "dependency-candidate"
+        return "dependency"
 
     def direct_candidates(self) -> list[str]:
         if not self.paths:
@@ -494,16 +534,28 @@ class Planner:
             # candidates, not proven prerequisites.
             for fixed in node.fixes:
                 if self.upstream_before(fixed, node.sha) and self.match(fixed, check_ancestry=True).status == "missing":
-                    if fixed not in self.nodes:
+                    before_kind = (
+                        self.dependency_kind(self.nodes[fixed])
+                        if fixed in self.nodes else None
+                    )
+                    dep_node = self.ensure_node(
+                        fixed, reason="Fixes-target", required_by=node.sha
+                    )
+                    if before_kind != "dependency" and self.dependency_kind(dep_node) == "dependency":
                         added += 1
-                    self.ensure_node(fixed, reason="Fixes-target", required_by=node.sha)
 
             # Also include later fixes to a commit we intend to introduce.
             for child in children.get(node.sha, set()):
                 if self.git.is_ancestor(child, self.target) and self.match(child).status == "missing":
-                    if child not in self.nodes:
+                    before_kind = (
+                        self.dependency_kind(self.nodes[child])
+                        if child in self.nodes else None
+                    )
+                    dep_node = self.ensure_node(
+                        child, reason="fixed-by", required_by=node.sha
+                    )
+                    if before_kind != "dependency" and self.dependency_kind(dep_node) == "dependency":
                         added += 1
-                    self.ensure_node(child, reason="fixed-by", required_by=node.sha)
         return added
 
     def parse_hunks(self, sha: str) -> list[DiffHunk]:
@@ -654,20 +706,33 @@ class Planner:
                     if dep == self.base or self.git.is_ancestor(dep, self.base):
                         continue
 
-                    # Auto-add strong direct provenance or repeated nearby
-                    # context. Weak one-line context is reported only when a
-                    # replay conflict points at the file.
-                    strong = reason == "hunk-preimage" or score >= self.args.context_score
-                    if not strong:
+                    # Direct hunk preimage is strong prerequisite evidence.
+                    # Nearby context, regardless of score, is only an
+                    # investigation lead.  Keep high-scoring static context as
+                    # a candidate for audit/debugging, but do not select it for
+                    # replay or recursively expand it.
+                    if reason == "hunk-context" and score < self.args.context_score:
                         continue
-                    if dep not in self.nodes:
+                    before_kind = (
+                        self.dependency_kind(self.nodes[dep])
+                        if dep in self.nodes else None
+                    )
+                    candidate = self.ensure_node(
+                        dep, reason=f"{reason}:{score}", required_by=node.sha
+                    )
+                    if before_kind != "dependency" and self.dependency_kind(candidate) == "dependency":
                         added += 1
-                    self.ensure_node(dep, reason=f"{reason}:{score}", required_by=node.sha)
             if self.args.symbol_deps:
                 for sym, dep in self.definition_dependencies(node.sha, self.extract_symbols(node.sha)).items():
-                    if dep not in self.nodes:
+                    before_kind = (
+                        self.dependency_kind(self.nodes[dep])
+                        if dep in self.nodes else None
+                    )
+                    dep_node = self.ensure_node(
+                        dep, reason=f"symbol:{sym}", required_by=node.sha
+                    )
+                    if before_kind != "dependency" and self.dependency_kind(dep_node) == "dependency":
                         added += 1
-                    self.ensure_node(dep, reason=f"symbol:{sym}", required_by=node.sha)
         return added
 
     def dependency_closure(self) -> None:
@@ -679,23 +744,27 @@ class Planner:
             frontier = [
                 node for sha, node in self.nodes.items()
                 if sha not in self._dependency_expanded
+                and self.is_actionable_node(node)
             ]
             if not frontier:
                 break
 
-            before = len(self.nodes)
-            self.add_explicit_fixes_closure(frontier)
-            self.add_static_dependencies(frontier)
+            before = sum(1 for n in self.nodes.values() if self.is_actionable_node(n))
+            added = self.add_explicit_fixes_closure(frontier)
+            added += self.add_static_dependencies(frontier)
             self._dependency_expanded.update(node.sha for node in frontier)
 
-            if len(self.nodes) == before:
+            if not added:
                 break
-            self.info(f"  dependency round {round_no}: {before} -> {len(self.nodes)} commits")
+            after = sum(1 for n in self.nodes.values() if self.is_actionable_node(n))
+            self.info(f"  dependency round {round_no}: {before} -> {after} selected commits")
 
     def ordered_missing(self) -> list[str]:
         selected = {
             sha for sha, n in self.nodes.items()
-            if n.match.status == "missing" and len(self.git.parents(sha)) == 1
+            if self.is_actionable_node(n)
+            and n.match.status == "missing"
+            and len(self.git.parents(sha)) == 1
         }
         if not selected:
             return []
@@ -728,6 +797,8 @@ class Planner:
             return
         self.info("Checking for later merge-resolution risk...")
         for node in self.nodes.values():
+            if not self.is_actionable_node(node):
+                continue
             if node.match.status == "present" or not node.files:
                 continue
             # Path-limited merge history is only a coarse first filter. Confirm
@@ -800,49 +871,88 @@ class Planner:
         finally:
             self._remove_worktree(root, wt)
 
-    def add_conflict_dependencies(self, conflicts: list[tuple[str, list[str]]]) -> int:
-        added = 0
+    def add_conflict_dependencies(
+        self, conflicts: list[tuple[str, list[str]]]
+    ) -> tuple[int, int]:
+        strong_added = 0
+        candidates_added = 0
         for sha, files in conflicts:
             deps = self.context_dependencies(sha, only_paths=set(files))
-            # Only add the strongest few missing provenance commits per
-            # conflicted candidate. This is intentionally bounded.
-            count = 0
+            # Inspect only the strongest few provenance commits per conflicted
+            # commit. Hunk preimage can select/promote a real dependency. Pure
+            # nearby context remains informational regardless of score.
+            considered = 0
             for dep, reason, score in deps:
-                if dep in self.nodes:
-                    continue
-                self.ensure_node(dep, reason=f"conflict-{reason}:{score}", required_by=sha)
-                added += 1
-                count += 1
-                if count >= self.args.max_conflict_deps:
+                if considered >= self.args.max_conflict_deps:
                     break
-        return added
+                considered += 1
+                existed = dep in self.nodes
+                before_kind = (self.dependency_kind(self.nodes[dep]) if existed else None)
+                node = self.ensure_node(
+                    dep, reason=f"conflict-{reason}:{score}", required_by=sha
+                )
+                after_kind = self.dependency_kind(node)
+                if before_kind != "dependency" and after_kind == "dependency":
+                    strong_added += 1
+                elif not existed and after_kind == "dependency-candidate":
+                    candidates_added += 1
+        return strong_added, candidates_added
+
+    def reset_replay_annotations(self) -> None:
+        for n in self.nodes.values():
+            n.replay = "not-run"
+            n.conflict_files = []
 
     def replay_with_discovery(self) -> None:
         if not self.args.simulate:
             return
         self.info("Dry-running the backport plan in a temporary worktree...")
+        needs_final_verification = False
         for round_no in range(1, self.args.max_replay_rounds + 1):
-            # Reset replay annotations each round.
-            for n in self.nodes.values():
-                n.replay = "not-run"
-                n.conflict_files = []
+            self.replay_rounds_run = round_no
+            self.reset_replay_annotations()
             ok, conflicts = self.replay_once()
             if ok:
                 self.info(f"  replay round {round_no}: clean")
                 return
             self.info(f"  replay round {round_no}: {len(conflicts)} conflicting commits")
-            added = self.add_conflict_dependencies(conflicts)
-            if not added:
+            strong_added, candidates_added = self.add_conflict_dependencies(conflicts)
+            if candidates_added:
+                self.info(
+                    f"  recorded {candidates_added} context-only dependency candidate(s)"
+                )
+            if not strong_added:
                 return
-            self.info(f"  added {added} context prerequisites from conflict provenance")
+            self.info(
+                f"  added/promoted {strong_added} strong prerequisite(s) from conflict provenance"
+            )
             self.dependency_closure()
+            needs_final_verification = round_no == self.args.max_replay_rounds
+
+        # If the final discovery round added commits, the replay annotations above
+        # describe the pre-discovery set. Run once more without discovering any
+        # further dependencies so the report reflects the complete printed set.
+        if needs_final_verification:
+            self.replay_final_verification = True
+            self.reset_replay_annotations()
+            ok, conflicts = self.replay_once()
+            if ok:
+                self.info("  final replay verification: clean")
+            else:
+                self.info(
+                    f"  final replay verification: {len(conflicts)} conflicting commits"
+                )
 
     def run_check_command(self) -> tuple[int, str] | None:
         if not self.args.check_command:
             return None
         # Recreate a fully-applied worktree. If replay still conflicts, don't
         # pretend a build check is meaningful.
-        if any(n.replay == "conflict" for n in self.nodes.values() if n.match.status == "missing"):
+        if any(
+            n.replay == "conflict"
+            for n in self.nodes.values()
+            if self.is_actionable_node(n) and n.match.status == "missing"
+        ):
             return (125, "not run because replay still has conflicts")
         root, wt = self._create_worktree()
         try:
@@ -914,7 +1024,10 @@ class Planner:
         # commits, then use one grep-filtered walk of all history reachable from
         # --target to find their peers.  This gets cross-base series context
         # without scanning every commit message in the repository.
-        selected = set(self.nodes)
+        selected = {
+            sha for sha, node in self.nodes.items()
+            if self.is_actionable_node(node)
+        }
         selected_keys: dict[str, dict[str, int]] = collections.defaultdict(dict)
         for sha in selected:
             for key, patch_no in self._series_identity(self.body(sha)):
@@ -983,7 +1096,7 @@ class Planner:
             label = f"S{idx:03d}"
             self.series_groups[label] = members
             for _patch_no, sha in members:
-                if sha in self.nodes:
+                if sha in selected:
                     self.nodes[sha].series_ids.add(label)
 
         self.info(f"  found {len(self.series_groups)} patch series touching selected commits")
@@ -1001,29 +1114,50 @@ class Planner:
 
     def report_text(self, check_result: tuple[int, str] | None = None) -> str:
         lines: list[str] = []
-        direct = sum(1 for n in self.nodes.values() if n.direct)
-        present = sum(1 for n in self.nodes.values() if n.match.status == "present")
-        missing = sum(1 for n in self.nodes.values() if n.match.status == "missing")
-        deps = len(self.nodes) - direct
-        lines.append(f"base:       {self.base[:12]}")
-        lines.append(f"target:     {self.target[:12]}")
-        lines.append(f"downstream: {self.downstream[:12]}")
-        lines.append(f"paths:      {', '.join(self.paths)}")
-        lines.append(f"candidates: {len(self.nodes)} ({direct} direct, {deps} dependency/context)")
-        lines.append(f"status:     {missing} missing, {present} already downstream")
+        actionable = [n for n in self.nodes.values() if self.is_actionable_node(n)]
+        direct = sum(1 for n in actionable if n.direct)
+        present = sum(1 for n in actionable if n.match.status == "present")
+        missing = sum(1 for n in actionable if n.match.status == "missing")
+        deps = sum(
+            1 for n in actionable
+            if not n.direct and self.dependency_kind(n) == "dependency"
+        )
+        tentative = sum(
+            1 for n in self.nodes.values()
+            if not n.direct and self.dependency_kind(n) == "dependency-candidate"
+        )
+        lines.append(f"base:         {self.base[:12]}")
+        lines.append(f"target:       {self.target[:12]}")
+        lines.append(f"downstream:   {self.downstream[:12]}")
+        lines.append(
+            f"replay-start: {self.replay_start[:12]} ({self.replay_start_source})"
+        )
+        lines.append(f"paths:        {', '.join(self.paths)}")
+        lines.append(
+            f"plan:         {len(actionable)} "
+            f"({direct} direct, {deps} dependency)"
+        )
+        if self.args.show_dependency_candidates:
+            lines.append(f"dependency-candidates: {tentative} informational")
+        lines.append(f"status:       {missing} missing, {present} already downstream")
         lines.append("")
 
         lines.append("BACKPORT PLAN (oldest first)")
         lines.append("=" * 80)
         for sha in self.ordered_missing():
             n = self.nodes[sha]
-            dependency = " [DEPENDENCY]" if not n.direct else ""
-            lines.append(f'{sha[:12]}{dependency} ("{n.subject}")')
+            if not self.is_actionable_node(n):
+                continue
+            kind = self.dependency_kind(n)
+            label = ""
+            if kind == "dependency":
+                label = " [DEPENDENCY]"
+            lines.append(f'{sha[:12]}{label} ("{n.subject}")')
 
             # Focus-path selection is the default and is therefore left
             # unmarked; only exceptional dependency commits are labeled.
             if n.reasons and n.reasons != {"focus-path"}:
-                lines.append(f"      reasons: {', '.join(sorted(n.reasons))}")
+                lines.append(f"      evidence: {', '.join(sorted(n.reasons))}")
             if n.series_ids:
                 lines.append(
                     "      same-series: "
@@ -1044,7 +1178,9 @@ class Planner:
                     )
 
             if n.required_by:
-                lines.append("      required-by: " + ", ".join(x[:12] for x in sorted(n.required_by)))
+                lines.append(
+                    "      required-by: " + ", ".join(x[:12] for x in sorted(n.required_by))
+                )
             if n.replay != "not-run":
                 extra = f" ({', '.join(n.conflict_files)})" if n.conflict_files else ""
                 lines.append(f"      replay: {n.replay}{extra}")
@@ -1054,6 +1190,26 @@ class Planner:
                 lines.append("      same-subject downstream hint (NOT proof): " +
                              ", ".join(x[:12] for x in n.subject_hints[:5]))
 
+        if self.args.show_dependency_candidates:
+            candidates = sorted(
+                (n for n in self.nodes.values()
+                 if self.dependency_kind(n) == "dependency-candidate"),
+                key=lambda n: n.sha,
+            )
+            if candidates:
+                lines.append("")
+                lines.append("DEPENDENCY CANDIDATES (informational; not selected or replayed)")
+                lines.append("=" * 80)
+                for n in candidates:
+                    lines.append(f'{n.sha[:12]} [DEPENDENCY-CANDIDATE] ("{n.subject}")')
+                    if n.reasons:
+                        lines.append(f"      evidence: {', '.join(sorted(n.reasons))}")
+                    if n.triggered_by:
+                        lines.append(
+                            "      triggered-by: "
+                            + ", ".join(x[:12] for x in sorted(n.triggered_by))
+                        )
+
         if self.series_groups:
             lines.append("")
             lines.append(
@@ -1061,14 +1217,19 @@ class Planner:
             )
             lines.append("=" * 80)
             for label, members in self.series_groups.items():
-                selected_count = sum(1 for _patch_no, sha in members if sha in self.nodes)
+                selected_count = sum(
+                    1 for _patch_no, sha in members
+                    if sha in self.nodes and self.is_actionable_node(self.nodes[sha])
+                )
                 lines.append(
                     f"{label}: {len(members)} commits found through upstream target; "
                     f"{selected_count} selected by planner"
                 )
                 missing_peers = 0
                 for patch_no, sha in members:
-                    selected_member = sha in self.nodes
+                    selected_member = (
+                        sha in self.nodes and self.is_actionable_node(self.nodes[sha])
+                    )
                     role = "SELECTED" if selected_member else "PEER"
                     m = self.match(sha)
                     status = m.status.upper()
@@ -1091,8 +1252,11 @@ class Planner:
         lines.append("")
         lines.append("ALREADY DOWNSTREAM")
         lines.append("=" * 80)
-        for n in sorted((x for x in self.nodes.values() if x.match.status == "present"),
-                        key=lambda x: x.sha):
+        for n in sorted(
+            (x for x in self.nodes.values()
+             if self.is_actionable_node(x) and x.match.status == "present"),
+            key=lambda x: x.sha,
+        ):
             lines.append(f'{n.sha[:12]} ("{n.subject}")')
             downstream = n.match.downstream_sha[:12] if n.match.downstream_sha else "unknown"
             lines.append(
@@ -1100,7 +1264,10 @@ class Planner:
                 f"  confidence={n.match.confidence}"
             )
 
-        unresolved = [n for n in self.nodes.values() if n.replay == "conflict"]
+        unresolved = [
+            n for n in self.nodes.values()
+            if self.is_actionable_node(n) and n.replay == "conflict"
+        ]
         if unresolved:
             lines.append("")
             lines.append("UNRESOLVED REPLAY CONFLICTS")
@@ -1123,14 +1290,22 @@ class Planner:
             "base": self.base,
             "target": self.target,
             "downstream": self.downstream,
+            "replay_start": self.replay_start,
+            "replay_start_source": self.replay_start_source,
+            "replay_rounds_run": self.replay_rounds_run,
+            "replay_final_verification": self.replay_final_verification,
             "paths": self.paths,
             "order": self.ordered_missing(),
             "commits": {
                 sha: {
                     "subject": n.subject,
                     "direct": n.direct,
-                    "reasons": sorted(n.reasons),
+                    "evidence": sorted(n.reasons),
+                    "reasons": sorted(n.reasons),  # compatibility alias
                     "required_by": sorted(n.required_by),
+                    "triggered_by": sorted(n.triggered_by),
+                    "dependency_kind": self.dependency_kind(n),
+                    "selected": self.is_actionable_node(n),
                     "match": dataclasses.asdict(n.match),
                     "aliases": sorted(n.aliases),
                     "files": n.files,
@@ -1149,7 +1324,9 @@ class Planner:
                         "patch": patch_no,
                         "sha": sha,
                         "subject": self.subject(sha),
-                        "selected": sha in self.nodes,
+                        "selected": (
+                            sha in self.nodes and self.is_actionable_node(self.nodes[sha])
+                        ),
                         "match": dataclasses.asdict(self.match(sha)),
                     }
                     for patch_no, sha in members
@@ -1196,14 +1373,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--context-lines", type=int, default=3,
                    help="nearby parent lines to blame around each hunk (default: 3)")
     p.add_argument("--context-score", type=int, default=5,
-                   help="minimum weak-context score to auto-add a dependency (default: 5)")
+                   help="minimum static nearby-context score to record an informational candidate (default: 5)")
     p.add_argument("--max-symbols", type=int, default=40)
     p.add_argument("--max-dependency-rounds", type=int, default=4)
     p.add_argument("--simulate", action=argparse.BooleanOptionalAction, default=True,
                    help="dry-run cherry-picks in a temporary worktree (default: true)")
     p.add_argument("--max-replay-rounds", type=int, default=3)
+    p.add_argument(
+        "--show-dependency-candidates", action="store_true",
+        help="include context-only dependency candidates in a separate informational section",
+    )
     p.add_argument("--max-conflict-deps", type=int, default=6,
-                   help="max new context dependencies per conflicting commit per round")
+                   help="max provenance candidates inspected per conflicting commit per round")
     p.add_argument("--merge-risk", action=argparse.BooleanOptionalAction, default=True,
                    help="flag later merge resolutions touching candidate files")
     p.add_argument("--max-merge-risks", type=int, default=5)

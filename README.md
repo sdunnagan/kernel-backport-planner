@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.3.2**.
+Current tool version: **0.3.4**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -94,8 +94,9 @@ in common code.
 
 ### Hunk and context provenance
 
-Within the normal `--base..--target` planning range, the planner can use blame
-on changed hunk preimages and nearby context to identify likely prerequisites.
+Within the normal `--base..--target` planning range, the planner uses blame on
+changed hunk preimages to identify likely prerequisites and nearby context to
+record weaker provenance leads.
 
 Pre-base hunk provenance is intentionally treated more conservatively. Merely
 discovering that an old commit authored a touched line is not enough to pull
@@ -106,12 +107,25 @@ rapidly turns into an excavation of kernel history.
 
 The planner dry-runs the proposed series in a disposable worktree. When a
 cherry-pick conflicts, it examines the conflicting files and can add a bounded
-number of strong context-provenance commits as new dependencies.
+number of context-provenance commits for further investigation.
 
-This replay-driven mechanism is allowed to cross `--base`. It is the primary way
-an older hunk/context prerequisite is promoted into the plan because an actual
-downstream conflict supplies concrete evidence that the historical context
-matters.
+Conflict hunk-preimage evidence is treated as strong dependency evidence.
+Nearby hunk context is never sufficient by itself to select a dependency,
+regardless of score. A higher context score makes the provenance lead more
+interesting, but it remains a `dependency-candidate` rather than a proposed
+backport prerequisite.
+
+Context-only candidates are intentionally non-actionable: they are not replayed,
+do not participate in recursive dependency closure, do not make a patch series
+selected, and are omitted from the default text plan. They remain available in
+JSON for auditing/debugging and can be displayed explicitly with
+`--show-dependency-candidates`. If later hunk-preimage, symbol, or explicit
+semantic evidence points to the same commit, it is promoted to `[DEPENDENCY]`.
+
+This replay-driven mechanism is allowed to cross `--base`. Direct hunk-preimage
+evidence can therefore select an older prerequisite when an actual downstream
+conflict demonstrates that the historical preimage matters. Nearby context can
+still be recorded across the boundary, but remains non-actionable.
 
 Pre-base dependencies are terminal during normal static dependency closure. They
 are not recursively mined for every older hunk, symbol, and `Fixes:`
@@ -124,23 +138,16 @@ set.
 
 ## Proven cross-base behavior
 
-Version 0.3.1 was exercised against the ARM64 `v6.19..v7.0` planning case for
-RHEL-223619. A real prerequisite that predates `v6.19` was successfully
-discovered during replay:
-
-```text
-3df6979d222b [DEPENDENCY] ("arm64: mm: split linear mapping if BBML2 unsupported on secondary CPUs")
-      reasons: conflict-hunk-context:82
-      required-by: ce2b3a50ad92
-      replay: conflict (arch/arm64/kernel/cpufeature.c)
-```
-
-`3df6979d222b` is an ancestor of `v6.19`, so a path-only `v6.19..v7.0` search
-would never include it. The planner nevertheless pulled it into the plan because
-replay of a later selected commit demonstrated relevant missing context.
+Cross-base discovery remains supported for strong evidence. A dependency that
+predates `--base` can still be selected when replay exposes direct hunk-preimage
+provenance or another strong relationship such as symbol or `Fixes:` evidence.
+Pure nearby-context provenance, even when it points before `--base`, remains an
+informational candidate rather than automatically extending the backport plan.
 
 This is one of the main differences from the old `find-backports` workflow: the
-planning threshold no longer silently hides an older prerequisite.
+planning threshold does not hide older prerequisites when concrete evidence
+requires them, while weak historical context is prevented from recursively
+turning the plan into an excavation of unrelated kernel history.
 
 ## Replay and ordering
 
@@ -165,7 +172,28 @@ additional independent conflict information. Consequently, conflicts reported
 for later commits may sometimes be secondary effects of an earlier skipped
 commit and still require human interpretation.
 
-By default the planner performs up to three replay/discovery rounds.
+By default the planner performs up to three replay/discovery rounds. If the
+last discovery round adds new commits, the planner performs one additional
+verification-only replay. That final pass does not discover more dependencies;
+it exists so the reported `replay:` state describes the complete selected set
+that is actually printed, rather than the pre-discovery state from the last
+round.
+
+The report header records the exact replay basis, for example:
+
+```text
+replay-start: 583f64ad2840 (cs10/main)
+```
+
+or, with `--include-local`:
+
+```text
+replay-start: 1aeeaa1567a8 (HEAD, --include-local)
+```
+
+A replay conflict is therefore a statement about that specific replay state. It
+is evidence for investigation, not a prediction that a later real backport onto
+a workspace containing additional prerequisite changes must still conflict.
 
 ## Same patch series
 
@@ -252,17 +280,19 @@ baseline and then reapply a saved patch set afterward, omit `--include-local`.
 The human-readable report uses 12-character commit IDs. JSON retains full commit
 IDs.
 
-Direct focus commits are intentionally unlabelled. Only exceptional commits are
-marked `[DEPENDENCY]`:
+Direct focus commits are intentionally unlabelled. Strongly supported
+prerequisites are marked `[DEPENDENCY]` in the normal plan. Context-only leads
+are omitted from the default text report so that the working plan remains
+focused on commits that deserve actual TAKE/SKIP consideration:
 
 ```text
 35c3dcb1ac2c ("syscall.h: Remove unused SYSCALL_MAX_ARGS")
 
 a4e5927115f3 ("arm64: mte: Set TCMA1 whenever MTE is present in the kernel")
 
-3df6979d222b [DEPENDENCY] ("arm64: mm: split linear mapping if BBML2 unsupported on secondary CPUs")
-      reasons: conflict-hunk-context:82
-      required-by: ce2b3a50ad92
+2b6a3f061f11 [DEPENDENCY] ("mm: declare VMA flags by bit")
+      evidence: symbol:VM_NONE
+      required-by: 47a8aad135ac
 ```
 
 There is no ordinal numbering in the plan. Ordering itself is significant; the
@@ -270,8 +300,8 @@ numbers were purely cosmetic and were removed.
 
 Common per-commit fields include:
 
-- `reasons:` why a dependency entered the selected set;
-- `required-by:` selected commits that led to that dependency;
+- `evidence:` why a selected dependency entered the plan;
+- `required-by:` commits linked by stronger prerequisite evidence;
 - `Fixes:` an older semantic target, including explicit `[Predates <base>]`
   notation where applicable;
 - `replay: clean` or `replay: conflict (...)`;
@@ -287,10 +317,26 @@ The report also contains:
 - `UNRESOLVED REPLAY CONFLICTS`, when replay remains non-clean;
 - optional check-command output.
 
-`[DEPENDENCY]` means "the planner found evidence that this belongs in the
-dependency investigation." It is not an instruction to blindly cherry-pick the
-commit. Kernel backports remain an activity in which human judgment has,
-regrettably, not yet been deprecated.
+`[DEPENDENCY]` means the planner found stronger evidence that the commit belongs
+in the prerequisite investigation, such as hunk-preimage provenance, symbol or
+`Fixes:` provenance. It is still engineering evidence, not an instruction to
+blindly cherry-pick the commit.
+
+Context-only provenance is deliberately weaker regardless of its numeric score.
+Such commits are tracked as `dependency-candidate` records but are not part of
+the proposed backport plan. To inspect them in the text report, opt in with:
+
+```text
+--show-dependency-candidates
+```
+
+They then appear in a separate `DEPENDENCY CANDIDATES` section using
+`triggered-by:`. They are not selected, replayed, recursively expanded, or used
+to make a patch series relevant. This keeps useful forensic evidence available
+without imposing review cost on the normal planning file.
+
+Kernel backports remain an activity in which human judgment has, regrettably,
+not yet been deprecated.
 
 ## Machine-readable output
 
@@ -303,8 +349,11 @@ kernel-backport-planner ... \
 ```
 
 The JSON report keeps full 40-character SHAs and includes commit metadata,
-dependency reasons, `required_by`, match information, replay state, conflicts,
-merge risk, and patch-series membership.
+dependency `evidence`, `required_by`, `triggered_by`, `dependency_kind`, a
+`selected` boolean, match information, replay basis/state, conflicts, merge
+risk, and patch-series membership. Context-only candidates remain in JSON with
+`selected: false`. The legacy `reasons` field is retained as a compatibility
+alias for `evidence`.
 
 ## Performance
 
@@ -350,6 +399,7 @@ Tune bounded analysis:
 --max-replay-rounds N
 --max-conflict-deps N
 --max-merge-risks N
+--show-dependency-candidates
 ```
 
 Disable merge-risk analysis:
@@ -418,7 +468,8 @@ For a broad upstream rebase, the intended workflow is:
 1. generate the plan from a known downstream baseline;
 2. review commits oldest-first;
 3. treat `[DEPENDENCY]`, replay conflicts, `Fixes:`, series peers, and merge
-   risks as engineering evidence;
+   risks as engineering evidence with different strengths; inspect context-only
+   dependency candidates only when debugging provenance or discovery behavior;
 4. annotate the working report with decisions such as `// Done` and `// Skip`;
 5. apply/backport commits deliberately;
 6. build and test the resulting kernel separately as appropriate.
