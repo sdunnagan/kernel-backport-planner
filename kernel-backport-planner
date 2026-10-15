@@ -22,18 +22,46 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import hashlib
 import json
 import os
 import re
 import shlex
+import socket
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.3.4"
+VERSION = "0.4.6"
+ADVISOR_PROMPT_VERSION = "7"
+
+# RHEL 10 product architecture set, verified against Red Hat's RHEL 10
+# architecture documentation. Kernel arch directory names differ from product
+# architecture names for powerpc/ppc64le and s390/s390x.
+# https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/10.2_release_notes/architectures
+RHEL10_SUPPORTED_ARCHITECTURES = {
+    "x86": "x86_64 (AMD/Intel 64-bit)",
+    "arm64": "aarch64 (64-bit ARM)",
+    "powerpc": "ppc64le (IBM Power little-endian)",
+    "s390": "s390x (IBM Z)",
+}
+
+# Kernel architecture directory names seen in arch/ and selected architecture-owned
+# library subtrees. The latter matter because optimized code can live outside
+# arch/<name>/, for example lib/crypto/arm/ and lib/crypto/arm64/.
+KNOWN_KERNEL_ARCHITECTURES = {
+    "alpha", "arc", "arm", "arm64", "csky", "h8300", "hexagon", "ia64",
+    "loongarch", "m68k", "microblaze", "mips", "nds32", "nios2",
+    "openrisc", "parisc", "powerpc", "riscv", "s390", "sh", "sparc",
+    "um", "x86", "xtensa",
+}
+
 
 HEX40_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
 FIXES_RE = re.compile(r"(?im)^Fixes:\s*([0-9a-f]{7,40})\b")
@@ -148,6 +176,18 @@ class CommitNode:
     conflict_files: list[str] = dataclasses.field(default_factory=list)
     subject_hints: list[str] = dataclasses.field(default_factory=list)
     series_ids: set[str] = dataclasses.field(default_factory=set)
+    advisor_decision: str | None = None
+    advisor_rationale: str | None = None
+    advisor_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_rejected_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_consumed_objects: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_recommended_by: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_inbound_assessments: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_consistency_warnings: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_risks: list[str] = dataclasses.field(default_factory=list)
+    advisor_error: str | None = None
+    advisor_error_kind: str | None = None
+    advisor_attempts: int = 0
 
     def add_reason(
         self, reason: str, parent: str | None = None, *, tentative: bool = False
@@ -179,6 +219,227 @@ class DiffHunk:
     new_start: int
     new_count: int
     added_lines: list[str]
+
+
+ADVISOR_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["TAKE", "SKIP", "REVIEW"]},
+        "rationale": {"type": "string"},
+        "prerequisite_evidence_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        },
+        "inbound_prerequisite_assessments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "disposition": {"type": "string", "enum": ["REQUIRED", "NOT_REQUIRED"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["evidence_id", "disposition", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        "risks": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "decision", "rationale", "prerequisite_evidence_ids",
+        "inbound_prerequisite_assessments", "risks"
+    ],
+    "additionalProperties": False,
+}
+
+
+def advisor_response_schema(
+    prerequisite_evidence: Sequence[dict[str, str]],
+    inbound_recommendations: Sequence[dict[str, str]] = (),
+) -> dict:
+    """Build the per-commit structured-output schema.
+
+    Prerequisite recommendations must point at deterministic evidence records,
+    not merely at any earlier missing same-series SHA.  Inbound prerequisite
+    assessments are likewise constrained to recommendations already made by
+    TAKE consumers.
+    """
+    evidence = list(prerequisite_evidence)
+    schema = json.loads(json.dumps(ADVISOR_RESPONSE_SCHEMA))
+    prereqs = schema["properties"]["prerequisite_evidence_ids"]
+    evidence_ids = list(dict.fromkeys(x["evidence_id"] for x in evidence))
+    if evidence_ids:
+        prereqs["items"] = {"type": "string", "enum": evidence_ids}
+        prereqs["maxItems"] = len(evidence_ids)
+    else:
+        prereqs["maxItems"] = 0
+
+    inbound = schema["properties"]["inbound_prerequisite_assessments"]
+    inbound_ids = list(dict.fromkeys(
+        x["evidence_id"] for x in inbound_recommendations if x.get("evidence_id")
+    ))
+    if inbound_ids:
+        inbound["items"]["properties"]["evidence_id"] = {
+            "type": "string", "enum": inbound_ids
+        }
+        inbound["minItems"] = len(inbound_ids)
+        inbound["maxItems"] = len(inbound_ids)
+    else:
+        inbound["maxItems"] = 0
+    return schema
+
+
+
+class AdvisorError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "validation",
+        retryable: bool = False,
+        raw_response: str | None = None,
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+        self.raw_response = raw_response
+
+
+def normalize_http_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        return "http://127.0.0.1:11434"
+    if "://" not in value:
+        value = "http://" + value
+    return value
+
+
+def parse_advisor_structured_content(content: str) -> dict:
+    """Parse one structured advisor object with conservative wrapper tolerance.
+
+    Ollama's constrained-output path can occasionally prefix an otherwise valid
+    JSON object with a YAML document separator, or wrap it in a normal JSON code
+    fence.  Accept only those narrow wrappers; do not extract JSON from arbitrary
+    prose or search for a brace-delimited substring.
+    """
+    text = content.strip()
+
+    # Tolerate exactly one YAML document-start marker when it occupies its own
+    # leading line.  This is not general YAML parsing.
+    yaml_match = re.match(r"\A---[ \t]*(?:\r?\n)", text)
+    if yaml_match:
+        text = text[yaml_match.end():].strip()
+
+    # Tolerate a complete fenced JSON object (or an unlabeled fence) and nothing
+    # outside the fence.  Deliberately reject explanatory prose around the fence.
+    fence_match = re.fullmatch(
+        r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```[ \t]*",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fence_match:
+        text = fence_match.group("body").strip()
+
+    result = json.loads(text)
+    if not isinstance(result, dict):
+        raise json.JSONDecodeError("advisor structured response is not a JSON object", text, 0)
+    return result
+
+
+class OllamaAdvisor:
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        timeout: float,
+        temperature: float,
+        keep_alive: str,
+        debug: bool = False,
+    ):
+        self.model = model
+        self.base_url = normalize_http_base_url(base_url)
+        self.timeout = timeout
+        self.temperature = temperature
+        self.keep_alive = keep_alive
+        self.debug = debug
+
+    def advise(self, system_prompt: str, packet: dict, response_schema: dict | None = None) -> dict:
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "format": response_schema or ADVISOR_RESPONSE_SCHEMA,
+            "keep_alive": self.keep_alive,
+            "options": {"temperature": self.temperature},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Evaluate this kernel backport candidate. Return only the "
+                        "structured response required by the schema.\n\n"
+                        + json.dumps(packet, indent=2, sort_keys=True)
+                    ),
+                },
+            ],
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/api/chat",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        if self.debug:
+            print(
+                f"advisor POST {self.base_url}/api/chat model={self.model} "
+                f"packet_sha={packet.get('commit', {}).get('sha', '?')}",
+                file=sys.stderr,
+            )
+        response_text: str | None = None
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response_text = response.read().decode("utf-8")
+                outer = json.loads(response_text)
+        except urllib.error.HTTPError as exc:
+            raise AdvisorError(
+                f"Ollama HTTP error {exc.code}: {exc.reason}",
+                kind="http",
+                retryable=exc.code == 429 or exc.code >= 500,
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise AdvisorError(
+                f"Ollama request timed out: {exc}", kind="timeout", retryable=True
+            ) from exc
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            kind = "timeout" if isinstance(reason, (TimeoutError, socket.timeout)) else "transport"
+            raise AdvisorError(
+                f"Ollama request failed: {exc}", kind=kind, retryable=True
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AdvisorError(
+                "Ollama returned invalid outer JSON",
+                kind="invalid-response",
+                retryable=True,
+                raw_response=response_text,
+            ) from exc
+
+        content = None
+        try:
+            content = outer["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("Ollama message content is not a string")
+            result = parse_advisor_structured_content(content)
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            diagnostic = content if isinstance(content, str) else response_text
+            raise AdvisorError(
+                "Ollama returned an invalid structured response",
+                kind="invalid-response",
+                retryable=True,
+                raw_response=diagnostic,
+            ) from exc
+        return result
 
 
 class Planner:
@@ -220,6 +481,42 @@ class Planner:
         self._dependency_expanded: set[str] = set()
         self._pre_base_cache: dict[str, bool] = {}
         self.series_groups: dict[str, list[tuple[int, str]]] = {}
+        self.advisor_model = args.advisor_model
+        self.advisor_cache_path: Path | None = None
+        self.advisor_cache: dict[str, dict] = {}
+        self.advisor_calls = 0
+        self.advisor_cache_hits = 0
+        self.advisor_retries_used = 0
+        self.advisor_failures = 0
+        self.advisor_failure_kinds: collections.Counter[str] = collections.Counter()
+        self.advisor_reconsiderations = 0
+        self.advisor_consistency_issues: list[dict[str, str]] = []
+        self.advisor_error_log_path: Path | None = None
+        self.advisor_error_log_entries = 0
+        if self.advisor_model:
+            if args.advisor_error_log:
+                self.advisor_error_log_path = Path(args.advisor_error_log).expanduser().resolve()
+            elif args.output:
+                self.advisor_error_log_path = Path(args.output + ".advisor-errors.jsonl").expanduser().resolve()
+            else:
+                self.advisor_error_log_path = self.repo / ".kernel-backport-planner-advisor-errors.jsonl"
+            try:
+                self.advisor_error_log_path.unlink(missing_ok=True)
+            except OSError:
+                self.info(f"Could not clear advisor error log: {self.advisor_error_log_path}")
+            if args.advisor_cache:
+                self.advisor_cache_path = Path(args.advisor_cache).expanduser().resolve()
+            elif args.output:
+                self.advisor_cache_path = Path(args.output + ".advisor-cache.json").expanduser().resolve()
+            else:
+                self.advisor_cache_path = self.repo / ".kernel-backport-planner-advisor-cache.json"
+            if not args.no_advisor_cache and self.advisor_cache_path.exists():
+                try:
+                    raw_cache = json.loads(self.advisor_cache_path.read_text())
+                    if isinstance(raw_cache, dict):
+                        self.advisor_cache = raw_cache
+                except (OSError, json.JSONDecodeError):
+                    self.info(f"Ignoring unreadable advisor cache: {self.advisor_cache_path}")
 
     def _load_paths(self, args: argparse.Namespace) -> list[str]:
         paths: list[str] = []
@@ -251,6 +548,1487 @@ class Planner:
         if sha not in self._changed_files_cache:
             self._changed_files_cache[sha] = self.git.changed_files(sha)
         return self._changed_files_cache[sha]
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        if limit <= 0 or len(text) <= limit:
+            return text
+        marker = f"\n... [truncated {len(text) - limit} characters]"
+        keep = max(0, limit - len(marker))
+        return text[:keep] + marker
+
+    @staticmethod
+    def _one_line(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    def patch_excerpt(self, sha: str, limit: int) -> str:
+        cache = getattr(self, "_advisor_patch_text_cache", None)
+        if cache is None:
+            cache = {}
+            self._advisor_patch_text_cache = cache
+        patch = cache.get(sha)
+        if patch is None:
+            patch = self.git.run([
+                "show", "--format=", "--no-ext-diff", "--find-renames", "--find-copies", sha
+            ])
+            cache[sha] = patch
+        return self._truncate_text(patch, limit)
+
+    def advisor_product_context(self) -> dict:
+        mode = getattr(self.args, "advisor_product", "auto")
+        is_cs10 = (
+            mode == "rhel10"
+            or (
+                mode == "auto"
+                and (
+                    str(getattr(self.args, "downstream", "") or "").lower() == "cs10"
+                    or "cs10" in str(self.downstream_ref).lower()
+                    or "centos-stream-10" in str(self.repo).lower()
+                )
+            )
+        )
+        if not is_cs10:
+            return {
+                "product": "generic downstream Linux kernel",
+                "supported_architectures": None,
+                "policy_note": (
+                    "No product-specific architecture allowlist is configured. "
+                    "Use repository evidence and focus paths rather than assuming product support."
+                ),
+            }
+        return {
+            "product": "Red Hat Enterprise Linux 10 / CentOS Stream 10",
+            "supported_architectures": [
+                {"kernel_arch_dir": arch, "product_architecture": desc}
+                for arch, desc in RHEL10_SUPPORTED_ARCHITECTURES.items()
+            ],
+            "supported_kernel_arch_dirs": sorted(RHEL10_SUPPORTED_ARCHITECTURES),
+            "policy_note": (
+                "RHEL 10 product architectures are x86_64, aarch64, ppc64le, and s390x. "
+                "Architecture-only commits for other arch/* trees should normally be SKIP unless "
+                "the supplied diff/graph evidence demonstrates a concrete prerequisite for code "
+                "that the product actually builds. A cross-architecture symbol-name or hunk-"
+                "provenance match alone is not sufficient."
+            ),
+        }
+
+    @staticmethod
+    def _path_architecture_dirs(path: str) -> set[str]:
+        """Return architecture ownership encoded by a source path.
+
+        Most architecture ownership is explicit under arch/<name>/, but optimized
+        library code also lives in architecture-named subtrees such as
+        lib/crypto/arm/ and lib/crypto/arm64/. Keep this intentionally narrow: a
+        platform/vendor directory elsewhere in drivers/ is not an architecture.
+        """
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "arch" and parts[1]:
+            return {parts[1]}
+        candidates: list[str] = []
+        if len(parts) >= 3 and parts[0] == "lib" and parts[1] == "crypto":
+            candidates.append(parts[2])
+        if len(parts) >= 2 and parts[0] == "crypto":
+            candidates.append(parts[1])
+        if len(parts) >= 2 and parts[0] == "lib":
+            candidates.append(parts[1])
+        return {name for name in candidates if name in KNOWN_KERNEL_ARCHITECTURES}
+
+    @classmethod
+    def _architecture_dirs(cls, files: Sequence[str]) -> list[str]:
+        result: set[str] = set()
+        for path in files:
+            result.update(cls._path_architecture_dirs(path))
+        return sorted(result)
+
+    def _advisor_path_product_relevant(self, path: str) -> bool:
+        """Whether architecture ownership of *path* is relevant to the product.
+
+        Common paths have no architecture owner and remain eligible. In generic
+        downstream mode no product architecture allowlist is applied.
+        """
+        owners = self._path_architecture_dirs(path)
+        if not owners:
+            return True
+        supported = set(
+            self.advisor_product_context().get("supported_kernel_arch_dirs") or []
+        )
+        return not supported or not owners.isdisjoint(supported)
+
+    def _advisor_evidence_paths_compatible(
+        self, selected_path: str, provider_path: str
+    ) -> bool:
+        """Return True when a lexical relationship is product/path plausible."""
+        if not self._advisor_path_product_relevant(selected_path):
+            return False
+        if not self._advisor_path_product_relevant(provider_path):
+            return False
+        selected_owners = self._path_architecture_dirs(selected_path)
+        provider_owners = self._path_architecture_dirs(provider_path)
+        if selected_owners and provider_owners and selected_owners.isdisjoint(provider_owners):
+            return False
+        return True
+
+    def advisor_scope_context(self, files: Sequence[str]) -> dict:
+        files = list(files)
+        arch_dirs = self._architecture_dirs(files)
+        product = self.advisor_product_context()
+        supported = set(product.get("supported_kernel_arch_dirs") or [])
+        focus = [p.rstrip("/") for p in self.paths]
+        touches_focus = any(
+            path == prefix or path.startswith(prefix + "/")
+            for path in files for prefix in focus
+        )
+        all_files_arch_local = bool(files) and all(path.startswith("arch/") for path in files)
+        unsupported_only = bool(
+            supported
+            and arch_dirs
+            and all_files_arch_local
+            and set(arch_dirs).isdisjoint(supported)
+        )
+        return {
+            "architecture_dirs": arch_dirs,
+            "touches_focus_paths": touches_focus,
+            "touches_supported_architecture": bool(set(arch_dirs) & supported) if supported else None,
+            "unsupported_architecture_only": unsupported_only,
+        }
+
+    def advisor_series_context(self, sha: str) -> list[dict]:
+        node = self.nodes[sha]
+        groups: list[dict] = []
+        peer_diffs_used = 0
+        for label in sorted(node.series_ids):
+            members = self.series_groups.get(label, [])
+            selected_patch = next((p for p, member_sha in members if member_sha == sha), None)
+            peers: list[dict] = []
+            for patch_no, member_sha in members:
+                m = self.match(member_sha)
+                relation = "same"
+                if selected_patch is not None:
+                    if patch_no < selected_patch:
+                        relation = "earlier"
+                    elif patch_no > selected_patch:
+                        relation = "later"
+                peer_files = self.changed_files(member_sha)
+                peer = {
+                    "patch": patch_no,
+                    "sha": member_sha,
+                    "subject": self.subject(member_sha),
+                    "relation": relation,
+                    "selected_by_planner": (
+                        member_sha in self.nodes
+                        and self.is_actionable_node(self.nodes[member_sha])
+                    ),
+                    "downstream_status": m.status,
+                    "changed_files": peer_files,
+                    "scope": self.advisor_scope_context(peer_files),
+                }
+                if (
+                    member_sha != sha
+                    and relation == "earlier"
+                    and m.status == "missing"
+                    and peer_diffs_used < self.args.advisor_max_peer_diffs
+                ):
+                    peer["patch_excerpt"] = self.patch_excerpt(
+                        member_sha, self.args.advisor_max_peer_diff_chars
+                    )
+                    peer_diffs_used += 1
+                peers.append(peer)
+            groups.append({
+                "series": label,
+                "selected_patch": selected_patch,
+                "members": peers,
+            })
+        return groups
+
+    def advisor_allowed_prerequisite_peers(self, sha: str) -> list[str]:
+        allowed: list[str] = []
+        for label in sorted(self.nodes[sha].series_ids):
+            members = self.series_groups.get(label, [])
+            selected_patch = next((p for p, member_sha in members if member_sha == sha), None)
+            if selected_patch is None:
+                continue
+            allowed.extend(
+                member_sha
+                for patch_no, member_sha in members
+                if patch_no < selected_patch and self.match(member_sha).status == "missing"
+            )
+        return list(dict.fromkeys(allowed))
+
+    @staticmethod
+    def _added_patch_text(patch: str) -> str:
+        """Return only added patch lines, excluding diff metadata."""
+        return "\n".join(
+            line[1:]
+            for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+
+    @staticmethod
+    def _added_patch_text_by_file(patch: str) -> dict[str, str]:
+        """Return added lines grouped by destination path in a unified diff."""
+        grouped: dict[str, list[str]] = collections.defaultdict(list)
+        current: str | None = None
+        for line in patch.splitlines():
+            match = DIFF_FILE_RE.match(line)
+            if match:
+                current = match.group(2)
+                continue
+            if current and line.startswith("+") and not line.startswith("+++"):
+                grouped[current].append(line[1:])
+        return {path: "\n".join(lines) for path, lines in grouped.items()}
+
+    @staticmethod
+    def _dts_label_references(text: str) -> set[str]:
+        return set(re.findall(r"&([A-Za-z_][A-Za-z0-9_]*)\b", text))
+
+    @staticmethod
+    def _dts_label_definitions(text: str) -> set[str]:
+        # Device-tree labels begin with e.g. ``uart18:``. The opening brace
+        # may be on the same line or later in a truncated diff excerpt.
+        return set(
+            re.findall(
+                r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _macro_uses(text: str) -> set[str]:
+        return set(MACRO_RE.findall(text))
+
+    @staticmethod
+    def _macro_definitions(text: str) -> set[str]:
+        return set(
+            re.findall(r"(?m)^\s*#\s*define\s+([A-Z][A-Z0-9_]{3,})\b", text)
+        )
+
+    @staticmethod
+    def _function_calls(text: str) -> set[str]:
+        return {name for name in FUNC_CALL_RE.findall(text) if name not in C_KEYWORDS}
+
+    @staticmethod
+    def _function_definitions(text: str) -> set[str]:
+        # Conservative approximation for newly-added C function definitions.
+        # Allow the opening brace to appear on a following added line.
+        result = set()
+        pattern = re.compile(
+            r"(?m)^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*[ \t*]+)+"
+            r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([^;{}]*\)[ \t\n]*\{"
+        )
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            if name not in C_KEYWORDS:
+                result.add(name)
+        return result
+
+    @staticmethod
+    def _function_declarations(text: str) -> set[str]:
+        # Header-style declarations/prototypes, including common annotations such
+        # as __init between the return type and function name.
+        result = set()
+        pattern = re.compile(
+            r"(?m)^[ \t]*(?:extern[ \t]+)?"
+            r"(?:[A-Za-z_][A-Za-z0-9_]*[ \t*]+)+"
+            r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([^;{}]*\)[ \t\n]*;"
+        )
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            if name not in C_KEYWORDS:
+                result.add(name)
+        return result
+
+    @staticmethod
+    def _include_paths(text: str) -> set[str]:
+        return set(re.findall(r'(?m)^\s*#\s*include\s*[<"]([^>"]+)[>"]', text))
+
+    @staticmethod
+    def _include_aliases_for_path(path: str) -> set[str]:
+        aliases = {path}
+        if path.startswith("include/"):
+            aliases.add(path[len("include/"):])
+        marker = "/include/"
+        if marker in path:
+            aliases.add(path.split(marker, 1)[1])
+        return aliases
+
+    @staticmethod
+    def _new_files_in_patch(patch: str) -> set[str]:
+        result: set[str] = set()
+        current: str | None = None
+        for line in patch.splitlines():
+            match = DIFF_FILE_RE.match(line)
+            if match:
+                current = match.group(2)
+                continue
+            if current and (line.startswith("new file mode ") or line == "--- /dev/null"):
+                result.add(current)
+        return result
+
+    @staticmethod
+    def _dt_compatible_strings(text: str) -> set[str]:
+        result: set[str] = set()
+        for line in text.splitlines():
+            if "compatible" not in line or "=" not in line:
+                continue
+            result.update(re.findall(r'"([A-Za-z0-9][A-Za-z0-9,._+\-/]+)"', line))
+        return result
+
+    @staticmethod
+    def _dt_property_uses(text: str) -> set[str]:
+        ignored = {
+            "compatible", "status", "reg", "ranges", "model", "phandle",
+            "#address-cells", "#size-cells",
+        }
+        result: set[str] = set()
+        for line in text.splitlines():
+            match = re.match(
+                r"^\s*([A-Za-z#][A-Za-z0-9,._+#-]*)\s*(?:=|;)", line
+            )
+            if match and match.group(1) not in ignored:
+                result.add(match.group(1))
+        return result
+
+    @staticmethod
+    def _yaml_property_definitions(text: str) -> set[str]:
+        return set(
+            re.findall(
+                r"(?m)^\s{2,}([A-Za-z#][A-Za-z0-9,._+#-]*)\s*:\s*(?:$|[#|>{])",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _type_uses(text: str) -> set[tuple[str, str]]:
+        return set(re.findall(r"\b(struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b", text))
+
+    @staticmethod
+    def _type_definitions(text: str) -> set[tuple[str, str]]:
+        return set(
+            re.findall(
+                r"(?m)^\s*(struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b[^;\n]*\{",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _advisor_evidence_id(
+        consumer_sha: str, peer_sha: str, kind: str, obj: str,
+        selected_use: str, peer_provides: str,
+    ) -> str:
+        raw = "\0".join(
+            (consumer_sha, peer_sha, kind, obj, selected_use, peer_provides)
+        ).encode("utf-8")
+        return "ev-" + hashlib.sha256(raw).hexdigest()[:16]
+
+    def advisor_same_series_consumed_objects(self, sha: str) -> list[dict[str, str]]:
+        """Find concrete lexical use/provision relationships with earlier peers.
+
+        These records are deterministic advisor evidence only. They neither select
+        nor promote a peer. Version 0.4.6 retains source paths on both sides of a
+        relationship and suppresses architecture-local evidence when the selected
+        use or provider belongs only to an unsupported product architecture. This
+        also recognizes selected architecture-owned library subtrees such as
+        lib/crypto/arm/ and lib/crypto/arm64/ rather than relying only on arch/*.
+        """
+        allowed = self.advisor_allowed_prerequisite_peers(sha)
+        if not allowed:
+            return []
+
+        selected_patch = self.patch_excerpt(sha, self.args.advisor_max_diff_chars)
+        selected_added = self._added_patch_text(selected_patch)
+        selected_files = self.nodes[sha].files or self.changed_files(sha)
+        selected_added_by_file = self._added_patch_text_by_file(selected_patch)
+        if not selected_added_by_file:
+            if len(selected_files) == 1:
+                selected_added_by_file = {selected_files[0]: selected_added}
+            else:
+                selected_added_by_file = {"": selected_added}
+
+        selected_refs_by_path = {
+            path: self._dts_label_references(text)
+            for path, text in selected_added_by_file.items()
+        }
+        selected_macros_by_path = {
+            path: self._macro_uses(text) - self._macro_definitions(text)
+            for path, text in selected_added_by_file.items()
+        }
+        selected_defs_by_path = {
+            path: self._function_definitions(text)
+            for path, text in selected_added_by_file.items()
+        }
+        selected_calls_by_path = {
+            path: self._function_calls(text) - selected_defs_by_path[path]
+            for path, text in selected_added_by_file.items()
+        }
+        selected_includes_by_path = {
+            path: self._include_paths(text)
+            for path, text in selected_added_by_file.items()
+        }
+        selected_type_defs_by_path = {
+            path: self._type_definitions(text)
+            for path, text in selected_added_by_file.items()
+        }
+        selected_types_by_path = {
+            path: self._type_uses(text) - selected_type_defs_by_path[path]
+            for path, text in selected_added_by_file.items()
+        }
+
+        # Only product-relevant selected paths contribute DT binding evidence.
+        selected_compatibles: set[str] = set()
+        selected_dt_properties: set[str] = set()
+        for selected_path, selected_text in selected_added_by_file.items():
+            if not self._advisor_path_product_relevant(selected_path):
+                continue
+            selected_compatibles.update(self._dt_compatible_strings(selected_text))
+            selected_dt_properties.update(self._dt_property_uses(selected_text))
+
+        # Build a same-series view of DT binding schemas before judging individual
+        # peers. Binding series commonly add a compatible in one patch and extend
+        # the same YAML schema with a property in the next. Exact binding-path
+        # identity keeps this much narrower than matching generic property names.
+        binding_compatible_sources: dict[str, dict[str, str]] = collections.defaultdict(dict)
+        for series_peer_sha in allowed:
+            series_peer_patch = self.patch_excerpt(
+                series_peer_sha, self.args.advisor_max_peer_diff_chars
+            )
+            series_peer_binding_texts = self._added_patch_text_by_file(series_peer_patch)
+            if not series_peer_binding_texts:
+                binding_files = [
+                    path for path in self.changed_files(series_peer_sha)
+                    if path.startswith("Documentation/devicetree/bindings/")
+                ]
+                if len(binding_files) == 1:
+                    series_peer_binding_texts = {
+                        binding_files[0]: self._added_patch_text(series_peer_patch)
+                    }
+            for binding_path, binding_text in series_peer_binding_texts.items():
+                if not binding_path.startswith("Documentation/devicetree/bindings/"):
+                    continue
+                for compat in sorted(selected_compatibles):
+                    if compat in binding_text:
+                        binding_compatible_sources[binding_path].setdefault(
+                            compat, series_peer_sha
+                        )
+
+        evidence: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(
+            peer_sha: str, kind: str, obj: str, selected_use: str,
+            peer_provides: str, *, selected_path: str = "", provider_path: str = "",
+        ) -> None:
+            key = (peer_sha, kind, obj)
+            if key in seen or len(evidence) >= 64:
+                return
+            seen.add(key)
+            selected_arch = ",".join(sorted(self._path_architecture_dirs(selected_path)))
+            provider_arch = ",".join(sorted(self._path_architecture_dirs(provider_path)))
+            evidence.append({
+                "evidence_id": self._advisor_evidence_id(
+                    sha, peer_sha, kind, obj, selected_use, peer_provides
+                ),
+                "peer_sha": peer_sha,
+                "peer_subject": self.subject(peer_sha),
+                "kind": kind,
+                "object": obj,
+                "selected_use": selected_use,
+                "peer_provides": peer_provides,
+                "selected_path": selected_path,
+                "provider_path": provider_path,
+                "selected_architecture": selected_arch,
+                "provider_architecture": provider_arch,
+            })
+
+        for peer_sha in allowed:
+            peer_patch = self.patch_excerpt(peer_sha, self.args.advisor_max_peer_diff_chars)
+            peer_added = self._added_patch_text(peer_patch)
+            peer_added_by_file = self._added_patch_text_by_file(peer_patch)
+            peer_files = self.changed_files(peer_sha)
+            if not peer_added_by_file:
+                if len(peer_files) == 1:
+                    peer_added_by_file = {peer_files[0]: peer_added}
+                else:
+                    peer_added_by_file = {"": peer_added}
+
+            peer_label_defs_by_path = {
+                path: self._dts_label_definitions(text)
+                for path, text in peer_added_by_file.items()
+            }
+            peer_macro_defs_by_path = {
+                path: self._macro_definitions(text)
+                for path, text in peer_added_by_file.items()
+            }
+            peer_function_defs_by_path = {
+                path: self._function_definitions(text)
+                for path, text in peer_added_by_file.items()
+            }
+            peer_function_decls_by_path = {
+                path: self._function_declarations(text)
+                for path, text in peer_added_by_file.items()
+            }
+            peer_type_defs_by_path = {
+                path: self._type_definitions(text)
+                for path, text in peer_added_by_file.items()
+            }
+
+            for selected_path, refs in selected_refs_by_path.items():
+                if not self._advisor_path_product_relevant(selected_path):
+                    continue
+                for provider_path, definitions in peer_label_defs_by_path.items():
+                    if not self._advisor_evidence_paths_compatible(selected_path, provider_path):
+                        continue
+                    for label in sorted(refs & definitions):
+                        add(
+                            peer_sha, "dts-label", label, f"&{label}",
+                            f"{label}:",
+                            selected_path=selected_path, provider_path=provider_path,
+                        )
+
+            for selected_path, macros in selected_macros_by_path.items():
+                if not self._advisor_path_product_relevant(selected_path):
+                    continue
+                for provider_path, definitions in peer_macro_defs_by_path.items():
+                    if not self._advisor_evidence_paths_compatible(selected_path, provider_path):
+                        continue
+                    for macro in sorted(macros & definitions):
+                        add(
+                            peer_sha, "macro", macro, macro,
+                            f"#define {macro}",
+                            selected_path=selected_path, provider_path=provider_path,
+                        )
+
+            # Function evidence is evaluated per selected-use path. A common
+            # declaration can support a supported architecture implementation, but an
+            # architecture-local implementation from an unsupported tree cannot.
+            for selected_path in sorted(selected_added_by_file):
+                if not self._advisor_path_product_relevant(selected_path):
+                    continue
+                calls = selected_calls_by_path.get(selected_path, set())
+                defs = selected_defs_by_path.get(selected_path, set())
+                for func in sorted(calls):
+                    declaration_paths = sorted(
+                        path for path, names in peer_function_decls_by_path.items()
+                        if func in names
+                        and self._advisor_evidence_paths_compatible(selected_path, path)
+                    )
+                    if declaration_paths:
+                        path = declaration_paths[0]
+                        add(
+                            peer_sha, "function-declaration", func,
+                            f"call to {func}(...)",
+                            f"declaration of {func}(...) in {path}",
+                            selected_path=selected_path, provider_path=path,
+                        )
+                        continue
+                    definition_paths = sorted(
+                        path for path, names in peer_function_defs_by_path.items()
+                        if func in names
+                        and self._advisor_evidence_paths_compatible(selected_path, path)
+                    )
+                    if definition_paths:
+                        path = definition_paths[0]
+                        add(
+                            peer_sha, "function", func,
+                            f"call to {func}(...)",
+                            f"definition of {func}(...) in {path}",
+                            selected_path=selected_path, provider_path=path,
+                        )
+
+                for func in sorted(defs):
+                    declaration_paths = sorted(
+                        path for path, names in peer_function_decls_by_path.items()
+                        if func in names
+                        and self._advisor_evidence_paths_compatible(selected_path, path)
+                    )
+                    if not declaration_paths:
+                        continue
+                    path = declaration_paths[0]
+                    add(
+                        peer_sha, "function-declaration", func,
+                        f"definition of {func}(...)",
+                        f"declaration of {func}(...) in {path}",
+                        selected_path=selected_path, provider_path=path,
+                    )
+
+            peer_include_aliases: dict[str, str] = {}
+            peer_new_files = self._new_files_in_patch(peer_patch)
+            for path in peer_new_files:
+                if not self._advisor_path_product_relevant(path):
+                    continue
+                for alias in self._include_aliases_for_path(path):
+                    peer_include_aliases.setdefault(alias, path)
+            for selected_path, includes in selected_includes_by_path.items():
+                if not self._advisor_path_product_relevant(selected_path):
+                    continue
+                for include in sorted(includes & set(peer_include_aliases)):
+                    provider_path = peer_include_aliases[include]
+                    if not self._advisor_evidence_paths_compatible(selected_path, provider_path):
+                        continue
+                    add(
+                        peer_sha, "included-file", include,
+                        f"#include <{include}>", provider_path,
+                        selected_path=selected_path, provider_path=provider_path,
+                    )
+
+            binding_peer = any(
+                path.startswith("Documentation/devicetree/bindings/") for path in peer_files
+            )
+            if binding_peer:
+                matching_compatibles = sorted(
+                    compat for compat in selected_compatibles if compat in peer_added
+                )
+                for compat in matching_compatibles:
+                    provider_path = next(
+                        (
+                            path for path, text in peer_added_by_file.items()
+                            if path.startswith("Documentation/devicetree/bindings/")
+                            and compat in text
+                        ),
+                        "",
+                    )
+                    add(
+                        peer_sha, "compatible-binding", compat,
+                        f'compatible = "{compat}"',
+                        f"binding text for compatible {compat}",
+                        provider_path=provider_path,
+                    )
+
+                for binding_path, binding_text in peer_added_by_file.items():
+                    if not binding_path.startswith("Documentation/devicetree/bindings/"):
+                        continue
+                    peer_properties = self._yaml_property_definitions(binding_text)
+                    if not peer_properties:
+                        continue
+                    compatible_sources = binding_compatible_sources.get(binding_path, {})
+                    for compat in sorted(compatible_sources):
+                        compat_peer_sha = (
+                            peer_sha if compat in binding_text
+                            else compatible_sources[compat]
+                        )
+                        for prop in sorted(selected_dt_properties & peer_properties):
+                            obj = f"{compat}:{prop}"
+                            if compat_peer_sha == peer_sha:
+                                kind = "dt-property-binding"
+                                provides = (
+                                    f"binding property {prop}: for compatible {compat} "
+                                    f"in {binding_path}"
+                                )
+                            else:
+                                kind = "dt-property-binding-series"
+                                provides = (
+                                    f"binding property {prop}: in {binding_path}; compatible "
+                                    f"{compat} is established for the same schema by earlier "
+                                    f"peer {compat_peer_sha[:12]}"
+                                )
+                            add(
+                                peer_sha, kind, obj,
+                                f"DTS property {prop} on compatible {compat}", provides,
+                                provider_path=binding_path,
+                            )
+
+            for selected_path, selected_types in selected_types_by_path.items():
+                if not self._advisor_path_product_relevant(selected_path):
+                    continue
+                for provider_path, definitions in peer_type_defs_by_path.items():
+                    if not self._advisor_evidence_paths_compatible(selected_path, provider_path):
+                        continue
+                    for type_kind, name in sorted(selected_types & definitions):
+                        add(
+                            peer_sha, "type-definition", f"{type_kind} {name}",
+                            f"use of {type_kind} {name}",
+                            f"definition of {type_kind} {name} in {provider_path}",
+                            selected_path=selected_path, provider_path=provider_path,
+                        )
+
+            if len(evidence) >= 64:
+                break
+
+        return evidence[:64]
+
+    def advisor_prerequisite_evidence(self, sha: str) -> list[dict[str, str]]:
+        """Return deterministic evidence eligible to support prerequisite output."""
+        return self.advisor_same_series_consumed_objects(sha)
+
+    def advisor_inbound_take_recommendations(self, sha: str) -> list[dict[str, str]]:
+        node = self.nodes.get(sha)
+        if node is None:
+            return []
+        return [
+            dict(item) for item in node.advisor_recommended_by
+            if item.get("consumer_decision") == "TAKE"
+        ]
+
+    def advisor_related_commit_context(self, sha: str, *, depth: int, requires_sha: str) -> dict:
+        node = self.nodes.get(sha)
+        files = (node.files if node and node.files else self.changed_files(sha))
+        data = {
+            "depth": depth,
+            "sha": sha,
+            "subject": self.subject(sha),
+            "provenance_child_sha": requires_sha,
+            "relationship_status": "provenance_only",
+            "changed_files": files,
+            "scope": self.advisor_scope_context(files),
+            "patch_excerpt": self.patch_excerpt(sha, self.args.advisor_max_related_diff_chars),
+        }
+        if node is not None:
+            data.update({
+                "direct": node.direct,
+                "dependency_kind": self.dependency_kind(node),
+                "evidence": sorted(node.reasons),
+                "replay": node.replay,
+                "conflict_files": node.conflict_files,
+                "advisor_decision": node.advisor_decision,
+                "advisor_error": node.advisor_error,
+            })
+        return data
+
+    def advisor_required_by_context(self, sha: str) -> list[dict]:
+        max_depth = max(0, self.args.advisor_required_by_depth)
+        max_commits = max(0, self.args.advisor_max_related_commits)
+        if max_depth == 0 or max_commits == 0:
+            return []
+        result: list[dict] = []
+        queue = collections.deque((parent, 1, sha) for parent in sorted(self.nodes[sha].required_by))
+        seen: set[str] = set()
+        while queue and len(result) < max_commits:
+            parent, depth, child = queue.popleft()
+            if parent in seen or depth > max_depth:
+                continue
+            seen.add(parent)
+            result.append(self.advisor_related_commit_context(parent, depth=depth, requires_sha=child))
+            parent_node = self.nodes.get(parent)
+            if parent_node is not None and depth < max_depth:
+                queue.extend(
+                    (grandparent, depth + 1, parent)
+                    for grandparent in sorted(parent_node.required_by)
+                )
+        return result
+
+    def advisor_packet(self, sha: str) -> dict:
+        n = self.nodes[sha]
+        fixes = [
+            {"sha": fixed, "subject": self.subject(fixed)}
+            for fixed in sorted(n.fixes)
+        ]
+        files = n.files or self.changed_files(sha)
+        all_missing_earlier_peers = self.advisor_allowed_prerequisite_peers(sha)
+        consumed_objects = self.advisor_prerequisite_evidence(sha)
+        n.advisor_consumed_objects = consumed_objects
+        evidence_backed_peers = list(dict.fromkeys(
+            item["peer_sha"] for item in consumed_objects
+        ))
+        inbound_take = self.advisor_inbound_take_recommendations(sha)
+        scope = self.advisor_scope_context(files)
+        default_bias = "NEUTRAL"
+        if n.direct and scope["touches_focus_paths"] and not scope["unsupported_architecture_only"]:
+            default_bias = "TAKE_UNLESS_CONCRETE_EXCLUSION"
+        return {
+            "planning_context": {
+                "base": self.base,
+                "target": self.target,
+                "downstream": self.downstream,
+                "downstream_ref": self.downstream_ref,
+                "focus_paths": self.paths,
+                "product": self.advisor_product_context(),
+                "policy": (
+                    "Prefer upstream alignment and low downstream divergence. For direct commits in "
+                    "the requested focus paths on a supported architecture, lack of affirmative evidence "
+                    "that a particular board or SoC is an officially supported RHEL platform is not an "
+                    "exclusion reason; prefer TAKE when there is no concrete exclusion reason. Do not carry "
+                    "architecture-only code for an unsupported product architecture merely because "
+                    "provenance or a shared symbol name caused the deterministic planner to connect it "
+                    "to a selected commit."
+                ),
+            },
+            "commit": {
+                "sha": sha,
+                "subject": n.subject,
+                "message": self._truncate_text(self.body(sha), self.args.advisor_max_message_chars),
+                "changed_files": files,
+                "scope": scope,
+                "default_policy_bias": default_bias,
+                "patch_excerpt": self.patch_excerpt(sha, self.args.advisor_max_diff_chars),
+                "direct": n.direct,
+                "dependency_kind": self.dependency_kind(n),
+                "evidence": sorted(n.reasons),
+                "deterministic_consumer_context": {
+                    "relationship_status": "provenance_only",
+                    "note": (
+                        "These commits are connected by deterministic discovery provenance. "
+                        "They are not inbound advisor prerequisite recommendations."
+                    ),
+                    "consumers": self.advisor_required_by_context(sha),
+                },
+                "fixes": fixes,
+                "replay": n.replay,
+                "conflict_files": n.conflict_files,
+                "merge_risk": n.merge_risk,
+                "same_series": self.advisor_series_context(sha),
+                "same_series_consumed_objects": consumed_objects,
+                "eligible_prerequisite_evidence": consumed_objects,
+                "eligible_prerequisite_peer_shas": evidence_backed_peers,
+                "all_missing_earlier_peer_shas": all_missing_earlier_peers,
+                "actual_inbound_take_prerequisites": inbound_take,
+                "actual_inbound_take_prerequisite_count": len(inbound_take),
+            },
+        }
+
+    def advisor_system_prompt(self) -> str:
+        return """You are the advisory layer of kernel-backport-planner, reviewing Linux
+kernel commits for an enterprise downstream backport plan. The deterministic planner has
+already gathered candidates and provenance. Your job is to recommend TAKE, SKIP, or REVIEW;
+you do not execute Git operations and you must not invent evidence.
+
+Evidence discipline:
+- Treat repository/tool data in the packet as verified evidence. Clearly base your decision on it.
+- Do not invent commits, symbols, functions, source paths, product support, command results, or tests.
+- If the supplied evidence is insufficient for a product-policy or dependency judgment, use REVIEW.
+
+Maintenance policy:
+- Upstream convergence is an explicit maintenance goal. Prefer TAKE for commits in the requested
+  focus area, required common/supporting code, and clean upstream context when there is no concrete
+  reason to exclude them. Immediate end-user feature relevance is not required.
+- When commit.default_policy_bias is TAKE_UNLESS_CONCRETE_EXCLUSION, TAKE is the default. Do NOT
+  SKIP merely because the packet lacks evidence that a particular board, laptop, SoC, or peripheral
+  is an officially supported RHEL product platform. Absence of such product-target evidence is not
+  an exclusion reason. This is especially important for direct arm64 DTS/platform commits in the
+  requested focus path, where carrying easy upstream context can reduce future divergence.
+- Product architecture support is explicit in planning_context.product. Architecture-owned code
+  for an unsupported product architecture should normally be SKIP unless concrete diff/graph
+  evidence shows that code built for a supported product architecture actually depends on it.
+  Architecture ownership can also appear outside arch/*, for example lib/crypto/arm/ versus
+  lib/crypto/arm64/.
+- A deterministic [DEPENDENCY] edge is evidence about textual/symbol/provenance relationships,
+  not proof that an unsupported architecture's implementation belongs in the product. Identical
+  symbol names can exist independently in different architecture trees.
+- commit.deterministic_consumer_context is provenance-only context supplied consumer-first and can
+  include multiple graph levels. It is NOT an inbound prerequisite recommendation. Use its changed
+  files, scope, diff excerpts, and deterministic evidence only to understand why the deterministic
+  planner connected commits. Another advisor decision is context, not verified evidence.
+- commit.actual_inbound_take_prerequisites is the only field containing concrete prerequisite
+  recommendations already made by TAKE consumers. If actual_inbound_take_prerequisite_count is 0,
+  there are NO inbound TAKE prerequisite recommendations. Never infer one from deterministic
+  consumer provenance, a DEPENDENCY edge, a shared symbol name, or prose in another field.
+- SKIP only for a concrete exclusion reason supported by the packet: unsupported architecture-only
+  code without a real cross-tree dependency, a known absent/inappropriate feature, obsolete/reverted
+  code, or meaningful integration/risk cost that outweighs convergence. Do not invent product
+  hardware-support policy that is not present in the evidence.
+- Use REVIEW when evidence is materially ambiguous. Do not turn uncertainty into confident prose.
+- replay: conflict is an integration-cost signal, not by itself a reason for REVIEW or SKIP. Judge
+  whether the commit belongs in the desired backport independently from how hard it may be to apply.
+  For a wanted commit, report an ordinary textual conflict as a risk while still choosing TAKE. Use
+  REVIEW for a conflict only when the supplied conflict/diff evidence creates genuine semantic
+  uncertainty about whether the upstream change belongs or can be reconciled safely.
+- Replay cleanliness is not proof that a full kernel build will succeed.
+
+Same-series prerequisite policy:
+- prerequisite_evidence_ids is evidence-bound. Every recommendation MUST be one evidence_id from
+  commit.eligible_prerequisite_evidence. Do not return peer SHAs or prerequisite prose; the planner
+  deterministically maps each evidence ID back to its peer commit and evidence record.
+- commit.eligible_prerequisite_evidence / commit.same_series_consumed_objects are deterministic
+  lexical evidence produced by the planner. Records can include selected_path/provider_path and
+  selected_architecture/provider_architecture so architecture-local name matches are not mistaken
+  for shared prerequisites. Evidence kinds can include DTS labels, macros,
+  function definitions/declarations, included headers, compatible strings matched to DT bindings,
+  compatible-scoped DT properties matched to those bindings (including same-schema binding-series
+  evidence where one earlier peer establishes the compatible and another adds the property), and
+  struct/enum definitions.
+- Recommend a peer only when one of these evidence records is a real semantic prerequisite for the
+  selected patch. Choose one strongest evidence record per peer. Do not recommend a peer merely
+  because it is in commit.all_missing_earlier_peer_shas.
+- Mere adjacency, earlier patch number, same series, touching the same file/subsystem, documentation
+  completeness, or vague statements such as 'may be required' are NOT sufficient.
+- Return at most one evidence ID per peer, choosing the strongest record that demonstrates why the
+  peer must accompany the selected patch. If your decision is SKIP, return no prerequisite evidence
+  IDs; a skipped commit does not need its own prerequisite recommendation chain.
+
+Inbound prerequisite consistency:
+- commit.actual_inbound_take_prerequisites contains concrete prerequisite recommendations already
+  made by TAKE consumers. For every such evidence_id, return exactly one inbound_prerequisite_assessment.
+- disposition REQUIRED means this candidate patch is still needed as a commit unit to satisfy that
+  TAKE consumer. A SKIP decision is invalid if any inbound assessment is REQUIRED.
+- disposition NOT_REQUIRED is allowed only when the supplied evidence shows why the consumer's
+  earlier prerequisite recommendation is unnecessary or satisfied elsewhere. State that concrete
+  reason; do not dismiss it merely because this candidate is in an unsupported architecture tree.
+- If the inbound recommendation cannot be confidently reconciled, use REVIEW rather than SKIP.
+
+The response must match the supplied JSON schema. Keep rationale concise and technical.
+"""
+
+    @staticmethod
+    def _match_peer_sha(value: str, allowed: set[str]) -> str | None:
+        value = value.strip().lower()
+        matches = [sha for sha in allowed if sha.startswith(value)]
+        return matches[0] if len(matches) == 1 else None
+
+    def validate_advisor_result(self, sha: str, result: dict) -> dict:
+        if not isinstance(result, dict):
+            raise AdvisorError(
+                "advisor result is not an object", kind="invalid-response", retryable=True
+            )
+        decision = result.get("decision")
+        if decision not in {"TAKE", "SKIP", "REVIEW"}:
+            raise AdvisorError(
+                f"invalid advisor decision: {decision!r}",
+                kind="invalid-response",
+                retryable=True,
+            )
+        rationale = result.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise AdvisorError(
+                "advisor rationale is missing", kind="invalid-response", retryable=True
+            )
+        raw_prereq_ids = result.get("prerequisite_evidence_ids", [])
+        raw_inbound = result.get("inbound_prerequisite_assessments", [])
+        raw_risks = result.get("risks", [])
+        if not isinstance(raw_prereq_ids, list) or not isinstance(raw_inbound, list) or not isinstance(raw_risks, list):
+            raise AdvisorError(
+                "advisor prerequisite_evidence_ids/inbound_prerequisite_assessments/risks must be arrays",
+                kind="invalid-response",
+                retryable=True,
+            )
+
+        evidence = self.advisor_prerequisite_evidence(sha)
+        evidence_by_id = {item["evidence_id"]: item for item in evidence}
+        prereqs: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        seen_peers: set[str] = set()
+        for evidence_id in ([] if decision == "SKIP" else raw_prereq_ids):
+            if not isinstance(evidence_id, str):
+                raise AdvisorError(
+                    "advisor prerequisite evidence ID is not a string",
+                    kind="invalid-response",
+                    retryable=True,
+                )
+            if evidence_id in seen_ids:
+                continue
+            seen_ids.add(evidence_id)
+            evidence_item = evidence_by_id.get(evidence_id)
+            if evidence_item is None:
+                raise AdvisorError(
+                    f"advisor proposed prerequisite without eligible deterministic evidence: "
+                    f"evidence_id={evidence_id!r}",
+                    kind="invalid-prerequisite",
+                    retryable=True,
+                )
+            peer_sha = evidence_item["peer_sha"]
+            # Multiple evidence records can point to one peer. Keep the first model-
+            # selected record rather than failing the whole response for redundancy.
+            if peer_sha in seen_peers:
+                continue
+            seen_peers.add(peer_sha)
+            reason = (
+                f"{evidence_item['kind']}:{evidence_item['object']}: selected patch uses/provides "
+                f"{evidence_item['selected_use']}; peer provides {evidence_item['peer_provides']}"
+            )
+            prereqs.append({
+                "sha": peer_sha,
+                "evidence_id": evidence_id,
+                "evidence_kind": evidence_item["kind"],
+                "evidence_object": evidence_item["object"],
+                "reason": reason,
+            })
+
+        inbound_recommendations = self.advisor_inbound_take_recommendations(sha)
+        inbound_by_id = {
+            item["evidence_id"]: item
+            for item in inbound_recommendations
+            if item.get("evidence_id")
+        }
+        inbound_assessments: list[dict[str, str]] = []
+        seen_inbound_ids: set[str] = set()
+        for item in raw_inbound:
+            if not isinstance(item, dict):
+                raise AdvisorError(
+                    "advisor inbound prerequisite assessment is not an object",
+                    kind="invalid-response",
+                    retryable=True,
+                )
+            evidence_id = item.get("evidence_id")
+            disposition = item.get("disposition")
+            reason = item.get("reason")
+            if (
+                not isinstance(evidence_id, str)
+                or disposition not in {"REQUIRED", "NOT_REQUIRED"}
+                or not isinstance(reason, str)
+                or not reason.strip()
+            ):
+                raise AdvisorError(
+                    "advisor inbound assessment lacks evidence_id/disposition/reason",
+                    kind="invalid-response",
+                    retryable=True,
+                )
+            if evidence_id not in inbound_by_id or evidence_id in seen_inbound_ids:
+                raise AdvisorError(
+                    f"advisor returned invalid/duplicate inbound evidence_id {evidence_id!r}",
+                    kind="invalid-response",
+                    retryable=True,
+                )
+            seen_inbound_ids.add(evidence_id)
+            inbound_assessments.append({
+                "evidence_id": evidence_id,
+                "disposition": disposition,
+                "reason": reason.strip(),
+            })
+
+        expected_inbound_ids = set(inbound_by_id)
+        if seen_inbound_ids != expected_inbound_ids:
+            missing = sorted(expected_inbound_ids - seen_inbound_ids)
+            extra = sorted(seen_inbound_ids - expected_inbound_ids)
+            raise AdvisorError(
+                f"advisor inbound assessments do not exactly cover TAKE-consumer recommendations "
+                f"(missing={missing}, extra={extra})",
+                kind="invalid-response",
+                retryable=True,
+            )
+        if decision == "SKIP" and any(
+            item["disposition"] == "REQUIRED" for item in inbound_assessments
+        ):
+            raise AdvisorError(
+                "advisor returned SKIP while marking an inbound TAKE-consumer prerequisite REQUIRED",
+                kind="invalid-response",
+                retryable=True,
+            )
+
+        risks = [x.strip() for x in raw_risks if isinstance(x, str) and x.strip()]
+        return {
+            "decision": decision,
+            "rationale": rationale.strip(),
+            "prerequisite_peers": prereqs,
+            "inbound_prerequisite_assessments": inbound_assessments,
+            "risks": risks,
+        }
+
+    def advisor_cache_key(self, sha: str, packet: dict) -> str:
+        fingerprint = json.dumps(
+            {
+                "prompt_version": ADVISOR_PROMPT_VERSION,
+                "model": self.advisor_model,
+                "base": self.base,
+                "target": self.target,
+                "downstream": self.downstream,
+                "packet": packet,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return sha + ":" + hashlib.sha256(fingerprint).hexdigest()
+
+    def save_advisor_cache(self) -> None:
+        if not self.advisor_cache_path or self.args.no_advisor_cache:
+            return
+        self.advisor_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.advisor_cache_path.with_name(self.advisor_cache_path.name + ".tmp")
+        tmp.write_text(json.dumps(self.advisor_cache, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, self.advisor_cache_path)
+
+    def advisor_distance_to_direct(
+        self, sha: str, memo: dict[str, int], visiting: set[str] | None = None
+    ) -> int:
+        if sha in memo:
+            return memo[sha]
+        node = self.nodes.get(sha)
+        if node is None:
+            return 10_000
+        if node.direct:
+            memo[sha] = 0
+            return 0
+        visiting = set() if visiting is None else visiting
+        if sha in visiting:
+            return 10_000
+        visiting.add(sha)
+        distances = [
+            1 + self.advisor_distance_to_direct(parent, memo, visiting.copy())
+            for parent in node.required_by
+            if parent in self.nodes and self.is_actionable_node(self.nodes[parent])
+        ]
+        distance = min(distances) if distances else 10_000
+        memo[sha] = distance
+        return distance
+
+    def advisor_order(self, ordered: Sequence[str]) -> list[str]:
+        """Advise consumers before deeper prerequisites while preserving stable order."""
+        index = {sha: pos for pos, sha in enumerate(ordered)}
+        memo: dict[str, int] = {}
+        return sorted(
+            ordered,
+            key=lambda sha: (self.advisor_distance_to_direct(sha, memo), index[sha]),
+        )
+
+    def _write_advisor_error_diagnostic(
+        self,
+        sha: str,
+        attempt: int,
+        exc: AdvisorError,
+        raw_result: object | None = None,
+    ) -> None:
+        path = getattr(self, "advisor_error_log_path", None)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as log_exc:
+            self.info(f"Could not create advisor error-log directory {path.parent}: {log_exc}")
+            return
+        raw_response = exc.raw_response
+        if raw_response is not None:
+            raw_response = self._truncate_text(raw_response, 4096)
+        raw_result_text = None
+        if raw_result is not None:
+            try:
+                raw_result_text = json.dumps(raw_result, sort_keys=True, ensure_ascii=False)
+            except (TypeError, ValueError):
+                raw_result_text = repr(raw_result)
+            raw_result_text = self._truncate_text(raw_result_text, 4096)
+        entry = {
+            "sha": sha,
+            "subject": self.nodes[sha].subject,
+            "attempt": attempt,
+            "kind": exc.kind,
+            "message": str(exc),
+            "prompt_version": ADVISOR_PROMPT_VERSION,
+            "raw_response": raw_response,
+            "raw_result": raw_result_text,
+        }
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+        except OSError as log_exc:
+            self.info(f"Could not write advisor error log {path}: {log_exc}")
+            return
+        self.advisor_error_log_entries = getattr(self, "advisor_error_log_entries", 0) + 1
+
+    def _advisor_call_with_retries(
+        self, client: OllamaAdvisor, prompt: str, sha: str, packet: dict
+    ) -> dict:
+        retries = max(0, self.args.advisor_retries)
+        schema = advisor_response_schema(
+            self.advisor_prerequisite_evidence(sha),
+            self.advisor_inbound_take_recommendations(sha),
+        )
+        last_error: AdvisorError | None = None
+        for attempt in range(retries + 1):
+            self.nodes[sha].advisor_attempts = attempt + 1
+            self.advisor_calls += 1
+            raw = None
+            try:
+                raw = client.advise(prompt, packet, schema)
+                return self.validate_advisor_result(sha, raw)
+            except AdvisorError as exc:
+                last_error = exc
+                self._write_advisor_error_diagnostic(sha, attempt + 1, exc, raw)
+                if not exc.retryable or attempt >= retries:
+                    raise
+                self.advisor_retries_used += 1
+                self.info(
+                    f"    advisor {exc.kind}; retry {attempt + 1}/{retries}: {exc}"
+                )
+                delay = max(0.0, self.args.advisor_retry_delay) * (2 ** attempt)
+                if delay:
+                    time.sleep(min(delay, 10.0))
+        assert last_error is not None
+        raise last_error
+
+    def _clear_advisor_recommendations_from(self, consumer_sha: str) -> None:
+        for node in self.nodes.values():
+            node.advisor_recommended_by = [
+                item for item in node.advisor_recommended_by
+                if item.get("consumer_sha") != consumer_sha
+            ]
+
+    def _record_advisor_prerequisite_recommendations(self, consumer_sha: str) -> None:
+        self._clear_advisor_recommendations_from(consumer_sha)
+        consumer = self.nodes[consumer_sha]
+        if consumer.advisor_decision != "TAKE":
+            return
+        evidence_by_id = {
+            item["evidence_id"]: item
+            for item in self.advisor_prerequisite_evidence(consumer_sha)
+        }
+        for prereq in consumer.advisor_prerequisites:
+            peer = self.nodes.get(prereq["sha"])
+            if peer is None or not self.is_actionable_node(peer):
+                continue
+            evidence = evidence_by_id.get(prereq.get("evidence_id", ""))
+            if evidence is None:
+                continue
+            peer.advisor_recommended_by.append({
+                "consumer_sha": consumer_sha,
+                "consumer_subject": consumer.subject,
+                "consumer_decision": consumer.advisor_decision,
+                "evidence_id": evidence["evidence_id"],
+                "evidence_kind": evidence["kind"],
+                "evidence_object": evidence["object"],
+                "consumer_use": evidence["selected_use"],
+                "candidate_provides": evidence["peer_provides"],
+                "reason": prereq["reason"],
+            })
+
+    def _advisor_note_failure(self, node: CommitNode, exc: AdvisorError) -> None:
+        previous = node.advisor_error_kind
+        if previous:
+            self.advisor_failure_kinds[previous] -= 1
+            if self.advisor_failure_kinds[previous] <= 0:
+                del self.advisor_failure_kinds[previous]
+        else:
+            self.advisor_failures += 1
+        self.advisor_failure_kinds[exc.kind] += 1
+        self._clear_advisor_recommendations_from(node.sha)
+        node.advisor_decision = "REVIEW"
+        node.advisor_rationale = (
+            f"Advisor failed ({exc.kind}); manual review required. {exc}"
+        )
+        node.advisor_prerequisites = []
+        node.advisor_rejected_prerequisites = []
+        node.advisor_inbound_assessments = []
+        node.advisor_risks = []
+        node.advisor_error = str(exc)
+        node.advisor_error_kind = exc.kind
+
+    def _advisor_note_success(self, node: CommitNode, result: dict) -> None:
+        previous = node.advisor_error_kind
+        if previous:
+            self.advisor_failures = max(0, self.advisor_failures - 1)
+            self.advisor_failure_kinds[previous] -= 1
+            if self.advisor_failure_kinds[previous] <= 0:
+                del self.advisor_failure_kinds[previous]
+        node.advisor_decision = result["decision"]
+        node.advisor_rationale = result["rationale"]
+        node.advisor_prerequisites = result["prerequisite_peers"]
+        node.advisor_rejected_prerequisites = []
+        node.advisor_inbound_assessments = result["inbound_prerequisite_assessments"]
+        node.advisor_risks = result["risks"]
+        node.advisor_error = None
+        node.advisor_error_kind = None
+        self._record_advisor_prerequisite_recommendations(node.sha)
+
+    def _advisor_evaluate_one(
+        self, client: OllamaAdvisor, prompt: str, sha: str, *, reconsideration: bool = False
+    ) -> None:
+        node = self.nodes[sha]
+        packet = self.advisor_packet(sha)
+        cache_key = self.advisor_cache_key(sha, packet)
+        cached = None if self.args.no_advisor_cache else self.advisor_cache.get(cache_key)
+        try:
+            if cached is not None:
+                result = self.validate_advisor_result(sha, cached)
+                self.advisor_cache_hits += 1
+                node.advisor_attempts = 0
+            else:
+                result = self._advisor_call_with_retries(client, prompt, sha, packet)
+                if not self.args.no_advisor_cache:
+                    self.advisor_cache[cache_key] = result
+                    self.save_advisor_cache()
+            self._advisor_note_success(node, result)
+        except AdvisorError as exc:
+            self._advisor_note_failure(node, exc)
+            label = "reconsideration error" if reconsideration else "advisor error"
+            self.info(f"    {label} [{exc.kind}]: {exc}")
+
+    def _advisor_unassessed_inbound_ids(self, sha: str) -> set[str]:
+        inbound = {
+            item["evidence_id"]
+            for item in self.advisor_inbound_take_recommendations(sha)
+            if item.get("evidence_id")
+        }
+        assessed = {
+            item["evidence_id"]
+            for item in self.nodes[sha].advisor_inbound_assessments
+            if item.get("evidence_id")
+        }
+        return inbound - assessed
+
+    def _advisor_reconciliation_pass(
+        self, client: OllamaAdvisor, prompt: str, ordered: Sequence[str]
+    ) -> None:
+        """Re-evaluate nodes that gained TAKE-consumer prerequisites too late.
+
+        Consumer-first graph depth cannot totally order same-depth series peers. A
+        later model decision may therefore discover a concrete prerequisite for a
+        candidate already judged SKIP/REVIEW. Reconsider only when new inbound
+        evidence has not yet been assessed, and bound the pass to at most twice the
+        advised population to prevent pathological feedback loops.
+        """
+        seen_contexts: set[tuple[str, tuple[str, ...]]] = set()
+        max_reconsiderations = max(1, len(ordered) * 2)
+        while self.advisor_reconsiderations < max_reconsiderations:
+            candidate = None
+            context_key = None
+            for sha in ordered:
+                node = self.nodes[sha]
+                if node.advisor_decision not in {"SKIP", "REVIEW"}:
+                    continue
+                missing = self._advisor_unassessed_inbound_ids(sha)
+                if not missing:
+                    continue
+                key = (sha, tuple(sorted(
+                    item["evidence_id"]
+                    for item in self.advisor_inbound_take_recommendations(sha)
+                    if item.get("evidence_id")
+                )))
+                if key in seen_contexts:
+                    continue
+                candidate = sha
+                context_key = key
+                break
+            if candidate is None or context_key is None:
+                break
+            seen_contexts.add(context_key)
+            self.advisor_reconsiderations += 1
+            node = self.nodes[candidate]
+            self.info(
+                f"  advisor reconsider {self.advisor_reconsiderations}: "
+                f"{candidate[:12]} {node.subject} "
+                f"[{len(context_key[1])} inbound TAKE prerequisite(s)]"
+            )
+            self._advisor_evaluate_one(
+                client, prompt, candidate, reconsideration=True
+            )
+
+    def _advisor_resolve_rejected_prerequisites(self) -> None:
+        """Remove prerequisite edges explicitly rejected by the candidate peer.
+
+        A TAKE consumer may nominate concrete evidence, while the candidate peer may
+        later assess that exact inbound evidence as NOT_REQUIRED. That is a resolved
+        relationship, not a consistency failure. Preserve the rejected edge for audit
+        while removing it from the active execution graph.
+        """
+        for consumer in self.nodes.values():
+            consumer.advisor_rejected_prerequisites = []
+            if consumer.advisor_decision != "TAKE" or not consumer.advisor_prerequisites:
+                continue
+            active: list[dict[str, str]] = []
+            for prereq in consumer.advisor_prerequisites:
+                peer = self.nodes.get(prereq.get("sha", ""))
+                evidence_id = prereq.get("evidence_id", "")
+                assessment = None
+                if peer is not None and evidence_id:
+                    assessment = next(
+                        (
+                            item for item in peer.advisor_inbound_assessments
+                            if item.get("evidence_id") == evidence_id
+                            and item.get("disposition") == "NOT_REQUIRED"
+                        ),
+                        None,
+                    )
+                if assessment is None:
+                    active.append(prereq)
+                    continue
+                rejected = dict(prereq)
+                rejected["candidate_decision"] = peer.advisor_decision or ""
+                rejected["assessment_disposition"] = "NOT_REQUIRED"
+                rejected["assessment_reason"] = assessment.get("reason", "")
+                consumer.advisor_rejected_prerequisites.append(rejected)
+            consumer.advisor_prerequisites = active
+
+    def _advisor_check_consistency(self) -> None:
+        self.advisor_consistency_issues = []
+        for node in self.nodes.values():
+            node.advisor_consistency_warnings = []
+
+        for consumer_sha, consumer in self.nodes.items():
+            if consumer.advisor_decision != "TAKE":
+                continue
+            for prereq in consumer.advisor_prerequisites:
+                peer_sha = prereq["sha"]
+                peer = self.nodes.get(peer_sha)
+                if (
+                    peer is None
+                    or not self.is_actionable_node(peer)
+                    or peer.advisor_decision is None
+                    or peer.advisor_decision == "TAKE"
+                ):
+                    continue
+                evidence_id = prereq.get("evidence_id", "")
+                assessment = next(
+                    (
+                        item for item in peer.advisor_inbound_assessments
+                        if item.get("evidence_id") == evidence_id
+                    ),
+                    None,
+                )
+                if assessment and assessment.get("disposition") == "NOT_REQUIRED":
+                    continue
+                issue = {
+                    "kind": f"TAKE->{peer.advisor_decision}",
+                    "consumer_sha": consumer_sha,
+                    "consumer_subject": consumer.subject,
+                    "prerequisite_sha": peer_sha,
+                    "prerequisite_subject": peer.subject,
+                    "prerequisite_decision": peer.advisor_decision,
+                    "evidence_id": evidence_id,
+                    "evidence_kind": prereq.get("evidence_kind", ""),
+                    "evidence_object": prereq.get("evidence_object", ""),
+                    "reason": prereq.get("reason", ""),
+                    "assessment_disposition": assessment.get("disposition", "") if assessment else "",
+                    "assessment_reason": assessment.get("reason", "") if assessment else "",
+                }
+                self.advisor_consistency_issues.append(issue)
+                consumer.advisor_consistency_warnings.append({
+                    "role": "consumer",
+                    **issue,
+                })
+                peer.advisor_consistency_warnings.append({
+                    "role": "prerequisite",
+                    **issue,
+                })
+
+    def run_advisor(self) -> None:
+        if not self.advisor_model:
+            return
+
+        requested: set[str] | None = None
+        if self.args.advisor_commit:
+            requested = set()
+            for value in self.args.advisor_commit:
+                resolved = self.git.rev_parse(value)
+                if resolved not in self.nodes or not self.is_actionable_node(self.nodes[resolved]):
+                    raise SystemExit(f"--advisor-commit {value} is not an actionable planner commit")
+                requested.add(resolved)
+
+        if self.args.advisor_limit is not None and self.args.advisor_limit < 1:
+            raise SystemExit("--advisor-limit must be >= 1")
+
+        plan_order = [sha for sha in self.ordered_missing() if requested is None or sha in requested]
+        ordered = self.advisor_order(plan_order)
+        if self.args.advisor_limit is not None:
+            ordered = ordered[:self.args.advisor_limit]
+
+        # Clear transient advisor graph state in case a Planner instance is reused.
+        for node in self.nodes.values():
+            node.advisor_recommended_by = []
+            node.advisor_inbound_assessments = []
+            node.advisor_rejected_prerequisites = []
+            node.advisor_consistency_warnings = []
+        self.advisor_consistency_issues = []
+        self.advisor_reconsiderations = 0
+
+        self.info(
+            f"Running advisor model {self.advisor_model} for {len(ordered)} commit(s) "
+            "(consumer-first graph order)..."
+        )
+        client = OllamaAdvisor(
+            model=self.advisor_model,
+            base_url=self.args.advisor_base_url,
+            timeout=self.args.advisor_timeout,
+            temperature=self.args.advisor_temperature,
+            keep_alive=self.args.advisor_keep_alive,
+            debug=self.args.debug,
+        )
+        prompt = self.advisor_system_prompt()
+        for pos, sha in enumerate(ordered, 1):
+            n = self.nodes[sha]
+            distance = self.advisor_distance_to_direct(sha, {})
+            distance_text = "direct" if distance == 0 else f"dependency-depth={distance}"
+            self.info(
+                f"  advisor {pos}/{len(ordered)}: {sha[:12]} {n.subject} [{distance_text}]"
+            )
+            self._advisor_evaluate_one(client, prompt, sha)
+
+        self._advisor_reconciliation_pass(client, prompt, ordered)
+        self._advisor_resolve_rejected_prerequisites()
+        self._advisor_check_consistency()
 
     def aliases_for(self, sha: str) -> set[str]:
         aliases = {sha}
@@ -1137,6 +2915,47 @@ class Planner:
             f"plan:         {len(actionable)} "
             f"({direct} direct, {deps} dependency)"
         )
+        if getattr(self, "advisor_model", None):
+            advised_nodes = [n for n in actionable if n.advisor_decision]
+            successful = [n for n in advised_nodes if not n.advisor_error]
+            counts = collections.Counter(n.advisor_decision for n in successful)
+            failures = sum(1 for n in advised_nodes if n.advisor_error)
+            lines.append(f"advisor-model: {self.advisor_model}")
+            lines.append(
+                f"advisor:      {len(successful)} recommendation(s) "
+                f"({counts.get('TAKE', 0)} TAKE, {counts.get('SKIP', 0)} SKIP, "
+                f"{counts.get('REVIEW', 0)} REVIEW), {failures} advisor failure(s) -> REVIEW"
+            )
+            lines.append(
+                f"advisor-run:  {getattr(self, 'advisor_calls', 0)} model call(s), "
+                f"{getattr(self, 'advisor_retries_used', 0)} retry/retries, "
+                f"{getattr(self, 'advisor_cache_hits', 0)} cache hit(s), "
+                f"{getattr(self, 'advisor_reconsiderations', 0)} reconsideration(s), "
+                f"{getattr(self, 'advisor_error_log_entries', 0)} diagnostic error record(s)"
+            )
+            if getattr(self, "advisor_error_log_entries", 0) and self.advisor_error_log_path:
+                lines.append(f"advisor-error-log: {self.advisor_error_log_path}")
+            consistency = getattr(self, "advisor_consistency_issues", [])
+            if consistency:
+                consistency_counts = collections.Counter(x["kind"] for x in consistency)
+                lines.append(
+                    "advisor-consistency: "
+                    + f"{len(consistency)} unresolved issue(s) ("
+                    + ", ".join(
+                        f"{kind}={count}" for kind, count in sorted(consistency_counts.items())
+                    )
+                    + ")"
+                )
+            else:
+                lines.append("advisor-consistency: 0 unresolved TAKE->prerequisite issue(s)")
+            if getattr(self, "advisor_failure_kinds", None):
+                lines.append(
+                    "advisor-failures: "
+                    + ", ".join(
+                        f"{kind}={count}"
+                        for kind, count in sorted(self.advisor_failure_kinds.items())
+                    )
+                )
         if self.args.show_dependency_candidates:
             lines.append(f"dependency-candidates: {tentative} informational")
         lines.append(f"status:       {missing} missing, {present} already downstream")
@@ -1152,7 +2971,10 @@ class Planner:
             label = ""
             if kind == "dependency":
                 label = " [DEPENDENCY]"
-            lines.append(f'{sha[:12]}{label} ("{n.subject}")')
+            advisor_comment = ""
+            if n.advisor_decision:
+                advisor_comment = " // " + n.advisor_decision.title()
+            lines.append(f'{sha[:12]}{label} ("{n.subject}"){advisor_comment}')
 
             # Focus-path selection is the default and is therefore left
             # unmarked; only exceptional dependency commits are labeled.
@@ -1189,6 +3011,65 @@ class Planner:
             if n.subject_hints:
                 lines.append("      same-subject downstream hint (NOT proof): " +
                              ", ".join(x[:12] for x in n.subject_hints[:5]))
+            if n.advisor_decision:
+                lines.append(f"      advisor: {n.advisor_decision}")
+                if n.advisor_rationale:
+                    lines.append(
+                        f"      advisor-rationale: {self._one_line(n.advisor_rationale)}"
+                    )
+                for item in n.advisor_prerequisites:
+                    peer_sha = item["sha"]
+                    evidence = ""
+                    if item.get("evidence_id"):
+                        detail = ":".join(
+                            x for x in (
+                                item.get("evidence_kind", ""),
+                                item.get("evidence_object", ""),
+                            ) if x
+                        )
+                        evidence = f' [evidence {item["evidence_id"]}' + (f" {detail}" if detail else "") + "]"
+                    lines.append(
+                        f'      advisor-prerequisite: {peer_sha[:12]} '
+                        f'("{self.subject(peer_sha)}"){evidence} - {self._one_line(item["reason"])}'
+                    )
+                for item in n.advisor_rejected_prerequisites:
+                    peer_sha = item["sha"]
+                    lines.append(
+                        f'      advisor-rejected-prerequisite: {peer_sha[:12]} '
+                        f'("{self.subject(peer_sha)}") evidence={item.get("evidence_id", "?")} '
+                        f'NOT_REQUIRED - {self._one_line(item.get("assessment_reason", ""))}'
+                    )
+                for item in n.advisor_recommended_by:
+                    lines.append(
+                        f'      advisor-recommended-by: {item["consumer_sha"][:12]} '
+                        f'("{item["consumer_subject"]}") [{item.get("consumer_decision", "?")}] '
+                        f'evidence={item.get("evidence_id", "?")} '
+                        f'{item.get("evidence_kind", "?")}:{item.get("evidence_object", "?")}'
+                    )
+                for item in n.advisor_inbound_assessments:
+                    lines.append(
+                        f'      advisor-inbound-assessment: {item["evidence_id"]} '
+                        f'{item["disposition"]} - {self._one_line(item["reason"])}'
+                    )
+                for item in n.advisor_consistency_warnings:
+                    if item.get("role") == "consumer":
+                        text = (
+                            f'prerequisite {item["prerequisite_sha"][:12]} is '
+                            f'{item["prerequisite_decision"]}'
+                        )
+                    else:
+                        text = (
+                            f'recommended by TAKE consumer {item["consumer_sha"][:12]} '
+                            f'but this decision is {item["prerequisite_decision"]}'
+                        )
+                    lines.append(f"      advisor-consistency-warning: {text}")
+                for risk in n.advisor_risks:
+                    lines.append(f"      advisor-risk: {self._one_line(risk)}")
+                if n.advisor_error:
+                    lines.append(
+                        f"      advisor-error: {n.advisor_error_kind or 'unknown'}: "
+                        f"{self._one_line(n.advisor_error)}"
+                    )
 
         if self.args.show_dependency_candidates:
             candidates = sorted(
@@ -1295,6 +3176,22 @@ class Planner:
             "replay_rounds_run": self.replay_rounds_run,
             "replay_final_verification": self.replay_final_verification,
             "paths": self.paths,
+            "advisor": None if not getattr(self, "advisor_model", None) else {
+                "model": self.advisor_model,
+                "base_url": normalize_http_base_url(self.args.advisor_base_url),
+                "prompt_version": ADVISOR_PROMPT_VERSION,
+                "model_calls": getattr(self, "advisor_calls", 0),
+                "retries_used": getattr(self, "advisor_retries_used", 0),
+                "reconsiderations": getattr(self, "advisor_reconsiderations", 0),
+                "failures": getattr(self, "advisor_failures", 0),
+                "failure_kinds": dict(getattr(self, "advisor_failure_kinds", {})),
+                "cache_hits": getattr(self, "advisor_cache_hits", 0),
+                "product": self.advisor_product_context(),
+                "consistency_issues": list(getattr(self, "advisor_consistency_issues", [])),
+                "cache_path": str(self.advisor_cache_path) if getattr(self, "advisor_cache_path", None) else None,
+                "error_log_path": str(self.advisor_error_log_path) if getattr(self, "advisor_error_log_path", None) else None,
+                "error_log_entries": getattr(self, "advisor_error_log_entries", 0),
+            },
             "order": self.ordered_missing(),
             "commits": {
                 sha: {
@@ -1315,6 +3212,19 @@ class Planner:
                     "conflict_files": n.conflict_files,
                     "subject_hints": n.subject_hints,
                     "series_ids": sorted(n.series_ids),
+                    "advisor_decision": n.advisor_decision,
+                    "advisor_rationale": n.advisor_rationale,
+                    "advisor_prerequisites": n.advisor_prerequisites,
+                    "advisor_rejected_prerequisites": n.advisor_rejected_prerequisites,
+                    "advisor_consumed_objects": n.advisor_consumed_objects,
+                    "advisor_prerequisite_evidence": n.advisor_consumed_objects,
+                    "advisor_recommended_by": n.advisor_recommended_by,
+                    "advisor_inbound_assessments": n.advisor_inbound_assessments,
+                    "advisor_consistency_warnings": n.advisor_consistency_warnings,
+                    "advisor_risks": n.advisor_risks,
+                    "advisor_error": n.advisor_error,
+                    "advisor_error_kind": n.advisor_error_kind,
+                    "advisor_attempts": n.advisor_attempts,
                 }
                 for sha, n in self.nodes.items()
             },
@@ -1390,6 +3300,78 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--max-merge-risks", type=int, default=5)
     p.add_argument("--check-command",
                    help="optional shell command to run after a clean replay, e.g. 'make -j8 ARCH=arm64'")
+    p.add_argument(
+        "--advisor-model",
+        help="optional Ollama model for AI-assisted TAKE/SKIP/REVIEW recommendations",
+    )
+    p.add_argument(
+        "--advisor-base-url",
+        default=os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"),
+        help="Ollama base URL (default: OLLAMA_HOST or http://127.0.0.1:11434)",
+    )
+    p.add_argument(
+        "--advisor-timeout", type=float, default=300.0,
+        help="per-commit advisor request timeout in seconds (default: 300)",
+    )
+    p.add_argument(
+        "--advisor-retries", type=int, default=2,
+        help="retry transient/invalid advisor responses this many times (default: 2)",
+    )
+    p.add_argument(
+        "--advisor-retry-delay", type=float, default=1.0,
+        help="initial seconds between advisor retries; exponential backoff, capped at 10s (default: 1)",
+    )
+    p.add_argument(
+        "--advisor-product", choices=("auto", "rhel10", "generic"), default="auto",
+        help="product policy context for advisor (default: auto; cs10 selects rhel10)",
+    )
+    p.add_argument(
+        "--advisor-temperature", type=float, default=0.1,
+        help="Ollama advisor temperature (default: 0.1)",
+    )
+    p.add_argument(
+        "--advisor-keep-alive", default="10m",
+        help="Ollama model keep-alive duration (default: 10m)",
+    )
+    p.add_argument(
+        "--advisor-limit", type=int,
+        help="advise only the first N matching missing planner commits (testing aid)",
+    )
+    p.add_argument(
+        "--advisor-commit", action="append",
+        help="advise only this actionable planner commit (repeatable; accepts Git revisions)",
+    )
+    p.add_argument(
+        "--advisor-cache",
+        help="advisor cache JSON path (default: <output>.advisor-cache.json)",
+    )
+    p.add_argument(
+        "--advisor-error-log",
+        help="advisor diagnostic JSONL path (default: <output>.advisor-errors.jsonl)",
+    )
+    p.add_argument(
+        "--no-advisor-cache", action="store_true",
+        help="disable persistent advisor response caching",
+    )
+    p.add_argument("--advisor-max-message-chars", type=int, default=6000)
+    p.add_argument("--advisor-max-diff-chars", type=int, default=12000)
+    p.add_argument("--advisor-max-peer-diff-chars", type=int, default=6000)
+    p.add_argument(
+        "--advisor-max-peer-diffs", type=int, default=6,
+        help="max missing earlier same-series peer diffs included per candidate (default: 6)",
+    )
+    p.add_argument(
+        "--advisor-required-by-depth", type=int, default=3,
+        help="dependency-consumer graph depth included in advisor evidence (default: 3)",
+    )
+    p.add_argument(
+        "--advisor-max-related-commits", type=int, default=8,
+        help="max required-by consumer commits included in advisor evidence (default: 8)",
+    )
+    p.add_argument(
+        "--advisor-max-related-diff-chars", type=int, default=5000,
+        help="max diff characters per required-by consumer in advisor evidence (default: 5000)",
+    )
     p.add_argument("--format", choices=("text", "json"), default="text")
     p.add_argument("--output", help="write report to this file instead of stdout")
     p.add_argument("--quiet", action="store_true")
@@ -1402,6 +3384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
     planner = Planner(args)
     planner.collect()
+    planner.run_advisor()
     check_result = planner.run_check_command()
     report = planner.report_json(check_result) if args.format == "json" else planner.report_text(check_result)
     if args.output:
