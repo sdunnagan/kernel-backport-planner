@@ -414,6 +414,57 @@ class AdvisorTests(unittest.TestCase):
         self.assertEqual(packet["commit"]["default_policy_bias"], "TAKE_UNLESS_CONCRETE_EXCLUSION")
         self.assertIn("not an exclusion reason", packet["planning_context"]["policy"])
 
+    def test_direct_focus_bias_is_subsystem_generic(self):
+        cases = [
+            (["arch/arm64/"], "arch/arm64/kernel/foo.c"),
+            (["arch/x86/"], "arch/x86/kernel/foo.c"),
+            (["mm/"], "mm/page_alloc.c"),
+            (["drivers/net/"], "drivers/net/ethernet/vendor/foo.c"),
+        ]
+        for paths, changed_file in cases:
+            with self.subTest(paths=paths):
+                planner = self.minimal_planner()
+                planner.paths = paths
+                node = kbp.CommitNode("a" * 40, "direct focus change", direct=True)
+                node.files = [changed_file]
+                planner.nodes = {node.sha: node}
+                planner.subject = lambda _sha: node.subject
+                planner.changed_files = lambda _sha: node.files
+                planner.patch_excerpt = lambda _sha, _limit: "+int changed;"
+                planner.body = lambda _sha: node.subject
+
+                packet = planner.advisor_packet(node.sha)
+                self.assertEqual(
+                    packet["commit"]["default_policy_bias"],
+                    "TAKE_UNLESS_CONCRETE_EXCLUSION",
+                )
+                if changed_file.startswith("mm/") or changed_file.startswith("drivers/"):
+                    self.assertEqual(packet["commit"]["scope"]["architecture_scope"], "common")
+                    self.assertIsNone(packet["commit"]["scope"]["touches_supported_architecture"])
+
+    def test_generic_product_does_not_apply_rhel_architecture_allowlist(self):
+        planner = self.minimal_planner()
+        planner.args.advisor_product = "generic"
+        planner.paths = ["arch/loongarch/"]
+        node = kbp.CommitNode("a" * 40, "loongarch: direct focus change", direct=True)
+        node.files = ["arch/loongarch/kernel/foo.c"]
+        planner.nodes = {node.sha: node}
+        planner.subject = lambda _sha: node.subject
+        planner.changed_files = lambda _sha: node.files
+        planner.patch_excerpt = lambda _sha, _limit: "+int changed;"
+        planner.body = lambda _sha: node.subject
+
+        packet = planner.advisor_packet(node.sha)
+        self.assertIsNone(
+            packet["planning_context"]["product"]["supported_architectures"]
+        )
+        self.assertFalse(packet["commit"]["scope"]["unsupported_architecture_only"])
+        self.assertEqual(packet["commit"]["scope"]["architecture_scope"], "unrestricted")
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "TAKE_UNLESS_CONCRETE_EXCLUSION",
+        )
+
 
     def test_rhel10_product_context_and_unsupported_arch_scope(self):
         planner = self.minimal_planner()
@@ -429,6 +480,24 @@ class AdvisorTests(unittest.TestCase):
         arm_scope = planner.advisor_scope_context(["arch/arm64/kernel/ptrace.c"])
         self.assertFalse(arm_scope["unsupported_architecture_only"])
         self.assertTrue(arm_scope["touches_focus_paths"])
+
+    def test_unsupported_arch_scope_uses_architecture_owned_library_paths(self):
+        planner = self.minimal_planner()
+        arm32 = planner.advisor_scope_context(["lib/crypto/arm/nh.h"])
+        self.assertEqual(arm32["architecture_dirs"], ["arm"])
+        self.assertTrue(arm32["unsupported_architecture_only"])
+        self.assertEqual(arm32["architecture_scope"], "unsupported-only")
+
+        arm64 = planner.advisor_scope_context(["lib/crypto/arm64/nh.h"])
+        self.assertEqual(arm64["architecture_dirs"], ["arm64"])
+        self.assertFalse(arm64["unsupported_architecture_only"])
+        self.assertEqual(arm64["architecture_scope"], "supported-or-mixed")
+
+        mixed = planner.advisor_scope_context(
+            ["lib/crypto/arm/nh.h", "include/crypto/nh.h"]
+        )
+        self.assertFalse(mixed["unsupported_architecture_only"])
+        self.assertEqual(mixed["architecture_scope"], "common-plus-unsupported")
 
     def test_dynamic_schema_constrains_prerequisite_shas_and_evidence_ids(self):
         a = "a" * 40
@@ -493,11 +562,14 @@ class AdvisorTests(unittest.TestCase):
                 "+    maxItems: 1\n"
             ),
             selected.sha: (
+                "diff --git a/mm/init.c b/mm/init.c\n"
                 "+#include <linux/new_api.h>\n"
                 "+void __init arch_zone_limits_init(void)\n"
                 "+{\n"
                 "+    struct widget *w;\n"
                 "+}\n"
+                "diff --git a/arch/arm64/boot/dts/vendor/board.dts "
+                "b/arch/arm64/boot/dts/vendor/board.dts\n"
                 "+compatible = \"vendor,board\";\n"
                 "+power-domains = <&gcc 1>;\n"
             ),
@@ -721,6 +793,202 @@ class AdvisorTests(unittest.TestCase):
             and item["kind"].startswith("dt-property-binding")
             for item in evidence
         ))
+
+    def test_talos_binding_example_label_is_not_dts_provider(self):
+        planner = self.minimal_planner()
+        selected = kbp.CommitNode("b" * 40, "arm64: dts: qcom: talos: add displayport", direct=True)
+        selected.files = ["arch/arm64/boot/dts/qcom/talos.dtsi"]
+        selected.series_ids.add("S101")
+        peer = "a" * 40
+        binding = "Documentation/devicetree/bindings/display/msm/qcom,sm6150-mdss.yaml"
+        planner.nodes = {selected.sha: selected}
+        planner.series_groups = {"S101": [(2, peer), (3, selected.sha)]}
+        planner.match = lambda _sha: kbp.Match(status="missing")
+        planner.subject = lambda sha: (
+            "dt-bindings: display: fix example" if sha == peer else selected.subject
+        )
+        planner.changed_files = lambda sha: [binding] if sha == peer else selected.files
+        planner.patch_excerpt = lambda sha, _limit: (
+            f"diff --git a/{binding} b/{binding}\n"
+            "+examples:\n"
+            "+  - |\n"
+            "+    dpu_intf0_out: endpoint { };\n"
+            if sha == peer else
+            "diff --git a/arch/arm64/boot/dts/qcom/talos.dtsi "
+            "b/arch/arm64/boot/dts/qcom/talos.dtsi\n"
+            "+remote-endpoint = <&dpu_intf0_out>;\n"
+        )
+
+        evidence = planner.advisor_prerequisite_evidence(selected.sha)
+        self.assertFalse(any(
+            item["peer_sha"] == peer and item["kind"] == "dts-label"
+            for item in evidence
+        ))
+
+    def test_static_tpdm_binding_example_label_is_not_dts_provider(self):
+        planner = self.minimal_planner()
+        selected = kbp.CommitNode("b" * 40, "arm64: dts: qcom: lemans: enable static TPDM", direct=True)
+        selected.files = ["arch/arm64/boot/dts/qcom/sa8775p.dtsi"]
+        selected.series_ids.add("S115")
+        peer = "a" * 40
+        binding = "Documentation/devicetree/bindings/arm/qcom,coresight-tpdm.yaml"
+        planner.nodes = {selected.sha: selected}
+        planner.series_groups = {"S115": [(1, peer), (3, selected.sha)]}
+        planner.match = lambda _sha: kbp.Match(status="missing")
+        planner.subject = lambda sha: (
+            "dt-bindings: arm: document static TPDM" if sha == peer else selected.subject
+        )
+        planner.changed_files = lambda sha: [binding] if sha == peer else selected.files
+        planner.patch_excerpt = lambda sha, _limit: (
+            f"diff --git a/{binding} b/{binding}\n"
+            "+examples:\n"
+            "+  - |\n"
+            "+    turing_llm_tpdm_out: endpoint { };\n"
+            if sha == peer else
+            "diff --git a/arch/arm64/boot/dts/qcom/sa8775p.dtsi "
+            "b/arch/arm64/boot/dts/qcom/sa8775p.dtsi\n"
+            "+remote-endpoint = <&turing_llm_tpdm_out>;\n"
+        )
+
+        evidence = planner.advisor_prerequisite_evidence(selected.sha)
+        self.assertFalse(any(
+            item["peer_sha"] == peer and item["kind"] == "dts-label"
+            for item in evidence
+        ))
+
+    def test_binding_example_compatible_assignment_is_not_schema_evidence(self):
+        planner = self.minimal_planner()
+        selected = kbp.CommitNode("b" * 40, "arm64: dts: add board", direct=True)
+        selected.files = ["arch/arm64/boot/dts/vendor/board.dts"]
+        selected.series_ids.add("S001")
+        peer = "a" * 40
+        binding = "Documentation/devicetree/bindings/arm/vendor,board.yaml"
+        planner.nodes = {selected.sha: selected}
+        planner.series_groups = {"S001": [(1, peer), (2, selected.sha)]}
+        planner.match = lambda _sha: kbp.Match(status="missing")
+        planner.subject = lambda sha: "dt-bindings: edit example" if sha == peer else selected.subject
+        planner.changed_files = lambda sha: [binding] if sha == peer else selected.files
+        planner.patch_excerpt = lambda sha, _limit: (
+            f"diff --git a/{binding} b/{binding}\n"
+            "+examples:\n"
+            "+  - |\n"
+            "+    compatible = \"vendor,board\";\n"
+            if sha == peer else
+            "diff --git a/arch/arm64/boot/dts/vendor/board.dts "
+            "b/arch/arm64/boot/dts/vendor/board.dts\n"
+            "+compatible = \"vendor,board\";\n"
+        )
+
+        evidence = planner.advisor_prerequisite_evidence(selected.sha)
+        self.assertFalse(any(
+            item["peer_sha"] == peer and item["kind"] == "compatible-binding"
+            for item in evidence
+        ))
+
+    def test_binding_items_tuple_only_exposes_specific_compatible(self):
+        text = (
+            "      - items:\n"
+            "          - const: medion,sprchrgd14s1\n"
+            "          - const: qcom,x1e80100\n"
+        )
+        self.assertEqual(
+            kbp.Planner._yaml_binding_compatible_candidates(text),
+            {"medion,sprchrgd14s1"},
+        )
+
+    def test_medion_board_does_not_depend_on_tuxedo_fallback_compatible(self):
+        planner = self.minimal_planner()
+        selected = kbp.CommitNode("c" * 40, "arm64: dts: qcom: add Medion board", direct=True)
+        selected.files = ["arch/arm64/boot/dts/qcom/x1e80100-medion.dts"]
+        selected.series_ids.add("S001")
+        tuxedo = "a" * 40
+        medion = "b" * 40
+        binding = "Documentation/devicetree/bindings/arm/qcom.yaml"
+        planner.nodes = {selected.sha: selected}
+        planner.series_groups = {"S001": [(3, tuxedo), (5, medion), (6, selected.sha)]}
+        planner.match = lambda _sha: kbp.Match(status="missing")
+        planner.subject = lambda sha: {
+            tuxedo: "dt-bindings: arm: qcom: add TUXEDO device",
+            medion: "dt-bindings: arm: qcom: add Medion device",
+            selected.sha: selected.subject,
+        }[sha]
+        planner.changed_files = lambda sha: [binding] if sha in {tuxedo, medion} else selected.files
+        patches = {
+            tuxedo: (
+                f"diff --git a/{binding} b/{binding}\n"
+                "+      - items:\n"
+                "+          - const: tuxedo,qualia-xa1510\n"
+                "+          - const: qcom,x1e80100\n"
+            ),
+            medion: (
+                f"diff --git a/{binding} b/{binding}\n"
+                "+      - items:\n"
+                "+          - const: medion,sprchrgd14s1\n"
+                "+          - const: qcom,x1e80100\n"
+            ),
+            selected.sha: (
+                "diff --git a/arch/arm64/boot/dts/qcom/x1e80100-medion.dts "
+                "b/arch/arm64/boot/dts/qcom/x1e80100-medion.dts\n"
+                "+compatible = \"medion,sprchrgd14s1\", \"qcom,x1e80100\";\n"
+            ),
+        }
+        planner.patch_excerpt = lambda sha, _limit: patches[sha]
+
+        evidence = planner.advisor_prerequisite_evidence(selected.sha)
+        compat = [item for item in evidence if item["kind"] == "compatible-binding"]
+        self.assertEqual([(item["peer_sha"], item["object"]) for item in compat], [
+            (medion, "medion,sprchrgd14s1")
+        ])
+
+    def test_armsom_board_does_not_use_rk3576_fallback_for_peripheral_bindings(self):
+        planner = self.minimal_planner()
+        selected = kbp.CommitNode("d" * 40, "arm64: dts: rockchip: add ArmSoM Sige5", direct=True)
+        selected.files = ["arch/arm64/boot/dts/rockchip/rk3576-armsom-sige5.dts"]
+        selected.series_ids.add("S001")
+        board = "a" * 40
+        pmu = "b" * 40
+        watchdog = "c" * 40
+        board_binding = "Documentation/devicetree/bindings/arm/rockchip.yaml"
+        pmu_binding = "Documentation/devicetree/bindings/soc/rockchip/pmu.yaml"
+        wdt_binding = "Documentation/devicetree/bindings/watchdog/snps,dw-wdt.yaml"
+        planner.nodes = {selected.sha: selected}
+        planner.series_groups = {
+            "S001": [(2, board), (3, pmu), (7, watchdog), (10, selected.sha)]
+        }
+        planner.match = lambda _sha: kbp.Match(status="missing")
+        planner.subject = lambda sha: sha
+        planner.changed_files = lambda sha: {
+            board: [board_binding], pmu: [pmu_binding], watchdog: [wdt_binding],
+            selected.sha: selected.files,
+        }[sha]
+        patches = {
+            board: (
+                f"diff --git a/{board_binding} b/{board_binding}\n"
+                "+      - items:\n"
+                "+          - const: armsom,sige5\n"
+                "+          - const: rockchip,rk3576\n"
+            ),
+            pmu: (
+                f"diff --git a/{pmu_binding} b/{pmu_binding}\n"
+                "+      - rockchip,rk3576\n"
+            ),
+            watchdog: (
+                f"diff --git a/{wdt_binding} b/{wdt_binding}\n"
+                "+      - rockchip,rk3576\n"
+            ),
+            selected.sha: (
+                "diff --git a/arch/arm64/boot/dts/rockchip/rk3576-armsom-sige5.dts "
+                "b/arch/arm64/boot/dts/rockchip/rk3576-armsom-sige5.dts\n"
+                "+compatible = \"armsom,sige5\", \"rockchip,rk3576\";\n"
+            ),
+        }
+        planner.patch_excerpt = lambda sha, _limit: patches[sha]
+
+        evidence = planner.advisor_prerequisite_evidence(selected.sha)
+        compat = [item for item in evidence if item["kind"] == "compatible-binding"]
+        self.assertEqual([(item["peer_sha"], item["object"]) for item in compat], [
+            (board, "armsom,sige5")
+        ])
 
     def test_cross_arch_local_declaration_is_not_common_prerequisite_evidence(self):
         planner = self.minimal_planner()
@@ -1007,10 +1275,164 @@ class AdvisorTests(unittest.TestCase):
         self.assertIn("actual_inbound_take_prerequisite_count", prompt)
         self.assertIn("there are NO inbound TAKE prerequisite recommendations", prompt)
         self.assertIn("prerequisite_evidence_ids", prompt)
+        self.assertIn("Apply this uniformly to direct commits in any requested focus path", prompt)
+        self.assertNotIn("direct arm64 DTS/platform commits", prompt)
+        self.assertIn("SKIP_UNSUPPORTED_ARCHITECTURE_ONLY", prompt)
+        self.assertIn("SKIP_OBSOLETED_BY_TAKE_CONSUMER", prompt)
+        self.assertIn("REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL", prompt)
+        self.assertIn("namespace-local", prompt)
 
         self.assertIn("replay: conflict is an integration-cost signal", prompt)
         self.assertIn("not by itself a reason for REVIEW or SKIP", prompt)
         self.assertIn("If your decision is SKIP, return no prerequisite evidence", prompt)
+
+    def test_unsupported_architecture_only_dependency_gets_policy_skip(self):
+        planner = self.minimal_planner()
+        consumer = kbp.CommitNode("c" * 40, "arm64 crypto migration", direct=True)
+        consumer.files = ["lib/crypto/arm64/nh.h"]
+        consumer.advisor_decision = "TAKE"
+        dep = kbp.CommitNode("a" * 40, "ARM/simd: add scoped guard")
+        dep.files = ["arch/arm/include/asm/simd.h"]
+        dep.add_reason("symbol:scoped_ksimd", consumer.sha)
+        planner.nodes = {consumer.sha: consumer, dep.sha: dep}
+        planner.subject = lambda sha: planner.nodes[sha].subject
+        planner.changed_files = lambda sha: planner.nodes[sha].files
+        planner.patch_excerpt = lambda sha, _limit: (
+            "diff --git a/lib/crypto/arm64/nh.h b/lib/crypto/arm64/nh.h\n"
+            "+scoped_ksimd();\n"
+            if sha == consumer.sha else
+            "diff --git a/arch/arm/include/asm/simd.h b/arch/arm/include/asm/simd.h\n"
+            "+#define scoped_ksimd() ...\n"
+        )
+        planner.body = lambda sha: planner.nodes[sha].subject
+
+        packet = planner.advisor_packet(dep.sha)
+        self.assertTrue(packet["commit"]["scope"]["unsupported_architecture_only"])
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "SKIP_UNSUPPORTED_ARCHITECTURE_ONLY",
+        )
+        self.assertEqual(packet["commit"]["actual_inbound_take_prerequisite_count"], 0)
+        result = planner.advisor_policy_override(dep.sha, packet)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["decision"], "SKIP")
+        self.assertIn("unsupported kernel architecture", result["rationale"])
+
+    def test_policy_skip_defers_when_take_consumer_has_evidence_bound_inbound(self):
+        planner = self.minimal_planner()
+        dep = kbp.CommitNode("a" * 40, "unsupported architecture candidate")
+        dep.files = ["arch/arm/kernel/foo.c"]
+        dep.advisor_recommended_by = [{
+            "consumer_sha": "c" * 40,
+            "consumer_subject": "supported consumer",
+            "consumer_decision": "TAKE",
+            "evidence_id": "ev-real",
+            "evidence_kind": "function-declaration",
+            "evidence_object": "foo",
+            "consumer_use": "foo()",
+            "candidate_provides": "foo()",
+            "reason": "evidence-bound recommendation",
+        }]
+        planner.nodes = {dep.sha: dep}
+        planner.subject = lambda _sha: dep.subject
+        planner.changed_files = lambda _sha: dep.files
+        planner.patch_excerpt = lambda _sha, _limit: "+int foo;"
+        planner.body = lambda _sha: dep.subject
+
+        packet = planner.advisor_packet(dep.sha)
+        self.assertEqual(packet["commit"]["actual_inbound_take_prerequisite_count"], 1)
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "RECONCILE_UNSUPPORTED_ARCHITECTURE_INBOUND",
+        )
+        self.assertIsNone(planner.advisor_policy_override(dep.sha, packet))
+
+    def test_obsoleted_dependency_gets_policy_skip(self):
+        planner = self.minimal_planner()
+        old = kbp.CommitNode("a" * 40, "old board fix")
+        old.files = [
+            "arch/arm64/boot/dts/vendor/old-board.dts",
+            "arch/arm64/boot/dts/vendor/old-board.dtsi",
+        ]
+        consumer = kbp.CommitNode("c" * 40, "remove obsolete board", direct=True)
+        consumer.files = list(old.files)
+        consumer.advisor_decision = "TAKE"
+        old.add_reason("conflict-hunk-preimage:8", consumer.sha)
+        planner.nodes = {old.sha: old, consumer.sha: consumer}
+        planner.subject = lambda sha: planner.nodes[sha].subject
+        planner.changed_files = lambda sha: planner.nodes[sha].files
+        planner.body = lambda sha: planner.nodes[sha].subject
+
+        def patch_excerpt(sha, _limit):
+            if sha == consumer.sha:
+                return (
+                    "diff --git a/arch/arm64/boot/dts/vendor/old-board.dts "
+                    "b/arch/arm64/boot/dts/vendor/old-board.dts\n"
+                    "deleted file mode 100644\n"
+                    "+++ /dev/null\n"
+                    "diff --git a/arch/arm64/boot/dts/vendor/old-board.dtsi "
+                    "b/arch/arm64/boot/dts/vendor/old-board.dtsi\n"
+                    "deleted file mode 100644\n"
+                    "+++ /dev/null\n"
+                )
+            return "+ status = \"okay\";\n"
+
+        planner.patch_excerpt = patch_excerpt
+        packet = planner.advisor_packet(old.sha)
+        self.assertTrue(
+            packet["commit"]["obsolescence"]["all_changed_files_deleted_by_take_consumers"]
+        )
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "SKIP_OBSOLETED_BY_TAKE_CONSUMER",
+        )
+        result = planner.advisor_policy_override(old.sha, packet)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["decision"], "SKIP")
+        self.assertIn("historical", planner.advisor_system_prompt())
+
+    def test_partial_deletion_does_not_force_obsolescence_skip(self):
+        planner = self.minimal_planner()
+        old = kbp.CommitNode("a" * 40, "mixed dependency")
+        old.files = ["drivers/foo/a.c", "drivers/foo/b.c"]
+        consumer = kbp.CommitNode("c" * 40, "delete one file", direct=True)
+        consumer.files = ["drivers/foo/a.c"]
+        consumer.advisor_decision = "TAKE"
+        old.add_reason("conflict-hunk-preimage:4", consumer.sha)
+        planner.nodes = {old.sha: old, consumer.sha: consumer}
+        planner.subject = lambda sha: planner.nodes[sha].subject
+        planner.changed_files = lambda sha: planner.nodes[sha].files
+        planner.body = lambda sha: planner.nodes[sha].subject
+        planner.patch_excerpt = lambda sha, _limit: (
+            "diff --git a/drivers/foo/a.c b/drivers/foo/a.c\n"
+            "deleted file mode 100644\n+++ /dev/null\n"
+            if sha == consumer.sha else "+int changed;\n"
+        )
+
+        packet = planner.advisor_packet(old.sha)
+        self.assertFalse(
+            packet["commit"]["obsolescence"]["all_changed_files_deleted_by_take_consumers"]
+        )
+        self.assertIsNone(planner.advisor_policy_override(old.sha, packet))
+
+    def test_dt_binding_symbol_only_dependency_requires_semantic_proof(self):
+        planner = self.minimal_planner()
+        dep = kbp.CommitNode("a" * 40, "dt-bindings: clock: add unrelated controller")
+        dep.files = ["include/dt-bindings/clock/rockchip,rk3506-cru.h"]
+        dep.reasons.add("symbol:CLK_SPI2")
+        planner.nodes = {dep.sha: dep}
+        planner.subject = lambda _sha: dep.subject
+        planner.changed_files = lambda _sha: dep.files
+        planner.patch_excerpt = lambda _sha, _limit: "+#define CLK_SPI2 42\n"
+        planner.body = lambda _sha: dep.subject
+
+        packet = planner.advisor_packet(dep.sha)
+        self.assertTrue(packet["commit"]["dependency_policy"]["symbol_only_dependency"])
+        self.assertTrue(packet["commit"]["dependency_policy"]["dt_binding_header_only"])
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL",
+        )
 
     def test_skip_discards_outbound_prerequisite_recommendations(self):
         planner = self.minimal_planner()

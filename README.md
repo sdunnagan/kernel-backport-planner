@@ -5,13 +5,19 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.6**.
+Current tool version: **0.4.8**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
 using upstream provenance, `Fixes:` relationships, symbol definitions, replay
 conflicts, and other context before producing an auditable oldest-first backport
 plan.
+
+The planner is path/subsystem-neutral. Focus paths come from `--path` and
+`--file-list`; ARM64 examples in this README reflect the project that originally
+drove development, not a built-in ARM64 selection rule. The same deterministic
+planner and advisor policy apply to other supported architecture trees and to
+common subsystems such as `mm/`, networking, filesystems, or drivers.
 
 The key distinction is that `--base` limits the **focus candidate range**, not
 the dependency universe. A required prerequisite may predate `--base` if there
@@ -65,6 +71,16 @@ evidence path- and product-architecture-aware on both sides of a relationship,
 recognizes architecture ownership in optimized library paths such as
 `lib/crypto/arm/` and `lib/crypto/arm64/`, and treats an explicit inbound
 `NOT_REQUIRED` assessment as a resolved edge while preserving it for audit.
+Version 0.4.7 tightens Device Tree evidence provenance: DTS labels must come
+from actual DT source files, compatible matching follows the most-specific DTS
+compatible rather than generic fallback values, and binding providers must add
+compatible values through schema-style YAML rather than merely mentioning them
+in examples or documentation text. Version 0.4.8 removes ARM64-specific advisor
+policy wording, makes architecture ownership/classification consistent for code
+inside and outside `arch/`, adds deterministic exclusions for unsupported-only
+dependencies and dependencies fully obsoleted by already-TAKE consumers, and
+requires semantic proof before treating symbol-only DT binding IDs as real
+cross-commit requirements.
 
 ## Downstream identity matching
 
@@ -264,10 +280,12 @@ add one of three recommendations to each requested missing commit:
 The maintenance policy deliberately favors upstream alignment: an easy upstream
 commit may be worth taking even when immediate feature relevance is modest,
 because reducing downstream divergence can simplify later maintenance. For a
-direct commit in a requested focus path on a supported architecture, the advisor
-now receives an explicit `TAKE_UNLESS_CONCRETE_EXCLUSION` bias. Lack of affirmative
-evidence that a particular board, laptop, SoC, or peripheral is an officially
-supported RHEL platform is **not** by itself a reason to skip that upstream context.
+direct commit in a requested focus path that is not excluded by the configured
+product architecture policy, the advisor receives an explicit
+`TAKE_UNLESS_CONCRETE_EXCLUSION` bias. This applies equally to architecture focus
+paths and common subsystems. Lack of affirmative evidence that a particular board,
+laptop, SoC, peripheral, or other platform is an officially supported product
+target is **not** by itself a reason to skip that upstream context.
 `SKIP` is reserved for concrete exclusion reasons supported by the supplied
 evidence. A replay conflict is treated as integration cost rather than, by itself,
 a reason to change a wanted commit from `TAKE` to `REVIEW`; ordinary textual
@@ -286,14 +304,43 @@ the product kernel architectures are:
 - `arch/s390/` -> s390x.
 
 The evidence packet also classifies each candidate's touched architecture trees,
-whether it touches the requested focus paths, and whether it is entirely confined
-to an unsupported product architecture. An unsupported-architecture-only commit
-should normally be `SKIP` unless concrete diff/graph evidence demonstrates that
-code built by a supported architecture actually depends on it. A shared symbol
-name or provenance edge by itself is explicitly not enough.
+whether it touches the requested focus paths, and its `architecture_scope` as
+`common`, `supported-or-mixed`, `unsupported-only`, `common-plus-unsupported`, or
+`unrestricted` (generic product mode). Architecture ownership is recognized both
+under `arch/<name>/` and in selected optimized library trees such as
+`lib/crypto/arm/` and `lib/crypto/arm64/`.
+
+An unsupported-architecture-only candidate receives deterministic product-policy
+handling rather than relying on model preference. When no evidence-bound inbound
+TAKE prerequisite exists, it is `SKIP`: a provenance edge or shared symbol name
+does not make architecture-private code part of a supported product build. If a
+TAKE consumer has already made an explicit evidence-bound prerequisite
+recommendation, the packet uses `RECONCILE_UNSUPPORTED_ARCHITECTURE_INBOUND` and
+normal advisor reconciliation is retained so the relationship is audited rather
+than silently overridden.
 
 Use `--advisor-product generic` to disable the RHEL 10 architecture allowlist,
 or `--advisor-product rhel10` to force it when auto-detection is inappropriate.
+Under `generic`, no architecture is classified as unsupported by product policy;
+direct focus-path commits receive the same convergence policy regardless of
+architecture.
+
+### Deterministic advisor guardrails
+
+Version 0.4.8 moves two unambiguous exclusion cases out of model discretion:
+
+- a candidate confined entirely to an unsupported product architecture, when no
+  evidence-bound inbound TAKE prerequisite requires it;
+- a non-direct dependency whose complete changed-file set is deleted by immediate
+  already-TAKE consumers, again with no evidence-bound inbound requirement.
+
+The latter captures obsolete intermediate fixes whose final-state effect disappears
+because a later selected change removes the affected files. The planner records the
+deleting TAKE consumers in the advisor packet and does not carry the older change
+merely to reproduce upstream history.
+
+These guardrails remain advisor policy only: they do not change deterministic
+candidate discovery or mutate the selected dependency graph.
 
 ### Consumer-first graph context
 
@@ -380,7 +427,8 @@ lexical relationships including:
 - an external function call matched to an earlier newly-added function definition;
 - a newly-added function definition matched to an earlier shared declaration;
 - a newly-added `#include` matched to a header newly created by the peer;
-- a DTS `compatible` string matched to an earlier DT binding;
+- the most-specific DTS `compatible` string matched to an earlier DT binding
+  schema addition;
 - a DTS property matched to an earlier DT binding property when the selected diff
   also uses a compatible associated with that exact binding schema path; the
   compatible and property may be introduced by different earlier peers in the same
@@ -398,6 +446,16 @@ prerequisite evidence. Common declarations such as `include/linux/mm.h` remain
 eligible for supported-architecture consumers. This avoids turning identical
 per-architecture callbacks, macros, or library helpers into false dependencies.
 
+Version 0.4.7 also makes Device Tree evidence source-aware. `dts-label` matches
+are produced only when both the reference and definition come from `.dts`,
+`.dtsi`, or `.dtso` files, so labels embedded in DT binding YAML examples cannot
+act as providers. For `compatible-binding`, only the first (most-specific)
+compatible in each added DTS property participates. On the binding side, the
+compatible must be introduced using binding-schema YAML forms such as `const`
+or `enum`; arbitrary mentions and `compatible = "..."` example text are ignored.
+When a newly-added binding tuple uses `items`, only its first item is treated as
+the specific compatible and later tuple values are treated as fallbacks.
+
 Generic DT property names such as `clocks` and `power-domains` are not evidence
 by themselves. Version 0.4.5 keys property evidence to the exact binding schema
 path: one earlier peer may establish a compatible and another earlier peer may add
@@ -405,6 +463,15 @@ the property, but both must modify the same binding YAML file. Direct same-patch
 matches remain `dt-property-binding`; split same-schema matches are reported as
 `dt-property-binding-series`. This recovers ordinary binding-series evolution
 without reopening generic cross-binding property matches.
+
+Version 0.4.8 also treats a non-direct dependency backed only by a `symbol:*`
+relationship in `include/dt-bindings/` as namespace-sensitive. Clock, reset,
+interrupt, and other binding ID macro names can be reused by unrelated SoCs or
+controllers. Such a candidate receives
+`REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL`: a matching macro name alone is
+not enough for TAKE; the supplied paths/diffs must demonstrate a common binding,
+API, or hardware namespace, or an evidence-bound TAKE consumer must establish the
+requirement.
 
 Every evidence record receives a deterministic `evidence_id`. The records are
 supplied as both `same_series_consumed_objects` and
@@ -744,11 +811,14 @@ python3 -m unittest -v test_kernel_backport_planner.py
 The tests cover deterministic dependency behavior, replay semantics, advisor
 policy and structured output, same-series prerequisite evidence, architecture
 filtering, Device Tree binding relationships, retries and diagnostics,
-reconciliation, consistency checking, and advisor audit output.
+reconciliation, consistency checking, advisor audit output, subsystem-neutral
+focus-path policy, generic-product behavior, deterministic policy exclusions,
+and architecture ownership outside `arch/`.
 
 ## Optional check/build command
 
-A command can be run after a conflict-free replay:
+A command can be run after a conflict-free replay. For example, an ARM64 run
+could use:
 
 ```bash
 kernel-backport-planner ... \

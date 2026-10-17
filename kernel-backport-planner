@@ -38,8 +38,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.6"
-ADVISOR_PROMPT_VERSION = "7"
+VERSION = "0.4.8"
+ADVISOR_PROMPT_VERSION = "9"
 
 # RHEL 10 product architecture set, verified against Red Hat's RHEL 10
 # architecture documentation. Kernel arch directory names differ from product
@@ -670,7 +670,8 @@ class Planner:
 
     def advisor_scope_context(self, files: Sequence[str]) -> dict:
         files = list(files)
-        arch_dirs = self._architecture_dirs(files)
+        ownership_by_file = [self._path_architecture_dirs(path) for path in files]
+        arch_dirs = sorted({arch for owners in ownership_by_file for arch in owners})
         product = self.advisor_product_context()
         supported = set(product.get("supported_kernel_arch_dirs") or [])
         focus = [p.rstrip("/") for p in self.paths]
@@ -678,18 +679,91 @@ class Planner:
             path == prefix or path.startswith(prefix + "/")
             for path in files for prefix in focus
         )
-        all_files_arch_local = bool(files) and all(path.startswith("arch/") for path in files)
+        # Use the same architecture-ownership classifier everywhere. Architecture-
+        # local code can live outside arch/<name>/ (for example lib/crypto/arm/),
+        # and a commit that also changes common code must not be classified as
+        # unsupported-architecture-only merely because one file is architecture-
+        # owned.
+        all_files_arch_local = bool(files) and all(bool(owners) for owners in ownership_by_file)
         unsupported_only = bool(
             supported
             and arch_dirs
             and all_files_arch_local
             and set(arch_dirs).isdisjoint(supported)
         )
+        if not supported:
+            architecture_scope = "unrestricted"
+        elif not arch_dirs:
+            architecture_scope = "common"
+        elif unsupported_only:
+            architecture_scope = "unsupported-only"
+        elif set(arch_dirs) & supported:
+            architecture_scope = "supported-or-mixed"
+        else:
+            # At least one common, unowned file prevented unsupported_only.
+            architecture_scope = "common-plus-unsupported"
         return {
             "architecture_dirs": arch_dirs,
+            "architecture_scope": architecture_scope,
             "touches_focus_paths": touches_focus,
-            "touches_supported_architecture": bool(set(arch_dirs) & supported) if supported else None,
+            "touches_supported_architecture": (
+                bool(set(arch_dirs) & supported) if supported and arch_dirs else None
+            ),
             "unsupported_architecture_only": unsupported_only,
+        }
+
+    @staticmethod
+    def _deleted_files_from_patch(patch: str) -> set[str]:
+        """Return paths deleted by a unified Git patch excerpt."""
+        deleted: set[str] = set()
+        current_path: str | None = None
+        for line in patch.splitlines():
+            match = DIFF_FILE_RE.match(line)
+            if match:
+                current_path = match.group(2)
+                continue
+            if current_path and (line.startswith("deleted file mode ") or line == "+++ /dev/null"):
+                deleted.add(current_path)
+        return deleted
+
+    def advisor_obsolescence_context(self, sha: str, files: Sequence[str]) -> dict:
+        """Describe immediate TAKE consumers that delete this candidate's files.
+
+        This is intentionally narrow. Deletion by a later provenance consumer is a
+        concrete final-state signal; ordinary modification is not. Only already-TAKE
+        immediate consumers participate so deeper graph ancestry cannot manufacture
+        an obsolescence conclusion.
+        """
+        candidate_files = set(files)
+        consumers: list[dict] = []
+        deleted_union: set[str] = set()
+        node = self.nodes.get(sha)
+        if node is None or not candidate_files:
+            return {
+                "all_changed_files_deleted_by_take_consumers": False,
+                "take_consumers": [],
+            }
+        for consumer_sha in sorted(node.required_by):
+            consumer = self.nodes.get(consumer_sha)
+            if consumer is None or consumer.advisor_decision != "TAKE":
+                continue
+            patch = self.patch_excerpt(
+                consumer_sha, self.args.advisor_max_related_diff_chars
+            )
+            deleted = self._deleted_files_from_patch(patch)
+            overlap = sorted(candidate_files & deleted)
+            if not overlap:
+                continue
+            deleted_union.update(overlap)
+            consumers.append({
+                "sha": consumer_sha,
+                "subject": self.subject(consumer_sha),
+                "deleted_candidate_files": overlap,
+            })
+        return {
+            "all_changed_files_deleted_by_take_consumers": bool(candidate_files)
+            and candidate_files <= deleted_union,
+            "take_consumers": consumers,
         }
 
     def advisor_series_context(self, sha: str) -> list[dict]:
@@ -865,12 +939,97 @@ class Planner:
         return result
 
     @staticmethod
+    def _is_dt_source_path(path: str) -> bool:
+        """Return True for source files that participate in the compiled DT graph."""
+        return path.endswith((".dts", ".dtsi", ".dtso"))
+
+    @staticmethod
     def _dt_compatible_strings(text: str) -> set[str]:
+        """Return the most-specific compatible from each added DTS assignment.
+
+        Device-tree compatible lists are ordered from most specific to fallback.
+        Same-series binding evidence should follow the first value rather than
+        treating a generic SoC fallback as proof that an unrelated binding patch
+        is a prerequisite for a board or peripheral node.
+        """
         result: set[str] = set()
+        pattern = re.compile(
+            r'\bcompatible\s*=\s*"([A-Za-z0-9][A-Za-z0-9,._+\-/]+)"'
+        )
         for line in text.splitlines():
-            if "compatible" not in line or "=" not in line:
+            match = pattern.search(line)
+            if match:
+                result.add(match.group(1))
+        return result
+
+    @staticmethod
+    def _yaml_binding_compatible_candidates(text: str) -> set[str]:
+        """Return specific compatibles introduced through binding-schema YAML.
+
+        Arbitrary textual mentions such as descriptions and DTS snippets under
+        ``examples:`` (``compatible = "..."``) are ignored.  For newly-added
+        ``items:`` tuples, only the first item is treated as the specific device
+        compatible; later tuple elements are fallback compatibles and are not
+        provider evidence.
+
+        This is intentionally a conservative lexical parser rather than a general
+        YAML-schema evaluator.
+        """
+        result: set[str] = set()
+        value_re = r"[A-Za-z0-9][A-Za-z0-9,._+\-/]+"
+        const_re = re.compile(
+            rf"^(?:-\s*)?const:\s*['\"]?({value_re})['\"]?\s*(?:#.*)?$"
+        )
+        scalar_re = re.compile(
+            rf"^-\s*['\"]?({value_re})['\"]?\s*(?:#.*)?$"
+        )
+        inline_enum_re = re.compile(r"^(?:-\s*)?enum:\s*\[(.*?)\]\s*(?:#.*)?$")
+
+        # Stack of newly-added ``items:`` sequence blocks.  Each frame tracks
+        # the indentation of its immediate sequence items and which tuple item is
+        # active.  Candidates beneath item 0 are specific; candidates beneath
+        # later items are fallbacks.
+        item_frames: list[dict[str, int | None]] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
                 continue
-            result.update(re.findall(r'"([A-Za-z0-9][A-Za-z0-9,._+\-/]+)"', line))
+            indent = len(line) - len(line.lstrip(" \t"))
+
+            while item_frames and indent <= int(item_frames[-1]["indent"]):
+                item_frames.pop()
+
+            if stripped.startswith("-"):
+                for frame in item_frames:
+                    child_indent = frame["child_indent"]
+                    if child_indent is None and indent > int(frame["indent"]):
+                        frame["child_indent"] = indent
+                        frame["index"] = 0
+                    elif child_indent is not None and indent == child_indent:
+                        frame["index"] = int(frame["index"] or 0) + 1
+
+            specific = all(
+                frame["index"] in (None, 0) for frame in item_frames
+            )
+            if specific:
+                match = const_re.match(stripped) or scalar_re.match(stripped)
+                if match:
+                    value = match.group(1)
+                    if "," in value:
+                        result.add(value)
+                else:
+                    match = inline_enum_re.match(stripped)
+                    if match:
+                        for value in re.findall(
+                            rf"['\"]({value_re})['\"]", match.group(1)
+                        ):
+                            if "," in value:
+                                result.add(value)
+
+            if re.match(r"^(?:-\s*)?items:\s*(?:#.*)?$", stripped):
+                item_frames.append({
+                    "indent": indent, "child_indent": None, "index": None
+                })
         return result
 
     @staticmethod
@@ -929,6 +1088,9 @@ class Planner:
         use or provider belongs only to an unsupported product architecture. This
         also recognizes selected architecture-owned library subtrees such as
         lib/crypto/arm/ and lib/crypto/arm64/ rather than relying only on arch/*.
+        Version 0.4.7 confines DTS-label providers/consumers to real DT source files
+        and makes compatible evidence use specific DTS values plus binding-schema
+        YAML additions rather than arbitrary binding example/documentation text.
         """
         allowed = self.advisor_allowed_prerequisite_peers(sha)
         if not allowed:
@@ -947,6 +1109,7 @@ class Planner:
         selected_refs_by_path = {
             path: self._dts_label_references(text)
             for path, text in selected_added_by_file.items()
+            if self._is_dt_source_path(path)
         }
         selected_macros_by_path = {
             path: self._macro_uses(text) - self._macro_definitions(text)
@@ -977,7 +1140,10 @@ class Planner:
         selected_compatibles: set[str] = set()
         selected_dt_properties: set[str] = set()
         for selected_path, selected_text in selected_added_by_file.items():
-            if not self._advisor_path_product_relevant(selected_path):
+            if (
+                not self._advisor_path_product_relevant(selected_path)
+                or not self._is_dt_source_path(selected_path)
+            ):
                 continue
             selected_compatibles.update(self._dt_compatible_strings(selected_text))
             selected_dt_properties.update(self._dt_property_uses(selected_text))
@@ -1004,11 +1170,11 @@ class Planner:
             for binding_path, binding_text in series_peer_binding_texts.items():
                 if not binding_path.startswith("Documentation/devicetree/bindings/"):
                     continue
-                for compat in sorted(selected_compatibles):
-                    if compat in binding_text:
-                        binding_compatible_sources[binding_path].setdefault(
-                            compat, series_peer_sha
-                        )
+                binding_compatibles = self._yaml_binding_compatible_candidates(binding_text)
+                for compat in sorted(selected_compatibles & binding_compatibles):
+                    binding_compatible_sources[binding_path].setdefault(
+                        compat, series_peer_sha
+                    )
 
         evidence: list[dict[str, str]] = []
         seen: set[tuple[str, str, str]] = set()
@@ -1053,6 +1219,7 @@ class Planner:
             peer_label_defs_by_path = {
                 path: self._dts_label_definitions(text)
                 for path, text in peer_added_by_file.items()
+                if self._is_dt_source_path(path)
             }
             peer_macro_defs_by_path = {
                 path: self._macro_definitions(text)
@@ -1174,22 +1341,25 @@ class Planner:
                 path.startswith("Documentation/devicetree/bindings/") for path in peer_files
             )
             if binding_peer:
-                matching_compatibles = sorted(
-                    compat for compat in selected_compatibles if compat in peer_added
-                )
-                for compat in matching_compatibles:
+                peer_binding_compatibles_by_path = {
+                    path: self._yaml_binding_compatible_candidates(text)
+                    for path, text in peer_added_by_file.items()
+                    if path.startswith("Documentation/devicetree/bindings/")
+                }
+                for compat in sorted(selected_compatibles):
                     provider_path = next(
                         (
-                            path for path, text in peer_added_by_file.items()
-                            if path.startswith("Documentation/devicetree/bindings/")
-                            and compat in text
+                            path for path, compatibles in peer_binding_compatibles_by_path.items()
+                            if compat in compatibles
                         ),
                         "",
                     )
+                    if not provider_path:
+                        continue
                     add(
                         peer_sha, "compatible-binding", compat,
                         f'compatible = "{compat}"',
-                        f"binding text for compatible {compat}",
+                        f"binding schema adds compatible {compat}",
                         provider_path=provider_path,
                     )
 
@@ -1202,7 +1372,8 @@ class Planner:
                     compatible_sources = binding_compatible_sources.get(binding_path, {})
                     for compat in sorted(compatible_sources):
                         compat_peer_sha = (
-                            peer_sha if compat in binding_text
+                            peer_sha
+                            if compat in peer_binding_compatibles_by_path.get(binding_path, set())
                             else compatible_sources[compat]
                         )
                         for prop in sorted(selected_dt_properties & peer_properties):
@@ -1320,8 +1491,31 @@ class Planner:
         ))
         inbound_take = self.advisor_inbound_take_recommendations(sha)
         scope = self.advisor_scope_context(files)
+        obsolescence = self.advisor_obsolescence_context(sha, files)
+        reasons = sorted(n.reasons)
+        symbol_only_dependency = bool(
+            not n.direct
+            and reasons
+            and all(reason.startswith("symbol:") for reason in reasons)
+        )
+        dt_binding_header_only = bool(
+            files and all(path.startswith("include/dt-bindings/") for path in files)
+        )
         default_bias = "NEUTRAL"
-        if n.direct and scope["touches_focus_paths"] and not scope["unsupported_architecture_only"]:
+        if scope["unsupported_architecture_only"]:
+            default_bias = (
+                "RECONCILE_UNSUPPORTED_ARCHITECTURE_INBOUND"
+                if inbound_take else "SKIP_UNSUPPORTED_ARCHITECTURE_ONLY"
+            )
+        elif (
+            not n.direct
+            and obsolescence["all_changed_files_deleted_by_take_consumers"]
+            and not inbound_take
+        ):
+            default_bias = "SKIP_OBSOLETED_BY_TAKE_CONSUMER"
+        elif symbol_only_dependency and dt_binding_header_only and not inbound_take:
+            default_bias = "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL"
+        elif n.direct and scope["touches_focus_paths"]:
             default_bias = "TAKE_UNLESS_CONCRETE_EXCLUSION"
         return {
             "planning_context": {
@@ -1333,12 +1527,12 @@ class Planner:
                 "product": self.advisor_product_context(),
                 "policy": (
                     "Prefer upstream alignment and low downstream divergence. For direct commits in "
-                    "the requested focus paths on a supported architecture, lack of affirmative evidence "
-                    "that a particular board or SoC is an officially supported RHEL platform is not an "
-                    "exclusion reason; prefer TAKE when there is no concrete exclusion reason. Do not carry "
-                    "architecture-only code for an unsupported product architecture merely because "
-                    "provenance or a shared symbol name caused the deterministic planner to connect it "
-                    "to a selected commit."
+                    "the requested focus paths that are not excluded by configured product architecture "
+                    "policy, lack of affirmative evidence that a particular device, platform, SoC, or "
+                    "peripheral is an officially supported product target is not an exclusion reason; "
+                    "prefer TAKE when there is no concrete exclusion reason. Do not carry architecture-"
+                    "only code for an unsupported product architecture merely because provenance or a "
+                    "shared symbol name caused the deterministic planner to connect it to a selected commit."
                 ),
             },
             "commit": {
@@ -1351,7 +1545,17 @@ class Planner:
                 "patch_excerpt": self.patch_excerpt(sha, self.args.advisor_max_diff_chars),
                 "direct": n.direct,
                 "dependency_kind": self.dependency_kind(n),
-                "evidence": sorted(n.reasons),
+                "evidence": reasons,
+                "dependency_policy": {
+                    "symbol_only_dependency": symbol_only_dependency,
+                    "dt_binding_header_only": dt_binding_header_only,
+                    "note": (
+                        "A symbol-only deterministic dependency is provenance, not semantic proof. "
+                        "DT binding clock/reset/ID macro names can be namespace-local and reused by "
+                        "unrelated hardware; require concrete same-API/schema/hardware evidence before TAKE."
+                    ),
+                },
+                "obsolescence": obsolescence,
                 "deterministic_consumer_context": {
                     "relationship_status": "provenance_only",
                     "note": (
@@ -1374,6 +1578,58 @@ class Planner:
             },
         }
 
+    def advisor_policy_override(self, sha: str, packet: dict) -> dict | None:
+        """Return a deterministic advisor result for unambiguous exclusions.
+
+        The model is useful for ambiguous semantic judgments, but two product-policy
+        cases are sufficiently mechanical that making them temperature-sensitive only
+        adds variance: code confined to an unsupported product architecture, and an
+        older dependency whose complete changed-file set is deleted by an immediate
+        already-TAKE consumer. If a TAKE consumer has made an explicit evidence-bound
+        inbound prerequisite recommendation, leave the case to normal advisor
+        reconciliation instead of overriding it.
+        """
+        commit = packet["commit"]
+        if commit.get("actual_inbound_take_prerequisite_count", 0):
+            return None
+        scope = commit.get("scope") or {}
+        if scope.get("unsupported_architecture_only"):
+            archs = ", ".join(scope.get("architecture_dirs") or []) or "unknown"
+            product = packet["planning_context"]["product"].get("product", "configured product")
+            return {
+                "decision": "SKIP",
+                "rationale": (
+                    f"Deterministic product-policy exclusion: this commit changes only "
+                    f"architecture-owned paths for unsupported kernel architecture(s) {archs} "
+                    f"under {product}, and no evidence-bound inbound TAKE prerequisite requires it."
+                ),
+                "prerequisite_peers": [],
+                "inbound_prerequisite_assessments": [],
+                "risks": [],
+            }
+        obsolescence = commit.get("obsolescence") or {}
+        if (
+            not commit.get("direct")
+            and obsolescence.get("all_changed_files_deleted_by_take_consumers")
+        ):
+            consumers = ", ".join(
+                item.get("sha", "")[:12]
+                for item in obsolescence.get("take_consumers", [])
+                if item.get("sha")
+            ) or "an immediate TAKE consumer"
+            return {
+                "decision": "SKIP",
+                "rationale": (
+                    "Deterministic obsolescence exclusion: every file changed by this dependency "
+                    f"is deleted by immediate already-TAKE consumer(s) {consumers}, and no "
+                    "evidence-bound inbound TAKE prerequisite requires preserving the intermediate change."
+                ),
+                "prerequisite_peers": [],
+                "inbound_prerequisite_assessments": [],
+                "risks": [],
+            }
+        return None
+
     def advisor_system_prompt(self) -> str:
         return """You are the advisory layer of kernel-backport-planner, reviewing Linux
 kernel commits for an enterprise downstream backport plan. The deterministic planner has
@@ -1391,9 +1647,24 @@ Maintenance policy:
   reason to exclude them. Immediate end-user feature relevance is not required.
 - When commit.default_policy_bias is TAKE_UNLESS_CONCRETE_EXCLUSION, TAKE is the default. Do NOT
   SKIP merely because the packet lacks evidence that a particular board, laptop, SoC, or peripheral
-  is an officially supported RHEL product platform. Absence of such product-target evidence is not
-  an exclusion reason. This is especially important for direct arm64 DTS/platform commits in the
-  requested focus path, where carrying easy upstream context can reduce future divergence.
+  is an officially supported product platform. Absence of such product-target evidence is not an exclusion reason.
+  Apply this uniformly to direct commits in any requested focus path; do not give
+  ARM64, Device Tree, or any other subsystem a special policy merely because it appears in examples.
+- When commit.default_policy_bias is SKIP_UNSUPPORTED_ARCHITECTURE_ONLY, the candidate changes only
+  code owned by an architecture excluded by the configured product profile. Deterministic consumer
+  provenance or a shared symbol name does not make that code part of a supported architecture build.
+- When commit.default_policy_bias is RECONCILE_UNSUPPORTED_ARCHITECTURE_INBOUND, the same product
+  exclusion applies but a TAKE consumer has made an explicit evidence-bound inbound recommendation.
+  Assess that evidence under the inbound-prerequisite rules instead of skipping or taking blindly.
+- When commit.default_policy_bias is SKIP_OBSOLETED_BY_TAKE_CONSUMER, an immediate already-TAKE
+  consumer deletes every file changed by this older dependency. Do not TAKE the older change merely
+  to preserve historical sequence; absent an explicit evidence-bound inbound requirement, it has no
+  surviving final-state effect.
+- When commit.default_policy_bias is REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL, the dependency is
+  supported only by symbol-name provenance in DT binding headers. Clock, reset, interrupt, and other
+  binding ID names can be namespace-local and reused by unrelated SoCs/controllers. TAKE only if the
+  supplied paths/diffs demonstrate the same binding/API/hardware namespace; a matching macro name alone
+  is not enough.
 - Product architecture support is explicit in planning_context.product. Architecture-owned code
   for an unsupported product architecture should normally be SKIP unless concrete diff/graph
   evidence shows that code built for a supported product architecture actually depends on it.
@@ -1433,7 +1704,10 @@ Same-series prerequisite policy:
   function definitions/declarations, included headers, compatible strings matched to DT bindings,
   compatible-scoped DT properties matched to those bindings (including same-schema binding-series
   evidence where one earlier peer establishes the compatible and another adds the property), and
-  struct/enum definitions.
+  struct/enum definitions. DTS-label evidence is limited to real .dts/.dtsi/.dtso sources; labels
+  appearing only in binding YAML examples are documentation, not providers. Compatible-binding
+  evidence follows the first, most-specific compatible in a DTS assignment and requires schema-like
+  YAML additions rather than arbitrary mentions in examples or descriptions.
 - Recommend a peer only when one of these evidence records is a real semantic prerequisite for the
   selected patch. Choose one strongest evidence record per peer. Do not recommend a peer merely
   because it is in commit.all_missing_earlier_peer_shas.
@@ -1808,6 +2082,15 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
     ) -> None:
         node = self.nodes[sha]
         packet = self.advisor_packet(sha)
+        policy_result = self.advisor_policy_override(sha, packet)
+        if policy_result is not None:
+            node.advisor_attempts = 0
+            self._advisor_note_success(node, policy_result)
+            self.info(
+                f"    advisor policy override: {policy_result['decision']} - "
+                f"{self._one_line(policy_result['rationale'])}"
+            )
+            return
         cache_key = self.advisor_cache_key(sha, packet)
         cached = None if self.args.no_advisor_cache else self.advisor_cache.get(cache_key)
         try:
@@ -3299,7 +3582,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                    help="flag later merge resolutions touching candidate files")
     p.add_argument("--max-merge-risks", type=int, default=5)
     p.add_argument("--check-command",
-                   help="optional shell command to run after a clean replay, e.g. 'make -j8 ARCH=arm64'")
+                   help="optional shell command to run after a clean replay, e.g. 'make -j8'")
     p.add_argument(
         "--advisor-model",
         help="optional Ollama model for AI-assisted TAKE/SKIP/REVIEW recommendations",
