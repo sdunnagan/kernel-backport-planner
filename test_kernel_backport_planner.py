@@ -1434,6 +1434,117 @@ class AdvisorTests(unittest.TestCase):
             "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL",
         )
 
+    def test_extract_symbol_uses_retains_changed_file_path(self):
+        planner = self.minimal_planner()
+        planner.args.max_symbols = 32
+        planner.parse_hunks = lambda _sha: [
+            types.SimpleNamespace(
+                path="arch/arm64/boot/dts/rockchip/rk3588s.dtsi",
+                added_lines=["clocks = <&cru CLK_SPI2>;"],
+            ),
+            types.SimpleNamespace(
+                path="drivers/foo/example.c",
+                added_lines=["ret = helper_fn(dev);"],
+            ),
+        ]
+
+        uses = planner.extract_symbol_uses("a" * 40)
+        self.assertEqual(
+            uses["CLK_SPI2"],
+            {"arch/arm64/boot/dts/rockchip/rk3588s.dtsi"},
+        )
+        self.assertEqual(uses["helper_fn"], {"drivers/foo/example.c"})
+
+    def test_dt_binding_include_closure_follows_dtsi_to_binding_header(self):
+        planner = self.minimal_planner()
+        start = "arch/arm64/boot/dts/qcom/board.dts"
+        dtsi = "arch/arm64/boot/dts/qcom/sm8750.dtsi"
+        header = "include/dt-bindings/clock/qcom,sm8750-gcc.h"
+        files = {
+            start: '#include "sm8750.dtsi"\n',
+            dtsi: '#include <dt-bindings/clock/qcom,sm8750-gcc.h>\n',
+            header: "#define GCC_VIDEO_AHB_CLK 1\n",
+        }
+        planner._tree_file_text = lambda _sha, path: files.get(path)
+
+        closure = planner.dt_binding_include_closure("a" * 40, start)
+        self.assertEqual(closure, {header})
+
+    def _symbol_definition_test_planner(
+        self,
+        *,
+        symbol: str,
+        provider_path: str,
+        use_path: str,
+        reachable_headers: set[str],
+    ):
+        planner = self.minimal_planner()
+        selected = "b" * 40
+        parent = "1" * 40
+        provider = "a" * 40
+        grep_output = f"{parent}:{provider_path}:10:#define {symbol} 42\n"
+        planner.git = types.SimpleNamespace(
+            parents=lambda _sha: [parent],
+            run=lambda args, check=False: grep_output if args[0] == "grep" else "",
+        )
+        planner.blame_commits = lambda _parent, path, _lo, _hi: (
+            kbp.collections.Counter({provider: 1}) if path == provider_path else kbp.collections.Counter()
+        )
+        planner.upstream_before = lambda _dep, _sha: True
+        planner.match = lambda _dep, check_ancestry=True: kbp.Match(status="missing")
+        planner.dt_binding_include_closure = lambda _sha, path: (
+            set(reachable_headers) if path == use_path else set()
+        )
+        return planner, selected, provider
+
+    def test_rk3588_symbol_does_not_select_rk3506_binding_header(self):
+        symbol = "CLK_SPI2"
+        provider_path = "include/dt-bindings/clock/rockchip,rk3506-cru.h"
+        use_path = "arch/arm64/boot/dts/rockchip/rk3588s.dtsi"
+        planner, selected, _provider = self._symbol_definition_test_planner(
+            symbol=symbol,
+            provider_path=provider_path,
+            use_path=use_path,
+            reachable_headers={"include/dt-bindings/clock/rockchip,rk3588-cru.h"},
+        )
+
+        deps = planner.definition_dependencies(
+            selected, {symbol}, {symbol: {use_path}}
+        )
+        self.assertEqual(deps, {})
+
+    def test_sm8750_symbol_does_not_select_sc8180x_binding_header(self):
+        symbol = "GCC_VIDEO_AHB_CLK"
+        provider_path = "include/dt-bindings/clock/qcom,gcc-sc8180x.h"
+        use_path = "arch/arm64/boot/dts/qcom/sm8750.dtsi"
+        planner, selected, _provider = self._symbol_definition_test_planner(
+            symbol=symbol,
+            provider_path=provider_path,
+            use_path=use_path,
+            reachable_headers={"include/dt-bindings/clock/qcom,sm8750-gcc.h"},
+        )
+
+        deps = planner.definition_dependencies(
+            selected, {symbol}, {symbol: {use_path}}
+        )
+        self.assertEqual(deps, {})
+
+    def test_dt_binding_symbol_from_reachable_header_remains_dependency(self):
+        symbol = "GCC_VIDEO_AHB_CLK"
+        provider_path = "include/dt-bindings/clock/qcom,sm8750-gcc.h"
+        use_path = "arch/arm64/boot/dts/qcom/sm8750.dtsi"
+        planner, selected, provider = self._symbol_definition_test_planner(
+            symbol=symbol,
+            provider_path=provider_path,
+            use_path=use_path,
+            reachable_headers={provider_path},
+        )
+
+        deps = planner.definition_dependencies(
+            selected, {symbol}, {symbol: {use_path}}
+        )
+        self.assertEqual(deps, {symbol: provider})
+
     def test_skip_discards_outbound_prerequisite_recommendations(self):
         planner = self.minimal_planner()
         selected = kbp.CommitNode("b" * 40, "unsupported dependency")

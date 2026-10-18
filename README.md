@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.8**.
+Current tool version: **0.4.9**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -80,7 +80,11 @@ policy wording, makes architecture ownership/classification consistent for code
 inside and outside `arch/`, adds deterministic exclusions for unsupported-only
 dependencies and dependencies fully obsoleted by already-TAKE consumers, and
 requires semantic proof before treating symbol-only DT binding IDs as real
-cross-commit requirements.
+cross-commit requirements. Version 0.4.9 moves that DT binding namespace check
+into deterministic symbol discovery: symbol uses retain their selected file,
+the planner follows a bounded DTS/DTSI -> `include/dt-bindings/` include closure,
+and a binding macro provider is accepted only when its exact header is reachable
+from the consumer.
 
 ## Downstream identity matching
 
@@ -473,6 +477,18 @@ not enough for TAKE; the supplied paths/diffs must demonstrate a common binding,
 API, or hardware namespace, or an evidence-bound TAKE consumer must establish the
 requirement.
 
+Version 0.4.9 enforces that namespace distinction earlier, during deterministic
+`symbol:*` discovery. Symbol extraction retains the changed file in which each
+new use occurs. When a candidate definition lives under `include/dt-bindings/`,
+the planner follows a bounded include graph from the selected file through DT
+sources and DT binding headers at the selected upstream commit. The provider is
+eligible only when that exact binding header is reachable from at least one file
+that added the symbol use. This prevents same-named IDs such as `CLK_SPI2` or
+`GCC_VIDEO_AHB_CLK` in unrelated SoC headers from entering the dependency graph
+at all, while preserving dependencies on the binding header the consumer actually
+includes. The 0.4.8 advisor policy remains as defense-in-depth for any ambiguous
+symbol-only binding relationship that survives deterministic filtering.
+
 Every evidence record receives a deterministic `evidence_id`. The records are
 supplied as both `same_series_consumed_objects` and
 `eligible_prerequisite_evidence`. They do not alter the deterministic plan or
@@ -813,7 +829,8 @@ policy and structured output, same-series prerequisite evidence, architecture
 filtering, Device Tree binding relationships, retries and diagnostics,
 reconciliation, consistency checking, advisor audit output, subsystem-neutral
 focus-path policy, generic-product behavior, deterministic policy exclusions,
-and architecture ownership outside `arch/`.
+architecture ownership outside `arch/`, and namespace-aware DT binding symbol
+resolution through bounded include closures.
 
 ## Optional check/build command
 

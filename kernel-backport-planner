@@ -25,6 +25,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import socket
@@ -38,8 +39,10 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.8"
-ADVISOR_PROMPT_VERSION = "9"
+VERSION = "0.4.9"
+ADVISOR_PROMPT_VERSION = "10"
+
+DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
 # RHEL 10 product architecture set, verified against Red Hat's RHEL 10
 # architecture documentation. Kernel arch directory names differ from product
@@ -476,6 +479,8 @@ class Planner:
         self._body_cache: dict[str, str] = {}
         self._subject_cache: dict[str, str] = {}
         self._changed_files_cache: dict[str, list[str]] = {}
+        self._tree_file_text_cache: dict[tuple[str, str], str | None] = {}
+        self._dt_include_closure_cache: dict[tuple[str, str], set[str]] = {}
         self._match_cache: dict[str, Match] = {}
         self._fixes_children: dict[str, set[str]] | None = None
         self._dependency_expanded: set[str] = set()
@@ -914,6 +919,124 @@ class Planner:
     @staticmethod
     def _include_paths(text: str) -> set[str]:
         return set(re.findall(r'(?m)^\s*#\s*include\s*[<"]([^>"]+)[>"]', text))
+
+    @staticmethod
+    def _include_candidate_paths(current_path: str, include: str) -> list[str]:
+        """Return plausible kernel-tree paths for one preprocessor include.
+
+        This is deliberately small rather than a general C preprocessor search
+        implementation. Device Tree sources primarily need relative DTS/DTSI
+        includes plus the kernel's include/ prefix used for dt-bindings headers.
+        """
+        include = include.strip()
+        if not include:
+            return []
+
+        candidates: list[str] = []
+        if include.startswith("dt-bindings/"):
+            candidates.append(f"include/{include}")
+        elif include.startswith("include/"):
+            candidates.append(include)
+
+        current_dir = posixpath.dirname(current_path)
+        if current_dir:
+            candidates.append(posixpath.normpath(posixpath.join(current_dir, include)))
+
+        dts_match = re.match(r"^(arch/[^/]+/boot/dts)(?:/|$)", current_path)
+        if dts_match:
+            candidates.append(posixpath.normpath(posixpath.join(dts_match.group(1), include)))
+
+        if not include.startswith(("dt-bindings/", "include/")):
+            candidates.append(posixpath.normpath(posixpath.join("include", include)))
+
+        return [
+            path for path in dict.fromkeys(candidates)
+            if path and path != "." and not path.startswith("../")
+        ]
+
+    def _tree_file_text(self, treeish: str, path: str) -> str | None:
+        cache = getattr(self, "_tree_file_text_cache", None)
+        if cache is None:
+            cache = {}
+            self._tree_file_text_cache = cache
+        key = (treeish, path)
+        if key in cache:
+            return cache[key]
+        if not self.git.ok(["cat-file", "-e", f"{treeish}:{path}"]):
+            cache[key] = None
+            return None
+        text = self.git.run(["show", f"{treeish}:{path}"], check=False)
+        cache[key] = text
+        return text
+
+    def dt_binding_include_closure(self, sha: str, start_path: str) -> set[str]:
+        """Return reachable include/dt-bindings headers for one selected file.
+
+        Follow a bounded graph consisting of Device Tree sources and dt-bindings
+        headers. This is sufficient to establish the namespace through which a
+        DTS/DTSI consumer sees clock/reset/etc. ID macros without recursively
+        walking the kernel's entire C header graph.
+        """
+        cache = getattr(self, "_dt_include_closure_cache", None)
+        if cache is None:
+            cache = {}
+            self._dt_include_closure_cache = cache
+        key = (sha, start_path)
+        if key in cache:
+            return set(cache[key])
+
+        reachable: set[str] = set()
+        queue: collections.deque[str] = collections.deque([start_path])
+        visited: set[str] = set()
+        while queue and len(visited) < DT_INCLUDE_CLOSURE_MAX_FILES:
+            path = queue.popleft()
+            if path in visited:
+                continue
+            visited.add(path)
+            if path.startswith("include/dt-bindings/"):
+                reachable.add(path)
+
+            text = self._tree_file_text(sha, path)
+            if text is None:
+                continue
+            for include in sorted(self._include_paths(text)):
+                resolved = None
+                for candidate in self._include_candidate_paths(path, include):
+                    if self._tree_file_text(sha, candidate) is not None:
+                        resolved = candidate
+                        break
+                if resolved is None:
+                    continue
+                if resolved.startswith("include/dt-bindings/"):
+                    reachable.add(resolved)
+                if (
+                    self._is_dt_source_path(resolved)
+                    or resolved.startswith("include/dt-bindings/")
+                ) and resolved not in visited:
+                    queue.append(resolved)
+
+        cache[key] = set(reachable)
+        return reachable
+
+    def _dt_binding_provider_reachable(
+        self,
+        sha: str,
+        provider_path: str,
+        use_paths: set[str] | None,
+    ) -> bool:
+        """Return whether a DT-binding provider is in a consumer include closure."""
+        if not provider_path.startswith("include/dt-bindings/"):
+            return True
+        if use_paths is None:
+            # Preserve the public helper's legacy behavior for callers that do not
+            # provide per-symbol use paths. The planner itself always supplies them.
+            return True
+        if not use_paths:
+            return False
+        return any(
+            provider_path in self.dt_binding_include_closure(sha, use_path)
+            for use_path in use_paths
+        )
 
     @staticmethod
     def _include_aliases_for_path(path: str) -> set[str]:
@@ -2693,8 +2816,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 by_dep[dep] = (reason, score)
         return sorted(((dep, reason, score) for dep, (reason, score) in by_dep.items()), key=lambda x: -x[2])
 
-    def extract_symbols(self, sha: str) -> set[str]:
-        symbols: set[str] = set()
+    def extract_symbol_uses(self, sha: str) -> dict[str, set[str]]:
+        uses: dict[str, set[str]] = collections.defaultdict(set)
         for h in self.parse_hunks(sha):
             for line in h.added_lines:
                 stripped = line.strip()
@@ -2702,14 +2825,23 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     continue
                 for sym in FUNC_CALL_RE.findall(line):
                     if sym not in C_KEYWORDS and sym not in IGNORE_SYMBOLS:
-                        symbols.add(sym)
+                        uses[sym].add(h.path)
                 for sym in MACRO_RE.findall(line):
                     if sym not in IGNORE_SYMBOLS and not sym.startswith("CONFIG_"):
-                        symbols.add(sym)
+                        uses[sym].add(h.path)
         # Avoid turning a large mechanical patch into a symbol-search apocalypse.
-        return set(sorted(symbols)[: self.args.max_symbols])
+        selected = sorted(uses)[: self.args.max_symbols]
+        return {symbol: uses[symbol] for symbol in selected}
 
-    def definition_dependencies(self, sha: str, symbols: set[str]) -> dict[str, str]:
+    def extract_symbols(self, sha: str) -> set[str]:
+        return set(self.extract_symbol_uses(sha))
+
+    def definition_dependencies(
+        self,
+        sha: str,
+        symbols: set[str],
+        symbol_use_paths: dict[str, set[str]] | None = None,
+    ) -> dict[str, str]:
         parents = self.git.parents(sha)
         if len(parents) != 1 or not symbols:
             return {}
@@ -2740,6 +2872,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         result: dict[str, str] = {}
         for symbol, locations in definition_lines.items():
             for path, lineno in locations[:10]:
+                if not self._dt_binding_provider_reachable(
+                    sha,
+                    path,
+                    None if symbol_use_paths is None else symbol_use_paths.get(symbol, set()),
+                ):
+                    continue
                 blame = self.blame_commits(parent, path, lineno, lineno)
                 if not blame:
                     continue
@@ -2784,7 +2922,10 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     if before_kind != "dependency" and self.dependency_kind(candidate) == "dependency":
                         added += 1
             if self.args.symbol_deps:
-                for sym, dep in self.definition_dependencies(node.sha, self.extract_symbols(node.sha)).items():
+                symbol_uses = self.extract_symbol_uses(node.sha)
+                for sym, dep in self.definition_dependencies(
+                    node.sha, set(symbol_uses), symbol_uses
+                ).items():
                     before_kind = (
                         self.dependency_kind(self.nodes[dep])
                         if dep in self.nodes else None
