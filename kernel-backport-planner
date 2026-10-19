@@ -39,8 +39,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.9"
-ADVISOR_PROMPT_VERSION = "10"
+VERSION = "0.4.10"
+ADVISOR_PROMPT_VERSION = "11"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -191,6 +191,7 @@ class CommitNode:
     advisor_error: str | None = None
     advisor_error_kind: str | None = None
     advisor_attempts: int = 0
+    symbol_dependency_proofs: list[dict[str, object]] = dataclasses.field(default_factory=list)
 
     def add_reason(
         self, reason: str, parent: str | None = None, *, tentative: bool = False
@@ -204,6 +205,10 @@ class CommitNode:
             return
         self.required_by.add(parent)
         self.triggered_by.discard(parent)
+
+    def add_symbol_dependency_proof(self, proof: dict[str, object]) -> None:
+        if proof not in self.symbol_dependency_proofs:
+            self.symbol_dependency_proofs.append(proof)
 
 
 @dataclasses.dataclass
@@ -1038,6 +1043,36 @@ class Planner:
             for use_path in use_paths
         )
 
+    def _dt_binding_namespace_proof(
+        self,
+        sha: str,
+        symbol: str,
+        provider_path: str,
+        use_paths: set[str] | None,
+    ) -> dict[str, object] | None:
+        """Return deterministic namespace proof for a DT-binding symbol provider.
+
+        A provider under include/dt-bindings/ is namespace-verified only when the
+        exact header is reachable from at least one changed file that added the
+        symbol use.  Callers that omit per-symbol use paths retain legacy lookup
+        behavior but do not manufacture a namespace proof.
+        """
+        if not provider_path.startswith("include/dt-bindings/") or use_paths is None:
+            return None
+        verified_use_paths = sorted(
+            use_path
+            for use_path in use_paths
+            if provider_path in self.dt_binding_include_closure(sha, use_path)
+        )
+        if not verified_use_paths:
+            return None
+        return {
+            "symbol": symbol,
+            "provider_path": provider_path,
+            "consumer_use_paths": verified_use_paths,
+            "verification": "dt-include-closure",
+        }
+
     @staticmethod
     def _include_aliases_for_path(path: str) -> set[str]:
         aliases = {path}
@@ -1624,6 +1659,30 @@ class Planner:
         dt_binding_header_only = bool(
             files and all(path.startswith("include/dt-bindings/") for path in files)
         )
+        namespace_proofs = sorted(
+            n.symbol_dependency_proofs,
+            key=lambda item: (
+                str(item.get("symbol", "")),
+                str(item.get("provider_path", "")),
+                str(item.get("consumer_sha", "")),
+            ),
+        )
+        symbol_reason_names = {
+            reason.split(":", 1)[1]
+            for reason in reasons
+            if reason.startswith("symbol:") and ":" in reason
+        }
+        namespace_verified_symbols = {
+            str(item.get("symbol"))
+            for item in namespace_proofs
+            if item.get("verification") == "dt-include-closure" and item.get("symbol")
+        }
+        dt_binding_namespace_verified = bool(
+            symbol_only_dependency
+            and dt_binding_header_only
+            and symbol_reason_names
+            and symbol_reason_names <= namespace_verified_symbols
+        )
         default_bias = "NEUTRAL"
         if scope["unsupported_architecture_only"]:
             default_bias = (
@@ -1636,6 +1695,13 @@ class Planner:
             and not inbound_take
         ):
             default_bias = "SKIP_OBSOLETED_BY_TAKE_CONSUMER"
+        elif (
+            symbol_only_dependency
+            and dt_binding_header_only
+            and dt_binding_namespace_verified
+            and not inbound_take
+        ):
+            default_bias = "TRUST_DT_BINDING_NAMESPACE_PROOF"
         elif symbol_only_dependency and dt_binding_header_only and not inbound_take:
             default_bias = "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL"
         elif n.direct and scope["touches_focus_paths"]:
@@ -1672,7 +1738,15 @@ class Planner:
                 "dependency_policy": {
                     "symbol_only_dependency": symbol_only_dependency,
                     "dt_binding_header_only": dt_binding_header_only,
+                    "dt_binding_namespace_verified": dt_binding_namespace_verified,
+                    "dt_binding_namespace_proofs": namespace_proofs,
                     "note": (
+                        "The DT-binding namespace is deterministically verified: the planner observed "
+                        "the symbol use in the listed consumer file(s) and confirmed that the exact "
+                        "provider header is reachable through the bounded DT include closure. This "
+                        "proof remains valid even when a truncated advisor patch excerpt omits the "
+                        "symbol-use line."
+                        if dt_binding_namespace_verified else
                         "A symbol-only deterministic dependency is provenance, not semantic proof. "
                         "DT binding clock/reset/ID macro names can be namespace-local and reused by "
                         "unrelated hardware; require concrete same-API/schema/hardware evidence before TAKE."
@@ -1783,11 +1857,17 @@ Maintenance policy:
   consumer deletes every file changed by this older dependency. Do not TAKE the older change merely
   to preserve historical sequence; absent an explicit evidence-bound inbound requirement, it has no
   surviving final-state effect.
+- When commit.default_policy_bias is TRUST_DT_BINDING_NAMESPACE_PROOF, deterministic discovery has
+  already observed the symbol use in the listed consumer file(s), followed the bounded DT include
+  graph, and confirmed that the exact provider header is reachable. Treat that namespace relationship
+  as established evidence. Do NOT choose REVIEW or SKIP merely because the bounded consumer patch
+  excerpt does not happen to contain the symbol-use line; the proof is computed from the full selected
+  tree/diff context outside the excerpt. Prefer TAKE unless some other concrete exclusion applies.
 - When commit.default_policy_bias is REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL, the dependency is
-  supported only by symbol-name provenance in DT binding headers. Clock, reset, interrupt, and other
-  binding ID names can be namespace-local and reused by unrelated SoCs/controllers. TAKE only if the
-  supplied paths/diffs demonstrate the same binding/API/hardware namespace; a matching macro name alone
-  is not enough.
+  an unverified/legacy symbol-name relationship in DT binding headers. Clock, reset, interrupt, and
+  other binding ID names can be namespace-local and reused by unrelated SoCs/controllers. TAKE only if
+  the supplied paths/diffs demonstrate the same binding/API/hardware namespace; a matching macro name
+  alone is not enough.
 - Product architecture support is explicit in planning_context.product. Architecture-owned code
   for an unsupported product architecture should normally be SKIP unless concrete diff/graph
   evidence shows that code built for a supported product architecture actually depends on it.
@@ -2836,12 +2916,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
     def extract_symbols(self, sha: str) -> set[str]:
         return set(self.extract_symbol_uses(sha))
 
-    def definition_dependencies(
+    def definition_dependency_details(
         self,
         sha: str,
         symbols: set[str],
         symbol_use_paths: dict[str, set[str]] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, object]]:
         parents = self.git.parents(sha)
         if len(parents) != 1 or not symbols:
             return {}
@@ -2869,13 +2949,14 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 if definitionish:
                     definition_lines[symbol].append((path, int(lineno_s)))
 
-        result: dict[str, str] = {}
+        result: dict[str, dict[str, object]] = {}
         for symbol, locations in definition_lines.items():
             for path, lineno in locations[:10]:
+                use_paths = None if symbol_use_paths is None else symbol_use_paths.get(symbol, set())
                 if not self._dt_binding_provider_reachable(
                     sha,
                     path,
-                    None if symbol_use_paths is None else symbol_use_paths.get(symbol, set()),
+                    use_paths,
                 ):
                     continue
                 blame = self.blame_commits(parent, path, lineno, lineno)
@@ -2883,9 +2964,29 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     continue
                 dep = blame.most_common(1)[0][0]
                 if dep != sha and self.upstream_before(dep, sha) and self.match(dep, check_ancestry=True).status == "missing":
-                    result[symbol] = dep
+                    result[symbol] = {
+                        "dependency_sha": dep,
+                        "provider_path": path,
+                        "namespace_proof": self._dt_binding_namespace_proof(
+                            sha, symbol, path, use_paths
+                        ),
+                    }
                     break
         return result
+
+    def definition_dependencies(
+        self,
+        sha: str,
+        symbols: set[str],
+        symbol_use_paths: dict[str, set[str]] | None = None,
+    ) -> dict[str, str]:
+        """Compatibility wrapper returning only symbol -> dependency SHA."""
+        return {
+            symbol: str(detail["dependency_sha"])
+            for symbol, detail in self.definition_dependency_details(
+                sha, symbols, symbol_use_paths
+            ).items()
+        }
 
     def add_static_dependencies(self, snapshot: Sequence[CommitNode] | None = None) -> int:
         added = 0
@@ -2923,9 +3024,10 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         added += 1
             if self.args.symbol_deps:
                 symbol_uses = self.extract_symbol_uses(node.sha)
-                for sym, dep in self.definition_dependencies(
+                for sym, detail in self.definition_dependency_details(
                     node.sha, set(symbol_uses), symbol_uses
                 ).items():
+                    dep = str(detail["dependency_sha"])
                     before_kind = (
                         self.dependency_kind(self.nodes[dep])
                         if dep in self.nodes else None
@@ -2933,6 +3035,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     dep_node = self.ensure_node(
                         dep, reason=f"symbol:{sym}", required_by=node.sha
                     )
+                    proof = detail.get("namespace_proof")
+                    if isinstance(proof, dict):
+                        dep_node.add_symbol_dependency_proof({
+                            **proof,
+                            "consumer_sha": node.sha,
+                        })
                     if before_kind != "dependency" and self.dependency_kind(dep_node) == "dependency":
                         added += 1
         return added
@@ -3404,6 +3512,23 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             # unmarked; only exceptional dependency commits are labeled.
             if n.reasons and n.reasons != {"focus-path"}:
                 lines.append(f"      evidence: {', '.join(sorted(n.reasons))}")
+            for proof in sorted(
+                n.symbol_dependency_proofs,
+                key=lambda item: (
+                    str(item.get("symbol", "")),
+                    str(item.get("consumer_sha", "")),
+                    str(item.get("provider_path", "")),
+                ),
+            ):
+                use_paths = ",".join(str(x) for x in proof.get("consumer_use_paths", []))
+                lines.append(
+                    "      symbol-namespace-proof: "
+                    f'{proof.get("symbol", "?")} '
+                    f'provider={proof.get("provider_path", "?")} '
+                    f'consumer={str(proof.get("consumer_sha", ""))[:12]} '
+                    f'use={use_paths or "?"} '
+                    f'verification={proof.get("verification", "?")}'
+                )
             if n.series_ids:
                 lines.append(
                     "      same-series: "
@@ -3649,6 +3774,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_error": n.advisor_error,
                     "advisor_error_kind": n.advisor_error_kind,
                     "advisor_attempts": n.advisor_attempts,
+                    "symbol_dependency_proofs": n.symbol_dependency_proofs,
                 }
                 for sha, n in self.nodes.items()
             },

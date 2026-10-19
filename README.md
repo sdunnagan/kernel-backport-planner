@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.9**.
+Current tool version: **0.4.10**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -84,7 +84,10 @@ cross-commit requirements. Version 0.4.9 moves that DT binding namespace check
 into deterministic symbol discovery: symbol uses retain their selected file,
 the planner follows a bounded DTS/DTSI -> `include/dt-bindings/` include closure,
 and a binding macro provider is accepted only when its exact header is reachable
-from the consumer.
+from the consumer. Version 0.4.10 records that include-closure result as explicit
+namespace proof on the dependency edge and teaches the advisor to trust verified
+DT binding relationships even when a bounded patch excerpt omits the actual
+symbol-use line.
 
 ## Downstream identity matching
 
@@ -489,6 +492,17 @@ at all, while preserving dependencies on the binding header the consumer actuall
 includes. The 0.4.8 advisor policy remains as defense-in-depth for any ambiguous
 symbol-only binding relationship that survives deterministic filtering.
 
+Version 0.4.10 distinguishes those fallback cases from dependencies already
+verified by 0.4.9. A verified edge records the symbol, exact provider header,
+consumer commit, consumer file(s) that added the use, and `dt-include-closure`
+verification method. Such a candidate receives
+`TRUST_DT_BINDING_NAMESPACE_PROOF`: the namespace relationship is deterministic
+evidence and does not need to be rediscovered from the advisor's bounded consumer
+patch excerpt. The advisor must not choose REVIEW or SKIP merely because that
+excerpt is truncated before the symbol-use line. Unverified or legacy
+symbol-only binding relationships continue to use
+`REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL`.
+
 Every evidence record receives a deterministic `evidence_id`. The records are
 supplied as both `same_series_consumed_objects` and
 `eligible_prerequisite_evidence`. They do not alter the deterministic plan or
@@ -709,7 +723,8 @@ risk, patch-series membership, and (when enabled) advisor decision, rationale,
 deterministic same-series prerequisite evidence, evidence-bound prerequisite
 recommendations, rejected prerequisite recommendations retained for audit,
 inbound TAKE-consumer recommendations and assessments, consistency warnings,
-risks, advisor attempts/error kinds, reconciliation count, and run-level
+risks, DT-binding `symbol_dependency_proofs`, advisor attempts/error kinds,
+reconciliation count, and run-level
 retry/failure statistics, plus the advisor diagnostic-error-log path/count when
 advisor errors occurred.
 
@@ -830,7 +845,8 @@ filtering, Device Tree binding relationships, retries and diagnostics,
 reconciliation, consistency checking, advisor audit output, subsystem-neutral
 focus-path policy, generic-product behavior, deterministic policy exclusions,
 architecture ownership outside `arch/`, and namespace-aware DT binding symbol
-resolution through bounded include closures.
+resolution through bounded include closures, including advisor trust of verified
+namespace proof when consumer excerpts are truncated.
 
 ## Optional check/build command
 

@@ -1279,6 +1279,8 @@ class AdvisorTests(unittest.TestCase):
         self.assertNotIn("direct arm64 DTS/platform commits", prompt)
         self.assertIn("SKIP_UNSUPPORTED_ARCHITECTURE_ONLY", prompt)
         self.assertIn("SKIP_OBSOLETED_BY_TAKE_CONSUMER", prompt)
+        self.assertIn("TRUST_DT_BINDING_NAMESPACE_PROOF", prompt)
+        self.assertIn("Do NOT choose REVIEW or SKIP merely because", prompt)
         self.assertIn("REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL", prompt)
         self.assertIn("namespace-local", prompt)
 
@@ -1429,10 +1431,58 @@ class AdvisorTests(unittest.TestCase):
         packet = planner.advisor_packet(dep.sha)
         self.assertTrue(packet["commit"]["dependency_policy"]["symbol_only_dependency"])
         self.assertTrue(packet["commit"]["dependency_policy"]["dt_binding_header_only"])
+        self.assertFalse(packet["commit"]["dependency_policy"]["dt_binding_namespace_verified"])
         self.assertEqual(
             packet["commit"]["default_policy_bias"],
             "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL",
         )
+
+    def test_verified_mt8188_binding_symbol_trusts_namespace_proof_despite_truncated_excerpt(self):
+        planner = self.minimal_planner()
+        provider = kbp.CommitNode(
+            "a" * 40,
+            "dt-bindings: clock: mediatek,mt8188: Add VDO1_DPI1_HDMI clock",
+        )
+        provider.files = ["include/dt-bindings/clock/mediatek,mt8188-clk.h"]
+        consumer = kbp.CommitNode(
+            "b" * 40,
+            "arm64: dts: mediatek: mt8188: Add DPI1, HDMI, HDMI PHY/DDC nodes",
+            direct=True,
+        )
+        consumer.files = ["arch/arm64/boot/dts/mediatek/mt8188.dtsi"]
+        consumer.advisor_decision = "TAKE"
+        provider.add_reason("symbol:CLK_VDO1_DPI1_HDMI", consumer.sha)
+        provider.add_symbol_dependency_proof({
+            "symbol": "CLK_VDO1_DPI1_HDMI",
+            "provider_path": "include/dt-bindings/clock/mediatek,mt8188-clk.h",
+            "consumer_use_paths": ["arch/arm64/boot/dts/mediatek/mt8188.dtsi"],
+            "verification": "dt-include-closure",
+            "consumer_sha": consumer.sha,
+        })
+        planner.nodes = {provider.sha: provider, consumer.sha: consumer}
+        planner.subject = lambda sha: planner.nodes[sha].subject
+        planner.changed_files = lambda sha: planner.nodes[sha].files
+        planner.body = lambda sha: planner.nodes[sha].subject
+        planner.patch_excerpt = lambda sha, _limit: (
+            "+#define CLK_VDO1_DPI1_HDMI 66\n"
+            if sha == provider.sha
+            else "+hdmi0: hdmi@14000000 { /* excerpt truncates clock line */ };\n"
+        )
+
+        packet = planner.advisor_packet(provider.sha)
+        policy = packet["commit"]["dependency_policy"]
+        self.assertTrue(policy["dt_binding_namespace_verified"])
+        self.assertEqual(
+            packet["commit"]["default_policy_bias"],
+            "TRUST_DT_BINDING_NAMESPACE_PROOF",
+        )
+        self.assertEqual(policy["dt_binding_namespace_proofs"][0]["consumer_sha"], consumer.sha)
+        self.assertIn("truncated advisor patch excerpt", policy["note"])
+
+        planner.ordered_missing = lambda: [provider.sha]
+        report = kbp.Planner.report_text(planner)
+        self.assertIn("symbol-namespace-proof: CLK_VDO1_DPI1_HDMI", report)
+        self.assertIn("verification=dt-include-closure", report)
 
     def test_extract_symbol_uses_retains_changed_file_path(self):
         planner = self.minimal_planner()
@@ -1540,10 +1590,58 @@ class AdvisorTests(unittest.TestCase):
             reachable_headers={provider_path},
         )
 
-        deps = planner.definition_dependencies(
+        details = planner.definition_dependency_details(
             selected, {symbol}, {symbol: {use_path}}
         )
-        self.assertEqual(deps, {symbol: provider})
+        self.assertEqual(details[symbol]["dependency_sha"], provider)
+        self.assertEqual(details[symbol]["provider_path"], provider_path)
+        self.assertEqual(details[symbol]["namespace_proof"], {
+            "symbol": symbol,
+            "provider_path": provider_path,
+            "consumer_use_paths": [use_path],
+            "verification": "dt-include-closure",
+        })
+        self.assertEqual(
+            planner.definition_dependencies(selected, {symbol}, {symbol: {use_path}}),
+            {symbol: provider},
+        )
+
+    def test_static_dependency_records_dt_binding_namespace_proof_on_provider(self):
+        planner = self.minimal_planner()
+        planner.args.context_deps = False
+        planner.args.symbol_deps = True
+        consumer = kbp.CommitNode("b" * 40, "arm64: dts: add HDMI", direct=True)
+        provider = kbp.CommitNode("a" * 40, "dt-bindings: clock: add HDMI clock")
+        symbol = "CLK_VDO1_DPI1_HDMI"
+        use_path = "arch/arm64/boot/dts/mediatek/mt8188.dtsi"
+        provider_path = "include/dt-bindings/clock/mediatek,mt8188-clk.h"
+        planner.nodes = {consumer.sha: consumer, provider.sha: provider}
+        planner.is_pre_base_dependency = lambda _node: False
+        planner.git = types.SimpleNamespace(rev_parse=lambda sha: sha)
+        planner.extract_symbol_uses = lambda _sha: {symbol: {use_path}}
+        planner.definition_dependency_details = lambda _sha, _symbols, _uses: {
+            symbol: {
+                "dependency_sha": provider.sha,
+                "provider_path": provider_path,
+                "namespace_proof": {
+                    "symbol": symbol,
+                    "provider_path": provider_path,
+                    "consumer_use_paths": [use_path],
+                    "verification": "dt-include-closure",
+                },
+            }
+        }
+
+        planner.add_static_dependencies([consumer])
+        self.assertIn(f"symbol:{symbol}", provider.reasons)
+        self.assertIn(consumer.sha, provider.required_by)
+        self.assertEqual(provider.symbol_dependency_proofs, [{
+            "symbol": symbol,
+            "provider_path": provider_path,
+            "consumer_use_paths": [use_path],
+            "verification": "dt-include-closure",
+            "consumer_sha": consumer.sha,
+        }])
 
     def test_skip_discards_outbound_prerequisite_recommendations(self):
         planner = self.minimal_planner()
