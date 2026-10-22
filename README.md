@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.10**.
+Current tool version: **0.4.12**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -88,6 +88,23 @@ from the consumer. Version 0.4.10 records that include-closure result as explici
 namespace proof on the dependency edge and teaches the advisor to trust verified
 DT binding relationships even when a bounded patch excerpt omits the actual
 symbol-use line.
+
+Version 0.4.11 extends verified namespace handling to binding commits that
+change both a DT binding header and accompanying YAML/schema files. After advisor
+evaluation (including cached responses), a conservative deterministic guardrail
+corrects a REVIEW or SKIP that rests solely on redundant uncertainty about a
+namespace already verified through the exact-header include closure. Other
+integration, architecture, build, and semantic concerns retain their original
+advisor decisions; the original advisor explanation is preserved for audit.
+
+Version 0.4.12 restricts that override to explicit omissions of symbol-use or
+provider-header include lines from bounded consumer patch/diff excerpts, facts
+already established by deterministic discovery. The guardrail fails closed if
+the rationale or any risk introduces another objection. In particular, exact
+header reachability does **not** prove that a DTS `compatible` value is correct,
+that downstream files exist, or that the change builds and integrates. REVIEW
+or SKIP is retained for those concerns. A safe but unrecognized paraphrase may
+therefore remain REVIEW rather than being automatically promoted to TAKE.
 
 ## Downstream identity matching
 

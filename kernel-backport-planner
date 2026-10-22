@@ -39,8 +39,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.10"
-ADVISOR_PROMPT_VERSION = "11"
+VERSION = "0.4.12"
+ADVISOR_PROMPT_VERSION = "12"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -1679,7 +1679,6 @@ class Planner:
         }
         dt_binding_namespace_verified = bool(
             symbol_only_dependency
-            and dt_binding_header_only
             and symbol_reason_names
             and symbol_reason_names <= namespace_verified_symbols
         )
@@ -1697,7 +1696,6 @@ class Planner:
             default_bias = "SKIP_OBSOLETED_BY_TAKE_CONSUMER"
         elif (
             symbol_only_dependency
-            and dt_binding_header_only
             and dt_binding_namespace_verified
             and not inbound_take
         ):
@@ -2263,6 +2261,86 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         node.advisor_error = str(exc)
         node.advisor_error_kind = exc.kind
 
+    @staticmethod
+    def _namespace_only_objection(text: str, *, allow_conclusion_only: bool = False) -> bool:
+        """Accept only explicit excerpt omissions of facts already proven by Git.
+
+        Include closure establishes the consumer's symbol use and the exact
+        header's reachability. It does NOT establish the hardware compatible
+        string, downstream applicability, or build correctness. Fail closed on
+        any wording outside this deliberately small vocabulary: a false TAKE
+        is more costly than leaving an uncertain commit at REVIEW.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+
+        excerpt = (
+            r"(?:the\s+)?(?:(?:bounded|truncated)\s+)?"
+            r"(?:(?:consumer|related)\s+)?(?:patch|diff)\s+excerpt"
+        )
+        proven_fact = (
+            r"(?:the\s+)?(?:(?:actual|exact|relevant)\s+)?"
+            r"(?:symbol[- ]use(?:\s+line)?|macro[- ]use(?:\s+line)?|"
+            r"symbol\s+reference(?:\s+line)?|"
+            r"(?:provider[- ]header|header)[- ]include(?:\s+line)?|"
+            r"(?:exact\s+)?provider\s+header\s+include(?:\s+line)?)"
+        )
+        omitted_fact = re.compile(
+            rf"{excerpt}\s+(?:"
+            rf"(?:does\s+not|doesn't)\s+(?:show|include|contain)\s+{proven_fact}|"
+            rf"(?:omits|lacks)\s+{proven_fact}|"
+            rf"(?:is\s+)?truncated\s+before\s+{proven_fact}"
+            rf")",
+            re.IGNORECASE,
+        )
+        namespace_conclusion = re.compile(
+            r"(?:(?:therefore|consequently|thus|as a result)\s*,?\s+)?"
+            r"(?:the\s+)?(?:DT[- ]binding\s+|binding\s+)?namespace\s+"
+            r"(?:cannot|can't|could\s+not)\s+be\s+"
+            r"(?:verified|established|confirmed)\s+"
+            r"(?:from|using)\s+(?:the|this|that)\s+excerpt",
+            re.IGNORECASE,
+        )
+
+        # Every sentence must be a known redundant objection. Do not use a
+        # keyword blacklist: it misses novel or paraphrased integration risks.
+        sentences = re.split(r"(?<=[.!?])\s+", " ".join(text.split()))
+        saw_omission = False
+        for sentence in sentences:
+            sentence = sentence.rstrip(". ")
+            if omitted_fact.fullmatch(sentence):
+                saw_omission = True
+            elif not namespace_conclusion.fullmatch(sentence):
+                return False
+        return saw_omission or allow_conclusion_only
+
+    def _enforce_verified_dt_namespace(self, node: CommitNode, result: dict) -> dict:
+        """Do not let an excerpt-only namespace objection veto proven edges.
+
+        Never manufacture proof, and never override independent objections or
+        an advisor error. Both fresh and cached model responses pass here.
+        """
+        if result["decision"] not in {"REVIEW", "SKIP"}:
+            return result
+        packet = self.advisor_packet(node.sha)
+        if packet["commit"]["default_policy_bias"] != "TRUST_DT_BINDING_NAMESPACE_PROOF":
+            return result
+        if not self._namespace_only_objection(result["rationale"]):
+            return result
+        if any(not self._namespace_only_objection(risk, allow_conclusion_only=True)
+               for risk in result["risks"]):
+            return result
+        revised = dict(result)
+        revised["decision"] = "TAKE"
+        revised["rationale"] = (
+            "Verified DT-binding namespace via exact-header include closure; "
+            "advisor's excerpt-based namespace objection is superseded. "
+            "Original advisor rationale: " + result["rationale"]
+        )
+        revised["risks"] = []  # All stated risks were the same disproven objection.
+        self.info(f"    verified DT namespace guardrail: TAKE {node.sha[:12]}")
+        return revised
+
     def _advisor_note_success(self, node: CommitNode, result: dict) -> None:
         previous = node.advisor_error_kind
         if previous:
@@ -2270,6 +2348,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             self.advisor_failure_kinds[previous] -= 1
             if self.advisor_failure_kinds[previous] <= 0:
                 del self.advisor_failure_kinds[previous]
+        result = self._enforce_verified_dt_namespace(node, result)
         node.advisor_decision = result["decision"]
         node.advisor_rationale = result["rationale"]
         node.advisor_prerequisites = result["prerequisite_peers"]

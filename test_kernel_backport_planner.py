@@ -1484,6 +1484,142 @@ class AdvisorTests(unittest.TestCase):
         self.assertIn("symbol-namespace-proof: CLK_VDO1_DPI1_HDMI", report)
         self.assertIn("verification=dt-include-closure", report)
 
+    def test_verified_namespace_excerpt_only_objection_overridden(self):
+        planner = self.minimal_planner()
+        provider = kbp.CommitNode("a" * 40, "dt-bindings: clock: qcom: Add GCC clocks for QCS8300")
+        provider.files = ["include/dt-bindings/clock/qcom,qcs8300-gcc.h", "Documentation/devicetree/bindings/clock/qcom,qcs8300-gcc.yaml"]
+        provider.add_reason("symbol:GCC_PCIE_1_BCR", "b" * 40)
+        provider.add_symbol_dependency_proof({
+            "symbol": "GCC_PCIE_1_BCR",
+            "provider_path": provider.files[0],
+            "consumer_sha": "b" * 40,
+            "consumer_use_paths": ["arch/arm64/boot/dts/qcom/qcs8300.dtsi"],
+            "verification": "dt-include-closure",
+        })
+        planner.nodes = {provider.sha: provider}
+        planner.subject = lambda sha: provider.subject
+        planner.changed_files = lambda sha: provider.files
+        planner.body = lambda sha: provider.subject
+        planner.patch_excerpt = lambda sha, limit: ""
+        planner.advisor_allowed_prerequisite_peers = lambda sha: []
+        planner.advisor_prerequisite_evidence = lambda sha: []
+        planner.advisor_inbound_take_recommendations = lambda sha: []
+        planner.advisor_scope_context = lambda files: {"unsupported_architecture_only": False, "touches_focus_paths": False}
+        planner.advisor_obsolescence_context = lambda sha, files: {"all_changed_files_deleted_by_take_consumers": False}
+        planner.advisor_product_context = lambda: {}
+        planner.info = lambda *args: None
+        self.assertEqual(planner.advisor_packet(provider.sha)["commit"]["default_policy_bias"], "TRUST_DT_BINDING_NAMESPACE_PROOF")
+        result = {
+            "decision": "REVIEW",
+            "rationale": (
+                "The bounded consumer patch excerpt omits the symbol-use line. "
+                "Consequently, the DT-binding namespace cannot be verified from that excerpt."
+            ),
+            "risks": ["The truncated consumer patch excerpt does not show the header-include line."],
+            "prerequisite_peers": [],
+            "inbound_prerequisite_assessments": [],
+        }
+        revised = planner._enforce_verified_dt_namespace(provider, result)
+        self.assertEqual(revised["decision"], "TAKE")
+        self.assertEqual(revised["risks"], [])
+        self.assertIn("Original advisor rationale", revised["rationale"])
+        self.assertEqual(result["decision"], "REVIEW")
+
+    def test_namespace_guardrail_does_not_override_qcs8300_compatible_objection(self):
+        # The real 0.4.10 QCS8300 objection asked for the *compatible* value.
+        # Include closure proves macro use and header reachability, not that
+        # the DTS node's compatible value is correct.
+        planner = self.minimal_planner()
+        planner.advisor_packet = lambda sha: {"commit": {
+            "default_policy_bias": "TRUST_DT_BINDING_NAMESPACE_PROOF"}}
+        node = kbp.CommitNode("a" * 40, "dt-bindings: clock: qcom: Add GCC clocks for QCS8300")
+        result = {
+            "decision": "REVIEW",
+            "rationale": (
+                "The provided evidence does not include the 'compatible' property for the gcc node. "
+                "Consequently, it cannot be verified that the consumer uses the specific "
+                "qcom,qcs8300-gcc binding rather than a legacy namespace."
+            ),
+            "risks": [
+                "The lack of explicit evidence linking the consumer's gcc node to the "
+                "qcom,qcs8300-gcc compatible string prevents verification of the binding namespace."
+            ],
+        }
+        self.assertIs(planner._enforce_verified_dt_namespace(node, result), result)
+
+    def test_namespace_guardrail_rejects_independent_objections(self):
+        planner = self.minimal_planner()
+        planner.advisor_packet = lambda sha: {"commit": {
+            "default_policy_bias": "TRUST_DT_BINDING_NAMESPACE_PROOF"}}
+        node = kbp.CommitNode("a" * 40, "binding")
+        excerpt_only = "The bounded consumer patch excerpt omits the symbol-use line."
+        cases = [
+            ("The compatible string is wrong for the target controller, and the driver lacks support for it.", []),
+            (excerpt_only + " The compatible string is wrong for the target controller.", []),
+            (excerpt_only + " The downstream driver lacks support for this hardware.", []),
+            (excerpt_only + " The downstream target file is missing.", []),
+            (excerpt_only + " A required downstream header is absent.", []),
+            (excerpt_only + " The integration breaks the API.", []),
+            (excerpt_only + " The patch fails to compile.", []),
+            (excerpt_only + " A separate architecture exclusion applies.", []),
+            (excerpt_only + " The compatible property is invalid.", []),
+            ("The truncated consumer patch excerpt omits the compatible property.", []),
+            ("The namespace cannot be verified from that excerpt.", []),
+            (excerpt_only, ["The downstream file is missing."]),
+            (excerpt_only, ["The compatible value does not match the hardware."]),
+            (excerpt_only, ["The patch cannot apply downstream."]),
+            (excerpt_only, ["The bounded consumer patch excerpt omits the symbol-use line. "
+                            "There is also a device regression."]),
+        ]
+        for decision in ("REVIEW", "SKIP"):
+            for rationale, risks in cases:
+                with self.subTest(decision=decision, rationale=rationale, risks=risks):
+                    result = {"decision": decision, "rationale": rationale, "risks": risks}
+                    self.assertIs(planner._enforce_verified_dt_namespace(node, result), result)
+
+    def test_namespace_guardrail_allows_only_explicit_excerpt_objections(self):
+        planner = self.minimal_planner()
+        planner.advisor_packet = lambda sha: {"commit": {
+            "default_policy_bias": "TRUST_DT_BINDING_NAMESPACE_PROOF"}}
+        planner.info = lambda *args: None
+        node = kbp.CommitNode("a" * 40, "binding")
+        cases = [
+            "The bounded consumer patch excerpt does not show the symbol-use line.",
+            "The truncated consumer diff excerpt is truncated before the macro-use line.",
+            "The consumer patch excerpt lacks the exact provider header include line.",
+            "The consumer patch excerpt omits the symbol-use line. "
+            "Therefore, the binding namespace cannot be verified from this excerpt.",
+        ]
+        for decision in ("REVIEW", "SKIP"):
+            for rationale in cases:
+                with self.subTest(decision=decision, rationale=rationale):
+                    result = {"decision": decision, "rationale": rationale, "risks": [],
+                              "prerequisite_peers": [], "inbound_prerequisite_assessments": []}
+                    revised = planner._enforce_verified_dt_namespace(node, result)
+                    self.assertEqual(revised["decision"], "TAKE")
+                    self.assertIn(rationale, revised["rationale"])
+                    self.assertEqual(result["decision"], decision)
+
+    def test_namespace_guardrail_preserves_independent_review(self):
+        planner = self.minimal_planner()
+        planner.advisor_packet = lambda sha: {"commit": {
+            "default_policy_bias": "TRUST_DT_BINDING_NAMESPACE_PROOF"}}
+        planner.info = lambda *args: None
+        node = kbp.CommitNode("a" * 40, "binding")
+        cases = [
+            ("The namespace cannot be verified, and there is an API incompatibility.", []),
+            ("The namespace cannot be verified.", ["Possible build failure due to changed ABI"]),
+            ("Build error from unresolved dependencies", []),
+        ]
+        for rationale, risks in cases:
+            with self.subTest(rationale=rationale):
+                result = {"decision": "REVIEW", "rationale": rationale, "risks": risks}
+                self.assertIs(planner._enforce_verified_dt_namespace(node, result), result)
+        planner.advisor_packet = lambda sha: {"commit": {
+            "default_policy_bias": "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL"}}
+        result = {"decision": "REVIEW", "rationale": "The namespace cannot be verified.", "risks": []}
+        self.assertIs(planner._enforce_verified_dt_namespace(node, result), result)
+
     def test_extract_symbol_uses_retains_changed_file_path(self):
         planner = self.minimal_planner()
         planner.args.max_symbols = 32
