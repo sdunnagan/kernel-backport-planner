@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.machinery
+import io
 import json
 import types
 import unittest
@@ -2022,6 +2023,114 @@ class AdvisorTests(unittest.TestCase):
         self.assertIn("1 advisor failure(s) -> REVIEW", report)
         self.assertIn("advisor-failures: timeout=1", report)
         self.assertIn("advisor-error: timeout: timed out", report)
+
+
+class DualReportOutputTests(unittest.TestCase):
+    """Exercise the CLI write path without running Git or the Ollama advisor."""
+
+    def fake_planner(self):
+        planner = mock.Mock()
+        planner.nodes = {}
+        planner.run_check_command.return_value = (0, "check passed")
+        planner.report_text.return_value = "text plan\n"
+        planner.report_json.return_value = json.dumps({
+            "order": ["a" * 40, "b" * 40],
+            "commits": {"a" * 40: {"advisor_decision": "TAKE"}},
+            "check": {"returncode": 0, "output": "check passed"},
+        }) + "\n"
+        return planner
+
+    def run_mocked(self, argv, planner):
+        with mock.patch.object(kbp, "Planner", return_value=planner):
+            with mock.patch.object(kbp.sys, "stdout", new_callable=io.StringIO) as stdout:
+                result = kbp.main(["--base", "v6.19", "--target", "v7.0", *argv])
+                return result, stdout.getvalue()
+
+    def test_dual_output_runs_analysis_once_and_shares_check_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            text_path = Path(temp) / "plan.c"
+            json_path = Path(temp) / "plan.json"
+            planner = self.fake_planner()
+            rc, stdout = self.run_mocked(
+                ["--output", str(text_path), "--json-output", str(json_path)], planner
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(stdout, "")
+            self.assertEqual(text_path.read_text(), "text plan\n")
+            self.assertEqual(json.loads(json_path.read_text())["order"], ["a" * 40, "b" * 40])
+            planner.collect.assert_called_once_with()
+            planner.run_advisor.assert_called_once_with()
+            planner.run_check_command.assert_called_once_with()
+            planner.report_text.assert_called_once_with((0, "check passed"))
+            planner.report_json.assert_called_once_with((0, "check passed"))
+            self.assertEqual(
+                [call[0] for call in planner.method_calls],
+                ["collect", "run_advisor", "run_check_command", "report_text", "report_json"],
+            )
+
+    def test_primary_stdout_still_works_with_json_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            json_path = Path(temp) / "plan.json"
+            planner = self.fake_planner()
+            rc, stdout = self.run_mocked(["--json-output", str(json_path)], planner)
+            self.assertEqual(rc, 0)
+            self.assertEqual(stdout, "text plan\n")
+            self.assertEqual(json.loads(json_path.read_text())["order"], ["a" * 40, "b" * 40])
+
+    def test_existing_json_only_output_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            json_path = Path(temp) / "plan.json"
+            planner = self.fake_planner()
+            rc, stdout = self.run_mocked(
+                ["--format", "json", "--output", str(json_path)], planner
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(stdout, "")
+            self.assertEqual(json.loads(json_path.read_text())["order"], ["a" * 40, "b" * 40])
+            planner.report_text.assert_not_called()
+            planner.report_json.assert_called_once_with((0, "check passed"))
+
+    def test_json_primary_with_second_json_output_renders_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            primary = Path(temp) / "primary.json"
+            secondary = Path(temp) / "secondary.json"
+            planner = self.fake_planner()
+            rc, _ = self.run_mocked(
+                ["--format", "json", "--output", str(primary), "--json-output", str(secondary)],
+                planner,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(primary.read_bytes(), secondary.read_bytes())
+            planner.report_json.assert_called_once()
+            planner.report_text.assert_not_called()
+
+    def test_same_output_path_is_rejected_before_analysis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_path = Path(temp) / "plan.c"
+            planner = self.fake_planner()
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                with mock.patch.object(kbp.sys, "stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as raised:
+                        kbp.main(["--base", "v6.19", "--target", "v7.0",
+                                  "--output", str(output_path),
+                                  "--json-output", str(Path(temp) / "." / "plan.c")])
+            self.assertEqual(raised.exception.code, 2)
+            planner.collect.assert_not_called()
+            self.assertFalse(output_path.exists())
+
+    def test_conflicts_still_return_two_after_writing_both_reports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            text_path = Path(temp) / "plan.c"
+            json_path = Path(temp) / "plan.json"
+            planner = self.fake_planner()
+            node = kbp.CommitNode("a" * 40, "conflicting backport", replay="conflict")
+            planner.nodes = {node.sha: node}
+            rc, _ = self.run_mocked(
+                ["--output", str(text_path), "--json-output", str(json_path)], planner
+            )
+            self.assertEqual(rc, 2)
+            self.assertTrue(text_path.exists())
+            self.assertEqual(json.loads(json_path.read_text())["order"][0], node.sha)
 
 
 if __name__ == "__main__":

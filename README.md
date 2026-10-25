@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.12**.
+Current tool version: **0.4.13**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -105,6 +105,11 @@ header reachability does **not** prove that a DTS `compatible` value is correct,
 that downstream files exist, or that the change builds and integrates. REVIEW
 or SKIP is retained for those concerns. A safe but unrecognized paraphrase may
 therefore remain REVIEW rather than being automatically promoted to TAKE.
+
+Version 0.4.13 adds `--json-output` to emit a machine-readable JSON report
+alongside the normal text report from the same planning and advisor run. The
+existing `--format` and `--output` options remain unchanged; the two output
+paths must be distinct.
 
 ## Downstream identity matching
 
@@ -633,7 +638,8 @@ time kernel-backport-planner \
     --base v6.19 \
     --target v7.0 \
     --file-list ~/projects/rhel-223619/file_list.txt \
-    --output ~/projects/rhel-223619/backport_plan.c
+    --output ~/projects/rhel-223619/backport_plan.c \
+    --json-output ~/projects/rhel-223619/backport_plan.json
 ```
 
 `--update` updates the named upstream and downstream remotes before analysis.
@@ -725,7 +731,23 @@ not yet been deprecated.
 
 ## Machine-readable output
 
-Use JSON when another tool will consume the result:
+For a machine-readable JSON report alongside the default human-readable text
+report, use:
+
+```bash
+kernel-backport-planner ... \
+    --output plan.c \
+    --json-output plan.json
+```
+
+Both reports are generated from the same in-memory analysis, with the same
+ordered commits, advisor recommendations, and check results. This does not
+repeat advisor inference. The `--json-output` path must differ from `--output`.
+When `--output` is omitted, the primary report still goes to stdout. The
+advisor cache and diagnostic log keep their existing default paths based on
+`--output`; `--json-output` does not change them.
+
+For JSON as the primary (or only) report, the existing form still works:
 
 ```bash
 kernel-backport-planner ... \

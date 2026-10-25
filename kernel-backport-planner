@@ -39,7 +39,7 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 ADVISOR_PROMPT_VERSION = "12"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
@@ -4002,14 +4002,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="max diff characters per required-by consumer in advisor evidence (default: 5000)",
     )
     p.add_argument("--format", choices=("text", "json"), default="text")
-    p.add_argument("--output", help="write report to this file instead of stdout")
+    p.add_argument("--output", help="write primary report to this file instead of stdout")
+    p.add_argument(
+        "--json-output",
+        help="also write a JSON report from the same analysis (independent of --format)",
+    )
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--debug", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.output and args.json_output and Path(args.output).expanduser().resolve() == Path(args.json_output).expanduser().resolve():
+        p.error("--json-output and --output must name different files")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
     planner = Planner(args)
     planner.collect()
@@ -4020,6 +4027,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         Path(args.output).write_text(report)
     else:
         sys.stdout.write(report)
+    if args.json_output:
+        # Both artifacts share one collected plan, advisor run, and check result.
+        json_report = report if args.format == "json" else planner.report_json(check_result)
+        Path(args.json_output).write_text(json_report)
     # A report with unresolved conflicts is still useful; use rc=2 to make it
     # script-detectable without treating analysis itself as a crash.
     if any(n.replay == "conflict" for n in planner.nodes.values() if n.match.status == "missing"):
