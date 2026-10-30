@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.13**.
+Current tool version: **0.4.16**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -50,7 +50,9 @@ backport work begins.
 
 Version 0.4 adds an optional local-model advisor layer. Deterministic commit
 discovery remains authoritative and auditable; the advisor adds TAKE/SKIP/REVIEW
-recommendations without changing the selected commit set. Version 0.4.1 tightens
+recommendations and, as of 0.4.14, may nominate evidence-backed earlier peers
+for independent evaluation rather than silently leaving required peers outside
+the executable plan. Version 0.4.1 tightens
 that layer with product-aware architecture policy, consumer-first dependency-graph
 context, constrained same-series prerequisite output, retries, and clearer advisor
 failure accounting. Version 0.4.2 further aligns advisor policy with upstream
@@ -110,6 +112,46 @@ Version 0.4.13 adds `--json-output` to emit a machine-readable JSON report
 alongside the normal text report from the same planning and advisor run. The
 existing `--format` and `--output` options remain unchanged; the two output
 paths must be distinct.
+
+Version 0.4.14 closes gaps exposed by plan-driven execution. It resolves DTS/DTSI
+preprocessor includes from the full upstream source to exact file-adding commits
+when those files are absent from the frozen downstream baseline. The provider is
+selected as a dependency, but still receives an independent advisor decision.
+Advisor-nominated same-series prerequisites are similarly promoted for bounded
+follow-up evaluation only when tied to deterministic evidence. TAKE is never
+assigned simply because another commit requests the peer. The final consistency
+check now examines the actual ordered missing commit set, including absent,
+unselected, unadvised, skipped, review, and misordered prerequisites. Missing
+DTS providers and unsupported automatic resolutions are surfaced explicitly.
+
+These changes can increase the size of the proposed plan. A zero consistency
+issue count means every active TAKE prerequisite has a viable earlier TAKE or
+an already-present peer, not that the final kernel has been compiled or tested.
+The JSON advisor section includes `execution_ready` and `consistency_issues`;
+when issues remain, the plan is not fully executable without manual review.
+Existing `--output` and `--json-output` behavior is unchanged.
+
+Version 0.4.15 fixes same-commit DT source includes: when a DTS and its
+included DTSI are both added by the same upstream patch, the DTSI is not a
+missing earlier prerequisite. Merely modifying a previously introduced DTSI
+is not sufficient to suppress its genuine provider. The planner also reconciles
+active TAKE/DT-include ordering edges. An independent binding provider can move
+before its consumer along with any selected Git ancestors, while a dependency
+that would contradict actual Git ancestry remains an explicit consistency
+issue. Neither a successful reorder nor `execution_ready` proves cherry-pick
+success or build correctness.
+
+Version 0.4.15 automatically packages standard dual-output runs when
+`--output PREFIX.c` and `--json-output PREFIX.json` have the same basename.
+The planner itself writes `PREFIX.log` while printing progress to the terminal;
+after the log is closed it copies all three completed files and available
+advisor cache/error-log artifacts into `PREFIX/` and creates `PREFIX.zip`.
+Neither a second command nor external `tee` is necessary. Existing package
+paths and `.log` files are never overwritten. A mismatched output basename
+is rejected before analysis, preventing a costly misnamed run. Use
+`--no-auto-package` for nonstandard independent output paths or when managing
+logs and archives externally. Standalone `--package-results PREFIX` remains
+available for packaging older completed runs.
 
 ## Downstream identity matching
 
@@ -527,8 +569,11 @@ symbol-only binding relationships continue to use
 
 Every evidence record receives a deterministic `evidence_id`. The records are
 supplied as both `same_series_consumed_objects` and
-`eligible_prerequisite_evidence`. They do not alter the deterministic plan or
-automatically select the peer.
+`eligible_prerequisite_evidence`. The evidence by itself does not select a peer.
+Beginning in 0.4.14, a TAKE consumer's actual, validated prerequisite
+recommendation can promote that peer into the candidate graph for independent
+advisor evaluation. A candidate can still receive SKIP or REVIEW; any unresolved
+TAKE relationship remains visible in the consistency report.
 
 Same-series peers remain candidates, not automatic dependencies. The model now
 returns only `prerequisite_evidence_ids`; it no longer repeats peer SHAs or writes
@@ -773,6 +818,116 @@ common-code relationships from architecture-local lexical matches.
 
 Context-only candidates remain in JSON with `selected: false`. The legacy
 `reasons` field is retained as a compatibility alias for `evidence`.
+
+## Automatic results packaging (0.4.15)
+
+With matching `--output PREFIX.c` and `--json-output PREFIX.json`, packaging
+happens automatically in the **same planner invocation**. Do not pipe this
+command into `tee PREFIX.log`; the planner writes that log itself while also
+streaming messages to the terminal. For example:
+
+```bash
+~/projects/kernel-backport-planner/kernel-backport-planner \
+    --update --upstream linux-stable --downstream cs10 \
+    --base v6.19 --target v7.0 \
+    --file-list ~/projects/rhel-223619/file_list.txt \
+    --advisor-model gemma4-kernel:128k \
+    --advisor-base-url http://gondor:11434 \
+    --output ~/projects/rhel-223619/backport_plan_19.c \
+    --json-output ~/projects/rhel-223619/backport_plan_19.json
+```
+
+After the planner finishes writing both reports, it closes the `.log` and
+creates the results directory and ZIP:
+
+```text
+~/projects/rhel-223619/backport_plan_19.c
+~/projects/rhel-223619/backport_plan_19.json
+~/projects/rhel-223619/backport_plan_19.log
+~/projects/rhel-223619/backport_plan_19/
+~/projects/rhel-223619/backport_plan_19.zip
+```
+
+The folder contains copies of the `.c`, `.json`, `.log`, performance
+journal/summary, and optional advisor cache/diagnostics referenced by the report JSON, keeping the original files
+in place. The ZIP contains the folder, not just loose files. Since the log is
+owned and closed by the planner before archiving, the included log is complete
+for the planner process. Elapsed time from an outer shell `time` command is
+printed only *after* the planner exits and is not part of the ZIP log; the
+planner also records its own elapsed time inside its log.
+
+The packaging destinations and primary output files must not already exist; checks run before
+expensive Git or advisor work starts. A mismatch such as `backport_plan_17.c`
+with `backport_plan_18.json` is rejected when auto-packaging is enabled.
+A diagnostic plan with replay conflicts (exit status 2) or failed check
+command (exit status 3) still gets packaged once both reports are written;
+the original nonzero exit status is preserved.
+
+To disable automatic packaging for independently named reports or custom
+logging, supply `--no-auto-package`. To package an older finished run with
+an existing `.c`, `.json`, and `.log`, the standalone command remains:
+
+```bash
+~/projects/kernel-backport-planner/kernel-backport-planner \
+    --package-results ~/projects/rhel-223619/backport_plan_18
+```
+
+This legacy command performs no analysis. It will refuse to overwrite a
+previous package. Missing optional advisor diagnostic files are skipped,
+while all three primary files are required.
+
+## Performance instrumentation (0.4.16)
+
+Version 0.4.16 adds low-overhead, always-on timing and request-volume metrics.
+It does **not** change advisor prompts, answers, dependency decisions, cache
+keys, or the underlying backport algorithm. No model switch is made.
+
+For the normal dual-output command with `--output backport_plan_20.c`, the
+planner automatically creates:
+
+```text
+backport_plan_20.perf.jsonl  # append-only events, written during the run
+backport_plan_20.perf.json   # full performance summary at completion
+```
+
+Both are copied into `backport_plan_20/` and its ZIP alongside the original
+reports and log. The `.perf.jsonl` file is **live**: it is useful even if a
+power outage or process interruption prevents the final reports from being
+written. Events include phase start/end, advisor attempt duration and status,
+cache hits, and Ollama-reported request measurements, when supplied. Every
+tenth event and phase completion is fsynced; a sudden power loss may still
+lose the last few events. The tool refuses to overwrite an existing metrics
+file during an automatically packaged run.
+
+The `.perf.json` summary reports wall time by phase (downstream indexing,
+selection, dependency closure, merge checks, replay, series indexing, advisor,
+checks, and output), plus Git subprocess counts/elapsed time by operation.
+Ollama metrics include request time, `prompt_eval_count`, `eval_count`, and
+`total_duration`/`load_duration`/`prompt_eval_duration`/`eval_duration`, in
+nanoseconds. Divide durations by 1e9 for seconds. Git timings measure calls
+through the Git helper, so total Git time is a *lower bound* on time spent
+in subprocesses; direct replay cherry-picks are included in replay phase time.
+
+Request `packet_input_bytes` are **UTF-8 bytes, not model tokens**. Use
+Ollama's exact token counts for per-model throughput or to estimate API costs.
+No prompt, patch, message, secret, or advisor response is written to the
+performance journal. Failure diagnostics remain in the separate existing
+advisor error log, as before. The summary is intentionally diagnostic and
+not a full system profiler; timestamps are elapsed monotonic seconds.
+
+For an interrupted run, examine live measurements without restarting:
+
+```bash
+tail -n 20 backport_plan_20.perf.jsonl
+grep '"event": "advisor_request"' backport_plan_20.perf.jsonl | tail -n 5
+```
+
+A partially completed run may also have useful cached advisor responses in
+`backport_plan_19.c.advisor-cache.json`. If its prompt version, model, and
+evidence packets are unchanged, copy that cache into the new run's default
+cache filename (for example, `backport_plan_20.c.advisor-cache.json`) before
+starting; the planner validates each individual fingerprint before reuse.
+Do not copy or rename incomplete `.perf.jsonl` files into a new run.
 
 ## Performance
 

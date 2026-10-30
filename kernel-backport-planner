@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -36,11 +37,12 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.13"
-ADVISOR_PROMPT_VERSION = "12"
+VERSION = "0.4.16"
+ADVISOR_PROMPT_VERSION = "13"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -90,14 +92,133 @@ IGNORE_SYMBOLS = {
 }
 
 
+class PerformanceRecorder:
+    """Lightweight phase, Git and advisor timings, durable during long runs.
+
+    JSONL events never contain code, prompts, patches, or model responses.
+    The final summary also omits that material.
+    """
+
+    def __init__(self, path: Path | None = None):
+        self.started = time.perf_counter()
+        self.events_path = path
+        self.events = path.open("x", encoding="utf-8", buffering=1) if path else None
+        self.phases: dict[str, dict[str, float | int]] = {}
+        self.git_commands: dict[str, dict[str, float | int]] = {}
+        self.advisor_requests = 0
+        self.advisor_seconds = 0.0
+        self.advisor_failures = 0
+        self.advisor_cache_hits = 0
+        self.advisor_input_bytes = 0
+        self.advisor_metrics: dict[str, int] = collections.defaultdict(int)
+        self._pending_events = 0
+        self.event("run_start", version=VERSION)
+
+    def event(self, kind: str, **fields) -> None:
+        if not self.events:
+            return
+        self.events.write(json.dumps({"event": kind, "elapsed_s": round(
+            time.perf_counter() - self.started, 3), **fields},
+            sort_keys=True) + "\n")
+        self._pending_events += 1
+        # Flush/fsync occasionally: retain data after a hard interruption
+        # without a synchronous disk write on every model request.
+        if self._pending_events >= 10 or kind == "phase_end":
+            self.events.flush()
+            os.fsync(self.events.fileno())
+            self._pending_events = 0
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        started = time.perf_counter()
+        self.event("phase_start", name=name)
+        try:
+            yield
+        finally:
+            seconds = time.perf_counter() - started
+            entry = self.phases.setdefault(name, {"count": 0, "seconds": 0.0})
+            entry["count"] += 1
+            entry["seconds"] += seconds
+            self.event("phase_end", name=name, seconds=round(seconds, 3))
+
+    def git(self, operation: str, seconds: float) -> None:
+        entry = self.git_commands.setdefault(operation,
+                                             {"count": 0, "seconds": 0.0, "max_seconds": 0.0})
+        entry["count"] += 1
+        entry["seconds"] += seconds
+        entry["max_seconds"] = max(entry["max_seconds"], seconds)
+
+    def advisor(self, sha: str, attempt: int, seconds: float, *,
+                input_bytes: int = 0, status: str = "ok",
+                ollama: dict | None = None) -> None:
+        self.advisor_requests += 1
+        self.advisor_seconds += seconds
+        self.advisor_input_bytes += input_bytes
+        if status != "ok":
+            self.advisor_failures += 1
+        measurements = {}
+        for key in ("total_duration", "load_duration", "prompt_eval_duration",
+                    "eval_duration", "prompt_eval_count", "eval_count"):
+            value = (ollama or {}).get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                measurements[key] = value
+                self.advisor_metrics[key] += value
+        self.event("advisor_request", sha=sha[:12], attempt=attempt,
+                   seconds=round(seconds, 3), status=status,
+                   input_bytes=input_bytes, ollama=measurements)
+
+    def cache_hit(self, sha: str) -> None:
+        self.advisor_cache_hits += 1
+        self.event("advisor_cache_hit", sha=sha[:12])
+
+    def summary(self) -> dict:
+        return {
+            "version": VERSION,
+            "elapsed_seconds": round(time.perf_counter() - self.started, 3),
+            "phases": {k: {"count": v["count"], "seconds": round(v["seconds"], 3)}
+                       for k, v in sorted(self.phases.items())},
+            "git_commands": {k: {"count": v["count"],
+                                 "seconds": round(v["seconds"], 3),
+                                 "max_seconds": round(v["max_seconds"], 3)}
+                             for k, v in sorted(self.git_commands.items())},
+            "advisor": {"requests": self.advisor_requests,
+                        "request_seconds": round(self.advisor_seconds, 3),
+                        "failed_attempts": self.advisor_failures,
+                        "cache_hits": self.advisor_cache_hits,
+                        "packet_input_bytes": self.advisor_input_bytes,
+                        "ollama": dict(self.advisor_metrics)},
+            "events_path": str(self.events_path) if self.events_path else None,
+        }
+
+    def finish(self, summary_path: Path | None = None) -> dict:
+        snapshot = self.summary()
+        self.event("run_end", seconds=snapshot["elapsed_seconds"])
+        if summary_path:
+            with summary_path.open("x", encoding="utf-8") as output:
+                json.dump(snapshot, output, indent=2, sort_keys=True)
+                output.write("\n")
+        if self.events:
+            self.events.flush()
+            os.fsync(self.events.fileno())
+            self.events.close()
+        return snapshot
+
+    def abort(self) -> None:
+        if self.events and not self.events.closed:
+            self.events.flush()
+            self.events.close()
+
+
 class GitError(RuntimeError):
     pass
 
 
 class Git:
-    def __init__(self, cwd: Path, debug: bool = False):
+    def __init__(self, cwd: Path, debug: bool = False,
+                 performance: PerformanceRecorder | None = None):
         self.cwd = cwd
         self.debug = debug
+        self.performance = performance
 
     def run(
         self,
@@ -110,14 +231,16 @@ class Git:
         cmd = ["git", *args]
         if self.debug:
             print("+", shlex.join(cmd), file=sys.stderr)
-        cp = subprocess.run(
-            cmd,
-            cwd=str(cwd or self.cwd),
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        started = time.perf_counter()
+        try:
+            cp = subprocess.run(
+                cmd, cwd=str(cwd or self.cwd), input=input_text,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        finally:
+            if self.performance is not None:
+                self.performance.git(args[0] if args else "unknown",
+                                     time.perf_counter() - started)
         if check and cp.returncode:
             raise GitError(
                 f"command failed ({cp.returncode}): {shlex.join(cmd)}\n{cp.stderr.strip()}"
@@ -125,10 +248,16 @@ class Git:
         return cp.stdout
 
     def ok(self, args: Sequence[str], *, cwd: Path | None = None) -> bool:
-        cp = subprocess.run(
-            ["git", *args], cwd=str(cwd or self.cwd),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        started = time.perf_counter()
+        try:
+            cp = subprocess.run(
+                ["git", *args], cwd=str(cwd or self.cwd),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        finally:
+            if self.performance is not None:
+                self.performance.git(args[0] if args else "unknown",
+                                     time.perf_counter() - started)
         return cp.returncode == 0
 
     def rev_parse(self, obj: str) -> str:
@@ -371,8 +500,10 @@ class OllamaAdvisor:
         self.temperature = temperature
         self.keep_alive = keep_alive
         self.debug = debug
+        self.last_telemetry: dict | None = None
 
     def advise(self, system_prompt: str, packet: dict, response_schema: dict | None = None) -> dict:
+        self.last_telemetry = None
         payload = {
             "model": self.model,
             "stream": False,
@@ -409,6 +540,15 @@ class OllamaAdvisor:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 response_text = response.read().decode("utf-8")
                 outer = json.loads(response_text)
+                if isinstance(outer, dict):
+                    self.last_telemetry = {
+                        key: outer[key]
+                        for key in ("total_duration", "load_duration",
+                                    "prompt_eval_duration", "eval_duration",
+                                    "prompt_eval_count", "eval_count")
+                        if isinstance(outer.get(key), int)
+                        and not isinstance(outer[key], bool)
+                    }
         except urllib.error.HTTPError as exc:
             raise AdvisorError(
                 f"Ollama HTTP error {exc.code}: {exc.reason}",
@@ -527,6 +667,10 @@ class Planner:
                         self.advisor_cache = raw_cache
                 except (OSError, json.JSONDecodeError):
                     self.info(f"Ignoring unreadable advisor cache: {self.advisor_cache_path}")
+
+    def _phase(self, name: str):
+        performance = getattr(self, "performance", None)
+        return performance.phase(name) if performance else contextlib.nullcontext()
 
     def _load_paths(self, args: argparse.Namespace) -> list[str]:
         paths: list[str] = []
@@ -2187,10 +2331,20 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             self.nodes[sha].advisor_attempts = attempt + 1
             self.advisor_calls += 1
             raw = None
+            request_ok = False
+            request_finished = None
+            started = time.perf_counter()
             try:
+                # A mock or future client may not expose Ollama measurements.
+                if hasattr(client, "last_telemetry"):
+                    client.last_telemetry = None
                 raw = client.advise(prompt, packet, schema)
-                return self.validate_advisor_result(sha, raw)
+                validated = self.validate_advisor_result(sha, raw)
+                request_ok = True
+                request_finished = time.perf_counter()
+                return validated
             except AdvisorError as exc:
+                request_finished = time.perf_counter()
                 last_error = exc
                 self._write_advisor_error_diagnostic(sha, attempt + 1, exc, raw)
                 if not exc.retryable or attempt >= retries:
@@ -2202,6 +2356,15 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 delay = max(0.0, self.args.advisor_retry_delay) * (2 ** attempt)
                 if delay:
                     time.sleep(min(delay, 10.0))
+            finally:
+                performance = getattr(self, "performance", None)
+                if performance:
+                    performance.advisor(
+                        sha, attempt + 1, (request_finished or time.perf_counter()) - started,
+                        input_bytes=len(json.dumps(packet, sort_keys=True).encode("utf-8")),
+                        status="ok" if request_ok else "failed",
+                        ollama=getattr(client, "last_telemetry", None),
+                    )
         assert last_error is not None
         raise last_error
 
@@ -2379,12 +2542,15 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             if cached is not None:
                 result = self.validate_advisor_result(sha, cached)
                 self.advisor_cache_hits += 1
+                if getattr(self, "performance", None):
+                    self.performance.cache_hit(sha)
                 node.advisor_attempts = 0
             else:
                 result = self._advisor_call_with_retries(client, prompt, sha, packet)
                 if not self.args.no_advisor_cache:
                     self.advisor_cache[cache_key] = result
-                    self.save_advisor_cache()
+                    with self._phase("advisor.cache_write"):
+                        self.save_advisor_cache()
             self._advisor_note_success(node, result)
         except AdvisorError as exc:
             self._advisor_note_failure(node, exc)
@@ -2487,41 +2653,97 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 consumer.advisor_rejected_prerequisites.append(rejected)
             consumer.advisor_prerequisites = active
 
+    def _advisor_promote_prerequisites(self) -> int:
+        """Select evidence-backed earlier peers, without deciding TAKE for them.
+
+        Advisor prerequisites are semantic claims, not automatically approved
+        backports. Promotion makes the candidate visible to advisor evaluation;
+        its eventual disposition must still pass consistency checking.
+        """
+        promoted = 0
+        for consumer in list(self.nodes.values()):
+            if (consumer.advisor_decision != "TAKE" or
+                    not self.is_actionable_node(consumer) or
+                    not consumer.advisor_prerequisites):
+                continue
+            evidence = {
+                item["evidence_id"]: item
+                for item in self.advisor_prerequisite_evidence(consumer.sha)
+            }
+            for prereq in consumer.advisor_prerequisites:
+                peer_sha = prereq["sha"]
+                proof = evidence.get(prereq.get("evidence_id", ""))
+                if proof is None or proof.get("peer_sha") != peer_sha:
+                    continue
+                if peer_sha not in self.advisor_allowed_prerequisite_peers(consumer.sha):
+                    continue
+                existing = self.nodes.get(peer_sha)
+                if existing is not None and (self.is_actionable_node(existing)
+                                             or existing.match.status == "present"):
+                    continue
+                peer = self.ensure_node(
+                    peer_sha, reason="advisor-prerequisite:" + proof["kind"],
+                    required_by=consumer.sha,
+                )
+                if not self.is_actionable_node(peer):
+                    continue
+                promoted += 1
+                self.info(f"  advisor promoted prerequisite candidate {peer_sha[:12]} "
+                          f"for {consumer.sha[:12]} (pending independent evaluation)")
+            # The peer was not previously actionable, so its inbound evidence
+            # was deliberately omitted during the original recording pass.
+            self._record_advisor_prerequisite_recommendations(consumer.sha)
+        return promoted
+
     def _advisor_check_consistency(self) -> None:
+        """Validate every TAKE edge against the actual executable JSON order.
+
+        Missing/unselected/unadvised peers must never be silently considered
+        satisfied. A planner report with outstanding issues is still useful,
+        but it must not claim the dependency closure is executable.
+        """
         self.advisor_consistency_issues = []
         for node in self.nodes.values():
             node.advisor_consistency_warnings = []
+        ordered = self.ordered_missing()
+        position = {sha: i for i, sha in enumerate(ordered)}
 
-        for consumer_sha, consumer in self.nodes.items():
-            if consumer.advisor_decision != "TAKE":
+        for consumer_sha, consumer in list(self.nodes.items()):
+            if (consumer.advisor_decision != "TAKE" or
+                    not self.is_actionable_node(consumer) or
+                    consumer.match.status != "missing"):
                 continue
             for prereq in consumer.advisor_prerequisites:
                 peer_sha = prereq["sha"]
                 peer = self.nodes.get(peer_sha)
-                if (
-                    peer is None
-                    or not self.is_actionable_node(peer)
-                    or peer.advisor_decision is None
-                    or peer.advisor_decision == "TAKE"
-                ):
-                    continue
                 evidence_id = prereq.get("evidence_id", "")
-                assessment = next(
-                    (
-                        item for item in peer.advisor_inbound_assessments
-                        if item.get("evidence_id") == evidence_id
-                    ),
-                    None,
-                )
+                assessment = next((item for item in peer.advisor_inbound_assessments
+                                   if item.get("evidence_id") == evidence_id), None) if peer else None
                 if assessment and assessment.get("disposition") == "NOT_REQUIRED":
                     continue
+                if peer is None:
+                    kind = "TAKE->ABSENT"
+                elif peer.match.status == "present":
+                    continue
+                elif not self.is_actionable_node(peer):
+                    kind = "TAKE->UNSELECTED"
+                elif peer.advisor_decision is None:
+                    kind = "TAKE->UNEVALUATED"
+                elif peer.advisor_decision != "TAKE":
+                    kind = f"TAKE->{peer.advisor_decision}"
+                elif peer_sha not in position:
+                    kind = "TAKE->UNORDERED"
+                elif consumer_sha not in position or position[peer_sha] >= position[consumer_sha]:
+                    kind = "TAKE->OUT_OF_ORDER"
+                else:
+                    continue
                 issue = {
-                    "kind": f"TAKE->{peer.advisor_decision}",
+                    "kind": kind,
                     "consumer_sha": consumer_sha,
                     "consumer_subject": consumer.subject,
                     "prerequisite_sha": peer_sha,
-                    "prerequisite_subject": peer.subject,
-                    "prerequisite_decision": peer.advisor_decision,
+                    "prerequisite_subject": peer.subject if peer else "(not in plan graph)",
+                    "prerequisite_decision": peer.advisor_decision if peer else None,
                     "evidence_id": evidence_id,
                     "evidence_kind": prereq.get("evidence_kind", ""),
                     "evidence_object": prereq.get("evidence_object", ""),
@@ -2530,14 +2752,57 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "assessment_reason": assessment.get("reason", "") if assessment else "",
                 }
                 self.advisor_consistency_issues.append(issue)
-                consumer.advisor_consistency_warnings.append({
-                    "role": "consumer",
-                    **issue,
-                })
-                peer.advisor_consistency_warnings.append({
-                    "role": "prerequisite",
-                    **issue,
-                })
+                consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
+                if peer:
+                    peer.advisor_consistency_warnings.append({"role": "prerequisite", **issue})
+
+        # DT source includes are stricter than binding-schema suggestions:
+        # these are verified file dependencies needed for DT compilation.
+        for provider in list(self.nodes.values()):
+            dt_paths = sorted(reason[len("dt-include:"):]
+                              for reason in provider.reasons
+                              if reason.startswith("dt-include:"))
+            if not dt_paths:
+                continue
+            for consumer_sha in sorted(provider.required_by):
+                consumer = self.nodes.get(consumer_sha)
+                if not consumer or consumer.advisor_decision != "TAKE":
+                    continue
+                if provider.match.status == "present":
+                    continue
+                if not self.is_actionable_node(provider):
+                    kind = "DT_INCLUDE->UNSELECTED"
+                elif provider.advisor_decision is None:
+                    kind = "DT_INCLUDE->UNEVALUATED"
+                elif provider.advisor_decision != "TAKE":
+                    kind = f"DT_INCLUDE->{provider.advisor_decision}"
+                elif provider.sha not in position or consumer_sha not in position:
+                    kind = "DT_INCLUDE->UNORDERED"
+                elif position[provider.sha] >= position[consumer_sha]:
+                    kind = "DT_INCLUDE->OUT_OF_ORDER"
+                else:
+                    continue
+                issue = {
+                    "kind": kind, "consumer_sha": consumer_sha,
+                    "consumer_subject": consumer.subject,
+                    "prerequisite_sha": provider.sha,
+                    "prerequisite_subject": provider.subject,
+                    "prerequisite_decision": provider.advisor_decision,
+                    "reason": "DT source include(s): " + ", ".join(dt_paths),
+                }
+                self.advisor_consistency_issues.append(issue)
+                consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
+                provider.advisor_consistency_warnings.append({"role": "prerequisite", **issue})
+
+        # A DT include whose provider could not be identified is also not a
+        # proven-safe execution dependency, even without an LLM recommendation.
+        for missing in getattr(self, "dt_include_unresolved", []):
+            issue = {"kind": "TAKE->MISSING_DT_INCLUDE", **missing}
+            consumer = self.nodes.get(missing["consumer_sha"])
+            if not consumer or consumer.advisor_decision != "TAKE":
+                continue
+            self.advisor_consistency_issues.append(issue)
+            consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
 
     def run_advisor(self) -> None:
         if not self.advisor_model:
@@ -2591,7 +2856,49 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             )
             self._advisor_evaluate_one(client, prompt, sha)
 
+        # A reconciliation decision can create fresh TAKE prerequisite edges.
+        # Process these before and during closure, not only at the very end.
         self._advisor_reconciliation_pass(client, prompt, ordered)
+        # Evaluate newly selected prerequisites rather than merely listing
+        # them in the consumer's JSON record. Bound graph growth and leave
+        # unresolved edges visible if closure cannot finish.
+        promoted_any = False
+        advised_after_initial = 0
+        for round_no in range(1, 9):
+            promoted = self._advisor_promote_prerequisites()
+            if not promoted:
+                break
+            promoted_any = True
+            self.dependency_closure()
+            self.build_series_index()
+            pending = [sha for sha in self.ordered_missing()
+                       if self.nodes[sha].advisor_decision is None]
+            if self.args.advisor_limit is not None:
+                # --advisor-limit is a total evaluation bound, including
+                # peers discovered after the first advisor pass.
+                pending = pending[:max(0, self.args.advisor_limit - len(ordered) - advised_after_initial)]
+            if not pending:
+                break
+            self.info(f"  advisor prerequisite round {round_no}: "
+                      f"{len(pending)} new candidate(s)")
+            for sha in self.advisor_order(pending):
+                self._advisor_evaluate_one(client, prompt, sha)
+                advised_after_initial += 1
+            self._advisor_reconciliation_pass(client, prompt,
+                list(dict.fromkeys([*ordered, *self.ordered_missing()])))
+        else:
+            self.info("  advisor prerequisite closure limit reached; unresolved "
+                      "recommendations will be reported")
+
+        # Newly selected peers change replay coverage. Do not present stale
+        # pre-advisor replay results as if they covered the expanded plan.
+        if promoted_any and self.args.simulate:
+            self.reset_replay_annotations()
+            self.replay_final_verification = True
+            _, conflicts = self.replay_once()
+            self.info(f"  final expanded-plan replay: {len(conflicts)} conflict(s)")
+        self._advisor_reconciliation_pass(client, prompt, list(dict.fromkeys(
+            [*ordered, *self.ordered_missing()])))
         self._advisor_resolve_rejected_prerequisites()
         self._advisor_check_consistency()
 
@@ -3124,6 +3431,79 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         added += 1
         return added
 
+    def add_dt_include_dependencies(self, snapshot: Sequence[CommitNode]) -> int:
+        """Resolve missing DT source includes to their exact introducing commits.
+
+        Inspect the full selected upstream DT file, not an abbreviated advisor
+        excerpt. Only promote an exact path provider already in the upstream
+        ancestry and absent from the frozen downstream baseline. Do not infer
+        providers from a similarly named board or binding.
+        """
+        if not hasattr(self, "dt_include_unresolved"):
+            self.dt_include_unresolved = []
+        added = 0
+        seen = {(item["consumer_sha"], item["include_path"])
+                for item in self.dt_include_unresolved}
+        for node in snapshot:
+            if node.match.status != "missing":
+                continue
+            for use_path in node.files:
+                if not self._is_dt_source_path(use_path):
+                    continue
+                source = self._tree_file_text(node.sha, use_path)
+                if source is None:
+                    continue
+                for include in sorted(self._include_paths(source)):
+                    resolved = next((candidate
+                        for candidate in self._include_candidate_paths(use_path, include)
+                        if self._is_dt_source_path(candidate)
+                        and self._tree_file_text(node.sha, candidate) is not None), None)
+                    if not resolved or resolved == use_path:
+                        continue
+                    if self._tree_file_text(self.replay_start, resolved) is not None:
+                        continue
+                    # The consumer may add the included file in the same patch.
+                    # That file is available during its cherry-pick, not a
+                    # prerequisite from an earlier commit. A file that was
+                    # merely modified here still needs its original provider.
+                    if (resolved in node.files and
+                            self._tree_file_text(f"{node.sha}^", resolved) is None):
+                        continue
+                    # Find the commit that originally added the exact file.
+                    history = self.git.run([
+                        "log", "-1", "--format=%H", "--diff-filter=A",
+                        f"{node.sha}^", "--", resolved,
+                    ]).strip().splitlines()
+                    provider_sha = history[0] if history else None
+                    if provider_sha and len(self.git.parents(provider_sha)) == 1:
+                        existing = self.nodes.get(provider_sha)
+                        before = bool(existing and self.is_actionable_node(existing))
+                        provider = self.ensure_node(
+                            provider_sha, reason=f"dt-include:{resolved}",
+                            required_by=node.sha,
+                        )
+                        if not before and self.is_actionable_node(provider):
+                            added += 1
+                        if provider.match.status == "present" and (node.sha, resolved) not in seen:
+                            # Content matching can mark a provider commit present
+                            # even though this precise DTS file is still absent.
+                            seen.add((node.sha, resolved))
+                            self.dt_include_unresolved.append({
+                                "consumer_sha": node.sha,
+                                "consumer_subject": node.subject,
+                                "include_path": resolved,
+                                "reason": f"DT include {resolved} absent despite provider identity match",
+                            })
+                    elif (node.sha, resolved) not in seen:
+                        seen.add((node.sha, resolved))
+                        self.dt_include_unresolved.append({
+                            "consumer_sha": node.sha,
+                            "consumer_subject": node.subject,
+                            "include_path": resolved,
+                            "reason": f"no verifiable introducing commit for DT include {resolved}",
+                        })
+        return added
+
     def dependency_closure(self) -> None:
         self.info("Expanding dependency closure...")
         for round_no in range(1, self.args.max_dependency_rounds + 1):
@@ -3140,6 +3520,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
 
             before = sum(1 for n in self.nodes.values() if self.is_actionable_node(n))
             added = self.add_explicit_fixes_closure(frontier)
+            added += self.add_dt_include_dependencies(frontier)
             added += self.add_static_dependencies(frontier)
             self._dependency_expanded.update(node.sha for node in frontier)
 
@@ -3179,6 +3560,94 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             "rev-list", "--reverse", "--topo-order", f"{self.base}..{self.target}"
         ]).splitlines()
         ordered.extend(sha for sha in range_order if sha in selected)
+        return self._dependency_order(ordered)
+
+    def _dependency_order(self, upstream_order: list[str]) -> list[str]:
+        """Honor active TAKE dependencies without violating Git ancestry.
+
+        The base Git topological order is safe for source history, but an
+        independently merged binding can have a later upstream commit date
+        than a DTS consumer. Move the binding and any selected ancestors in
+        front of the consumer. Never move a Git descendant ahead of its
+        ancestor. Cyclic or otherwise unsatisfiable edges stay visible to the
+        consistency checker rather than being silently discarded.
+        """
+        ordered = list(upstream_order)
+        positions = {sha: i for i, sha in enumerate(ordered)}
+        if not positions:
+            return ordered
+        edges: set[tuple[str, str]] = set()
+        for consumer_sha in ordered:
+            consumer = self.nodes[consumer_sha]
+            if consumer.advisor_decision != "TAKE":
+                continue
+            for item in consumer.advisor_prerequisites:
+                peer_sha = item["sha"]
+                peer = self.nodes.get(peer_sha)
+                if (peer_sha in positions and peer and
+                        peer.advisor_decision == "TAKE"):
+                    edges.add((peer_sha, consumer_sha))
+        for provider in self.nodes.values():
+            if (provider.sha not in positions or
+                    provider.advisor_decision != "TAKE" or
+                    not any(reason.startswith("dt-include:")
+                            for reason in provider.reasons)):
+                continue
+            for consumer_sha in provider.required_by:
+                if (consumer_sha in positions and
+                        self.nodes[consumer_sha].advisor_decision == "TAKE"):
+                    edges.add((provider.sha, consumer_sha))
+        if not edges:
+            return ordered
+        cache_key = (tuple(ordered), tuple(sorted(edges)))
+        cached = getattr(self, "_dependency_order_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return list(cached[1])
+
+        ancestors_cache: dict[str, set[str]] = {}
+        # Keep the result deterministic across runs and hash seeds. Previously
+        # satisfied edges can become inverted if a consumer must move forward
+        # for another dependency; examine until no further legal moves exist.
+        seen_orders: set[tuple[str, ...]] = set()
+        for _round in range(max(2, 2 * len(edges) + 1)):
+            key = tuple(ordered)
+            if key in seen_orders:
+                break
+            seen_orders.add(key)
+            changed = False
+            for provider_sha, consumer_sha in sorted(edges,
+                    key=lambda pair: (positions[pair[1]], positions[pair[0]])):
+                if positions[provider_sha] < positions[consumer_sha]:
+                    continue
+                if provider_sha == consumer_sha:
+                    continue
+                if provider_sha not in ancestors_cache:
+                    # Git rev-list includes the provider itself. Cache the
+                    # selected subset, so movement preserves upstream ancestry
+                    # even when some intervening commits were not selected.
+                    ancestors_cache[provider_sha] = (
+                        set(self.git.run(["rev-list", provider_sha]).splitlines())
+                        & set(positions)
+                    )
+                ancestors = ancestors_cache[provider_sha]
+                if consumer_sha in ancestors:
+                    # A genuine upstream ancestry constraint conflicts with
+                    # the advisor recommendation; keep an unresolved warning.
+                    continue
+                consumer_position = positions[consumer_sha]
+                moving = [sha for sha in ordered[consumer_position + 1:]
+                          if sha in ancestors]
+                if not moving:
+                    continue
+                move_set = set(moving)
+                ordered = [sha for sha in ordered if sha not in move_set]
+                new_consumer_position = ordered.index(consumer_sha)
+                ordered[new_consumer_position:new_consumer_position] = moving
+                positions = {sha: i for i, sha in enumerate(ordered)}
+                changed = True
+            if not changed:
+                break
+        self._dependency_order_cache = (cache_key, tuple(ordered))
         return ordered
 
     def merge_resolution_risks(self) -> None:
@@ -3221,7 +3690,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         root, wt = self._create_worktree()
         conflicts: list[tuple[str, list[str]]] = []
         try:
-            wg = Git(wt, self.args.debug)
+            wg = Git(wt, self.args.debug, getattr(self, "performance", None))
             for sha in order:
                 node = self.nodes[sha]
                 cp = subprocess.run(
@@ -3491,15 +3960,21 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         self.info(f"  found {len(self.series_groups)} patch series touching selected commits")
 
     def collect(self) -> None:
-        self.build_downstream_index()
-        direct = self.direct_candidates()
-        self.info(f"Found {len(direct)} direct path candidates")
-        for sha in direct:
-            self.ensure_node(sha, direct=True, reason="focus-path")
-        self.dependency_closure()
-        self.merge_resolution_risks()
-        self.replay_with_discovery()
-        self.build_series_index()
+        with self._phase("collect.downstream_index"):
+            self.build_downstream_index()
+        with self._phase("collect.direct_candidates"):
+            direct = self.direct_candidates()
+            self.info(f"Found {len(direct)} direct path candidates")
+            for sha in direct:
+                self.ensure_node(sha, direct=True, reason="focus-path")
+        with self._phase("collect.dependency_closure"):
+            self.dependency_closure()
+        with self._phase("collect.merge_resolution"):
+            self.merge_resolution_risks()
+        with self._phase("collect.replay"):
+            self.replay_with_discovery()
+        with self._phase("collect.series_index"):
+            self.build_series_index()
 
     def report_text(self, check_result: tuple[int, str] | None = None) -> str:
         lines: list[str] = []
@@ -3680,15 +4155,17 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         f'{item["disposition"]} - {self._one_line(item["reason"])}'
                     )
                 for item in n.advisor_consistency_warnings:
-                    if item.get("role") == "consumer":
+                    if item.get("kind") == "TAKE->MISSING_DT_INCLUDE":
+                        text = f'missing DT source include {item["include_path"]}: {item["reason"]}'
+                    elif item.get("role") == "consumer":
                         text = (
-                            f'prerequisite {item["prerequisite_sha"][:12]} is '
-                            f'{item["prerequisite_decision"]}'
+                            f'prerequisite {item["prerequisite_sha"][:12]} '
+                            f'{item["kind"]} ({item.get("reason", "")})'
                         )
                     else:
                         text = (
                             f'recommended by TAKE consumer {item["consumer_sha"][:12]} '
-                            f'but this decision is {item["prerequisite_decision"]}'
+                            f'but relationship is {item["kind"]}'
                         )
                     lines.append(f"      advisor-consistency-warning: {text}")
                 for risk in n.advisor_risks:
@@ -3803,6 +4280,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             "replay_start_source": self.replay_start_source,
             "replay_rounds_run": self.replay_rounds_run,
             "replay_final_verification": self.replay_final_verification,
+            "performance": self.performance.summary() if getattr(self, "performance", None) else None,
             "paths": self.paths,
             "advisor": None if not getattr(self, "advisor_model", None) else {
                 "model": self.advisor_model,
@@ -3816,6 +4294,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "cache_hits": getattr(self, "advisor_cache_hits", 0),
                 "product": self.advisor_product_context(),
                 "consistency_issues": list(getattr(self, "advisor_consistency_issues", [])),
+                "execution_ready": not bool(getattr(self, "advisor_consistency_issues", [])),
                 "cache_path": str(self.advisor_cache_path) if getattr(self, "advisor_cache_path", None) else None,
                 "error_log_path": str(self.advisor_error_log_path) if getattr(self, "advisor_error_log_path", None) else None,
                 "error_log_entries": getattr(self, "advisor_error_log_entries", 0),
@@ -3879,14 +4358,188 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
+
+def package_results(prefix_arg: str) -> tuple[Path, Path]:
+    """Package completed dual reports and the planner's closed internal log.
+
+    Refuse to overwrite existing output directories or archives. Legacy
+    post-run packaging is also supported for already completed tee logs.
+    """
+    raw = Path(prefix_arg).expanduser().absolute()
+    prefix = raw.with_suffix("") if raw.suffix in {".c", ".json", ".log"} else raw
+    destination = prefix
+    archive = prefix.with_suffix(".zip")
+    for path in (destination, archive):
+        if os.path.lexists(path):
+            raise ValueError(f"package destination already exists: {path}")
+    sources = [prefix.with_suffix(ext) for ext in (".c", ".json", ".log")]
+    sources += [path for ext in (".perf.json", ".perf.jsonl")
+                if (path := prefix.with_suffix(ext)).is_file()]
+    for source in sources:
+        if not source.is_file():
+            raise ValueError(f"required completed output is missing: {source}")
+    try:
+        payload = json.loads(prefix.with_suffix(".json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read plan JSON for packaging: {exc}") from exc
+    advisor = payload.get("advisor")
+    if isinstance(advisor, dict):
+        for field in ("cache_path", "error_log_path"):
+            value = advisor.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            candidate = Path(value).expanduser()
+            if candidate.is_file() and candidate not in sources:
+                sources.append(candidate)
+    # Avoid silently flattening distinct paths with identical file names.
+    names = [source.name for source in sources]
+    if len(names) != len(set(names)):
+        raise ValueError("packaging source filenames collide; inspect advisor paths")
+    if not destination.parent.is_dir():
+        raise ValueError(f"package parent directory does not exist: {destination.parent}")
+    with tempfile.TemporaryDirectory(prefix=".planner-package-",
+                                     dir=destination.parent) as temp:
+        staging = Path(temp) / destination.name
+        staging.mkdir()
+        for source in sources:
+            shutil.copy2(source, staging / source.name)
+        temp_zip = Path(temp) / archive.name
+        with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as output:
+            for child in sorted(staging.iterdir()):
+                output.write(child, arcname=f"{destination.name}/{child.name}")
+        # Atomic no-overwrite publication; packaging should never damage
+        # existing run artifacts, even if another process races this command.
+        if os.path.lexists(destination) or os.path.lexists(archive):
+            raise ValueError("package destination appeared during packaging")
+        os.rename(staging, destination)
+        try:
+            os.link(temp_zip, archive)
+        except OSError:
+            shutil.rmtree(destination)
+            raise
+    return destination, archive
+
+
+class TeeOutput:
+    """Write Python progress to the terminal and the planner-owned log."""
+
+    def __init__(self, terminal, log):
+        self.terminal = terminal
+        self.log = log
+
+    def write(self, data: str) -> int:
+        self.terminal.write(data)
+        self.log.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        self.log.flush()
+
+    def isatty(self) -> bool:
+        return self.terminal.isatty()
+
+
+def auto_package_prefix(args: argparse.Namespace) -> Path | None:
+    """Choose the package name for standard dual-output text/JSON runs.
+
+    All other previously supported output formats remain unchanged. Using
+    different text/JSON basenames is almost always a typo, and would make
+    the packaged reports ambiguous, so reject that combination early.
+    """
+    if (not args.auto_package or not args.output or not args.json_output
+            or args.format != "text"):
+        return None
+    text_path = Path(args.output).expanduser().absolute()
+    json_path = Path(args.json_output).expanduser().absolute()
+    if text_path.suffix != ".c" or json_path.suffix != ".json":
+        return None
+    if text_path.with_suffix("") != json_path.with_suffix(""):
+        raise ValueError(
+            "automatic packaging requires matching text/JSON basenames; "
+            "use --no-auto-package for independent output paths"
+        )
+    return text_path.with_suffix("")
+
+
+def ensure_package_destinations_available(prefix: Path) -> None:
+    """Fail before a costly planner run if its package would be overwritten."""
+    for path in (prefix, prefix.with_suffix(".zip"), prefix.with_suffix(".log"),
+                 prefix.with_suffix(".c"), prefix.with_suffix(".json"),
+                 prefix.with_suffix(".perf.json"), prefix.with_suffix(".perf.jsonl")):
+        if os.path.lexists(path):
+            raise ValueError(f"automatic package output already exists: {path}")
+    if not prefix.parent.is_dir():
+        raise ValueError(f"output directory does not exist: {prefix.parent}")
+
+
+def run_planner(args: argparse.Namespace) -> int:
+    # The append-only event file is useful even if power fails before reports.
+    source = Path(args.output).expanduser() if args.output else None
+    event_path = (source.with_suffix(".perf.jsonl") if source else None)
+    summary_path = (source.with_suffix(".perf.json") if source else None)
+    performance = PerformanceRecorder(event_path)
+    try:
+        with performance.phase("initialize"):
+            planner = Planner(args)
+        planner.performance = performance
+        if isinstance(getattr(planner, "git", None), Git):
+            planner.git.performance = performance
+        with performance.phase("collect"):
+            planner.collect()
+        with performance.phase("advisor"):
+            planner.run_advisor()
+        with performance.phase("check_command"):
+            check_result = planner.run_check_command()
+        with performance.phase("render_primary"):
+            report = (planner.report_json(check_result) if args.format == "json"
+                      else planner.report_text(check_result))
+        with performance.phase("write_reports"):
+            if args.output:
+                Path(args.output).write_text(report)
+            else:
+                sys.stdout.write(report)
+            if args.json_output:
+                # Both artifacts share one collected plan and advisor run.
+                json_report = report if args.format == "json" else planner.report_json(check_result)
+                Path(args.json_output).write_text(json_report)
+        # A report with unresolved conflicts is useful; preserve existing rc.
+        rc = 0
+        if any(n.replay == "conflict" for n in planner.nodes.values()
+               if n.match.status == "missing"):
+            rc = 2
+        elif check_result is not None and check_result[0] != 0:
+            rc = 3
+        summary = performance.finish(summary_path)
+        print("Performance: total={:.1f}s collect={:.1f}s advisor={:.1f}s "
+              "model_requests={} model_wait={:.1f}s git_calls={}".format(
+                  summary["elapsed_seconds"],
+                  summary["phases"].get("collect", {}).get("seconds", 0),
+                  summary["phases"].get("advisor", {}).get("seconds", 0),
+                  summary["advisor"]["requests"],
+                  summary["advisor"]["request_seconds"],
+                  sum(v["count"] for v in summary["git_commands"].values())),
+              file=sys.stderr)
+        return rc
+    finally:
+        performance.abort()
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Build a dependency-aware kernel subsystem backport plan"
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("--package-results", metavar="PREFIX",
+                   help="package previously completed PREFIX.c/.json/.log "
+                        "(legacy post-run mode)")
+    p.add_argument("--no-auto-package", dest="auto_package", action="store_false",
+                   help="disable automatic log, results directory, and ZIP for "
+                        "matching --output .c and --json-output .json")
+    p.set_defaults(auto_package=True)
     p.add_argument("--repo", default=".", help="git repository containing upstream/downstream refs")
-    p.add_argument("--base", required=True, help="upstream base commit/tag, e.g. v6.19")
-    p.add_argument("--target", required=True, help="upstream target commit/tag, e.g. v7.0")
+    p.add_argument("--base", help="upstream base commit/tag, e.g. v6.19")
+    p.add_argument("--target", help="upstream target commit/tag, e.g. v7.0")
     p.add_argument("--downstream-ref", help="downstream ref, e.g. cs10/main; overrides --downstream/--downstream-branch")
     p.add_argument("--downstream", help="downstream remote name, e.g. cs10")
     p.add_argument("--downstream-branch", default="main", help="downstream branch (default: main)")
@@ -4010,34 +4663,70 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    if args.package_results:
+        if args.base or args.target or args.output or args.json_output:
+            p.error("--package-results is a separate post-run operation")
+        return args
+    if not args.base or not args.target:
+        p.error("--base and --target are required for planning")
     if args.output and args.json_output and Path(args.output).expanduser().resolve() == Path(args.json_output).expanduser().resolve():
         p.error("--json-output and --output must name different files")
+    try:
+        auto_package_prefix(args)
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
-    planner = Planner(args)
-    planner.collect()
-    planner.run_advisor()
-    check_result = planner.run_check_command()
-    report = planner.report_json(check_result) if args.format == "json" else planner.report_text(check_result)
-    if args.output:
-        Path(args.output).write_text(report)
-    else:
-        sys.stdout.write(report)
-    if args.json_output:
-        # Both artifacts share one collected plan, advisor run, and check result.
-        json_report = report if args.format == "json" else planner.report_json(check_result)
-        Path(args.json_output).write_text(json_report)
-    # A report with unresolved conflicts is still useful; use rc=2 to make it
-    # script-detectable without treating analysis itself as a crash.
-    if any(n.replay == "conflict" for n in planner.nodes.values() if n.match.status == "missing"):
-        return 2
-    if check_result is not None and check_result[0] != 0:
-        return 3
-    return 0
+    if args.package_results:
+        print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+        try:
+            directory, archive = package_results(args.package_results)
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            print(f"backport-plan: cannot package results: {exc}", file=sys.stderr)
+            return 1
+        print(f"Results directory: {directory}")
+        print(f"Results archive: {archive}")
+        return 0
+
+    prefix = auto_package_prefix(args)
+    if prefix is None:
+        print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+        return run_planner(args)
+
+    # Package in the SAME invocation, but only after the internal log closes.
+    # Shell-side `tee` cannot be captured safely until its process exits.
+    try:
+        ensure_package_destinations_available(prefix)
+    except ValueError as exc:
+        print(f"backport-plan: cannot automatically package results: {exc}",
+              file=sys.stderr)
+        return 1
+    log_path = prefix.with_suffix(".log")
+    with log_path.open("x", encoding="utf-8") as log:
+        out = TeeOutput(sys.stdout, log)
+        err = TeeOutput(sys.stderr, log)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            started = time.monotonic()
+            print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+            rc = run_planner(args)
+            print(f"Planner elapsed: {time.monotonic() - started:.1f}s",
+                  file=sys.stderr)
+            out.flush()
+            err.flush()
+        log.flush()
+        os.fsync(log.fileno())
+
+    try:
+        directory, archive = package_results(str(prefix))
+    except (ValueError, OSError, zipfile.BadZipFile) as exc:
+        print(f"backport-plan: automatic packaging failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Results directory: {directory}")
+    print(f"Results archive: {archive}")
+    return rc
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 import importlib.machinery
 import io
 import json
+import subprocess
+import zipfile
 import types
 import unittest
 from unittest import mock
@@ -1199,6 +1201,7 @@ class AdvisorTests(unittest.TestCase):
         peer.advisor_decision = "SKIP"
         planner.nodes = {consumer.sha: consumer, peer.sha: peer}
         planner.advisor_consistency_issues = []
+        planner.ordered_missing = lambda: [peer.sha, consumer.sha]
 
         planner._advisor_check_consistency()
         self.assertEqual(len(planner.advisor_consistency_issues), 1)
@@ -1825,6 +1828,7 @@ class AdvisorTests(unittest.TestCase):
         }]
         planner.nodes = {consumer.sha: consumer, peer.sha: peer}
         planner.advisor_consistency_issues = []
+        planner.ordered_missing = lambda: [peer.sha, consumer.sha]
 
         planner._advisor_check_consistency()
         self.assertEqual(planner.advisor_consistency_issues, [])
@@ -2055,7 +2059,7 @@ class DualReportOutputTests(unittest.TestCase):
                 ["--output", str(text_path), "--json-output", str(json_path)], planner
             )
             self.assertEqual(rc, 0)
-            self.assertEqual(stdout, "")
+            self.assertIn("Results archive:", stdout)
             self.assertEqual(text_path.read_text(), "text plan\n")
             self.assertEqual(json.loads(json_path.read_text())["order"], ["a" * 40, "b" * 40])
             planner.collect.assert_called_once_with()
@@ -2133,5 +2137,610 @@ class DualReportOutputTests(unittest.TestCase):
             self.assertEqual(json.loads(json_path.read_text())["order"][0], node.sha)
 
 
+class AutoPackagingTests(unittest.TestCase):
+    """Automatic packaging must close the log before creating the ZIP."""
+
+    def planner(self, *, error=False, conflict=False):
+        planner = mock.Mock()
+        node = kbp.CommitNode("a" * 40, "patch", replay="conflict" if conflict else "clean")
+        planner.nodes = {node.sha: node}
+        planner.collect.side_effect = lambda: print("progress: collecting upstream", file=sys.stderr)
+        planner.run_advisor.side_effect = lambda: print("progress: advisor finished")
+        planner.run_check_command.return_value = ((5, "check failed") if error else None)
+        planner.report_text.return_value = "text plan\n"
+        planner.report_json.return_value = json.dumps({"advisor": None, "order": [node.sha]}) + "\n"
+        return planner
+
+    def test_auto_creates_complete_log_directory_zip_in_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "backport_plan_19"
+            planner = self.planner()
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                self.assertEqual(kbp.main([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--output", str(prefix) + ".c",
+                    "--json-output", str(prefix) + ".json",
+                ]), 0)
+            folder = prefix
+            archive = prefix.with_suffix(".zip")
+            self.assertTrue(archive.is_file())
+            self.assertEqual(sorted(f.name for f in folder.iterdir()), sorted([
+                "backport_plan_19.c", "backport_plan_19.json", "backport_plan_19.log",
+                "backport_plan_19.perf.json", "backport_plan_19.perf.jsonl",
+            ]))
+            with zipfile.ZipFile(archive) as zf:
+                self.assertEqual(sorted(zf.namelist()), sorted([
+                    "backport_plan_19/backport_plan_19.c",
+                    "backport_plan_19/backport_plan_19.json",
+                    "backport_plan_19/backport_plan_19.log",
+                    "backport_plan_19/backport_plan_19.perf.json",
+                    "backport_plan_19/backport_plan_19.perf.jsonl",
+                ]))
+                log = zf.read("backport_plan_19/backport_plan_19.log").decode()
+                self.assertIn("progress: collecting upstream", log)
+                self.assertIn("progress: advisor finished", log)
+                self.assertIn("0.4.16", log)
+                self.assertEqual(log, prefix.with_suffix(".log").read_text())
+
+    def test_package_preserves_analysis_exit_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for suffix, planner, expected in (
+                ("conflict", self.planner(conflict=True), 2),
+                ("check", self.planner(error=True), 3),
+            ):
+                prefix = Path(tmp) / suffix
+                with mock.patch.object(kbp, "Planner", return_value=planner):
+                    rc = kbp.main([
+                        "--base", "v6.19", "--target", "v7.0",
+                        "--output", str(prefix) + ".c",
+                        "--json-output", str(prefix) + ".json",
+                    ])
+                self.assertEqual(rc, expected)
+                self.assertTrue(prefix.with_suffix(".zip").is_file())
+
+    def test_preflight_refuses_overwrite_without_running_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "plan"
+            prefix.with_suffix(".zip").write_text("do not overwrite")
+            planner = self.planner()
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                rc = kbp.main([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--output", str(prefix) + ".c",
+                    "--json-output", str(prefix) + ".json",
+                ])
+            self.assertEqual(rc, 1)
+            planner.collect.assert_not_called()
+            self.assertEqual(prefix.with_suffix(".zip").read_text(), "do not overwrite")
+            self.assertFalse(prefix.with_suffix(".log").exists())
+
+    def test_preflight_protects_existing_source_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "plan"
+            prefix.with_suffix(".c").write_text("original report\n")
+            planner = self.planner()
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                rc = kbp.main([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--output", str(prefix) + ".c",
+                    "--json-output", str(prefix) + ".json",
+                ])
+            self.assertEqual(rc, 1)
+            self.assertEqual(prefix.with_suffix(".c").read_text(),
+                             "original report\n")
+            planner.collect.assert_not_called()
+            self.assertFalse(prefix.with_suffix(".log").exists())
+
+    def test_inconsistent_basename_fails_before_expensive_analysis(self):
+        with self.assertRaises(SystemExit) as raised:
+            kbp.parse_args([
+                "--base", "v6.19", "--target", "v7.0",
+                "--output", "plan_18.c", "--json-output", "plan_19.json",
+            ])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_disable_auto_packaging_restores_independent_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            text = path / "plan_18.c"
+            js = path / "plan_19.json"
+            planner = self.planner()
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                rc = kbp.main([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--output", str(text), "--json-output", str(js),
+                    "--no-auto-package",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(text.is_file())
+            self.assertTrue(js.is_file())
+            self.assertFalse(text.with_suffix(".log").exists())
+            self.assertFalse(text.with_suffix(".zip").exists())
+
+
+class DependencyClosure0414Tests(unittest.TestCase):
+    """Exercise 0.4.14 executable-plan closure, not just advisor labels."""
+
+    @staticmethod
+    def edge(peer):
+        return {"sha": peer, "evidence_id": "ev-binding",
+                "evidence_kind": "compatible-binding", "evidence_object": "armsom,sige5",
+                "reason": "uses compatible armsom,sige5"}
+
+    @staticmethod
+    def graph():
+        planner = object.__new__(kbp.Planner)
+        consumer = kbp.CommitNode("c" * 40, "ArmSoM Sige 5 board", direct=True)
+        consumer.advisor_decision = "TAKE"
+        provider = kbp.CommitNode("b" * 40, "ArmSoM Sige 5 binding")
+        consumer.advisor_prerequisites = [DependencyClosure0414Tests.edge(provider.sha)]
+        planner.nodes = {consumer.sha: consumer}
+        planner.ordered_missing = lambda: [
+            sha for sha in (provider.sha, consumer.sha)
+            if sha in planner.nodes and planner.is_actionable_node(planner.nodes[sha])
+        ]
+        return planner, consumer, provider
+
+    def test_missing_peer_is_not_silently_consistent(self):
+        planner, consumer, provider = self.graph()
+        planner._advisor_check_consistency()
+        self.assertEqual([x["kind"] for x in planner.advisor_consistency_issues],
+                         ["TAKE->ABSENT"])
+        self.assertEqual(planner.advisor_consistency_issues[0]["prerequisite_sha"], provider.sha)
+        self.assertEqual(len(consumer.advisor_consistency_warnings), 1)
+
+    def test_candidate_and_unevaluated_peer_are_blockers(self):
+        planner, consumer, provider = self.graph()
+        provider.add_reason("hunk-context:1", consumer.sha, tentative=True)
+        planner.nodes[provider.sha] = provider
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues[0]["kind"], "TAKE->UNSELECTED")
+        provider.add_reason("advisor-prerequisite:compatible-binding", consumer.sha)
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues[0]["kind"], "TAKE->UNEVALUATED")
+
+    def test_take_peer_must_precede_consumer(self):
+        planner, consumer, provider = self.graph()
+        provider.add_reason("advisor-prerequisite:compatible-binding", consumer.sha)
+        provider.advisor_decision = "TAKE"
+        planner.nodes[provider.sha] = provider
+        planner.ordered_missing = lambda: [consumer.sha, provider.sha]
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues[0]["kind"], "TAKE->OUT_OF_ORDER")
+        planner.ordered_missing = lambda: [provider.sha, consumer.sha]
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_present_peer_does_not_block(self):
+        planner, consumer, provider = self.graph()
+        provider.match = kbp.Match(status="present")
+        planner.nodes[provider.sha] = provider
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_promotes_verified_binding_without_force_take(self):
+        planner, consumer, provider = self.graph()
+        planner.advisor_prerequisite_evidence = lambda sha: [{
+            "evidence_id": "ev-binding", "peer_sha": provider.sha,
+            "kind": "compatible-binding", "object": "armsom,sige5",
+            "selected_use": "board compatible", "peer_provides": "binding",
+        }]
+        planner.advisor_allowed_prerequisite_peers = lambda sha: [provider.sha]
+        planner.info = lambda msg: None
+        planner._record_advisor_prerequisite_recommendations = lambda sha: None
+        # Stand-in ensure_node must perform the actionability transition.
+        def ensure(sha, reason, required_by):
+            provider.add_reason(reason, required_by)
+            planner.nodes[sha] = provider
+            return provider
+        planner.ensure_node = ensure
+        count = planner._advisor_promote_prerequisites()
+        self.assertEqual(count, 1)
+        self.assertTrue(kbp.Planner.is_actionable_node(provider))
+        self.assertIsNone(provider.advisor_decision)
+        self.assertEqual(planner._advisor_promote_prerequisites(), 0)
+
+    def test_no_promotion_from_unverified_evidence(self):
+        planner, consumer, provider = self.graph()
+        planner.advisor_prerequisite_evidence = lambda sha: []
+        planner.advisor_allowed_prerequisite_peers = lambda sha: [provider.sha]
+        planner.ensure_node = lambda *args, **kwargs: self.fail("unverified promotion")
+        planner._record_advisor_prerequisite_recommendations = lambda sha: None
+        self.assertEqual(planner._advisor_promote_prerequisites(), 0)
+
+    def test_run_advisor_evaluates_promoted_peer(self):
+        planner, consumer, provider = self.graph()
+        planner.advisor_model = "dummy"
+        planner.args = types.SimpleNamespace(
+            advisor_commit=None, advisor_limit=None, advisor_base_url="http://localhost",
+            advisor_timeout=1, advisor_temperature=0, advisor_keep_alive="1m",
+            debug=False, simulate=False,
+        )
+        planner.info = lambda msg: None
+        planner.advisor_reconsiderations = 0
+        planner.advisor_order = lambda shas: list(shas)
+        planner.advisor_system_prompt = lambda: "prompt"
+        planner.advisor_prerequisite_evidence = lambda sha: [{
+            "evidence_id": "ev-binding", "peer_sha": provider.sha,
+            "kind": "compatible-binding", "object": "armsom,sige5",
+            "selected_use": "board compatible", "peer_provides": "schema",
+        }]
+        planner.advisor_allowed_prerequisite_peers = lambda sha: [provider.sha]
+        planner.ensure_node = lambda sha, reason, required_by: provider
+        def ensure(sha, reason, required_by):
+            provider.add_reason(reason, required_by)
+            planner.nodes[sha] = provider
+            return provider
+        planner.ensure_node = ensure
+        planner._record_advisor_prerequisite_recommendations = lambda sha: None
+        planner.dependency_closure = lambda: None
+        planner.build_series_index = lambda: None
+        planner._advisor_reconciliation_pass = lambda *args: None
+        seen = []
+        def evaluate(_client, _prompt, sha):
+            seen.append(sha)
+            planner.nodes[sha].advisor_decision = "TAKE"
+        planner._advisor_evaluate_one = evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor"):
+            planner.run_advisor()
+        self.assertEqual(seen, [consumer.sha, provider.sha])
+        self.assertTrue(provider.required_by)
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_missing_dts_provider_is_hard_dependency(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=root, text=True,
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+            def commit(message):
+                git("add", ".")
+                git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "-m", message)
+                return git("rev-parse", "HEAD")
+            git("init", "-q")
+            (root / "README").write_text("baseline\n")
+            baseline = commit("base")
+            dts = root / "arch/arm64/boot/dts/rockchip"
+            dts.mkdir(parents=True)
+            (dts / "rk3576.dtsi").write_text("/ { soc { }; };\n")
+            provider_sha = commit("arm64: dts: rockchip: Add rk3576 SoC base DT")
+            (dts / "rk3576-armsom-sige5.dts").write_text(
+                '/dts-v1/;\n#include "rk3576.dtsi"\n/ { model = "Sige5"; };\n')
+            consumer_sha = commit("arm64: dts: rockchip: Add rk3576-armsom-sige5 board")
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            planner.replay_start = baseline
+            consumer = kbp.CommitNode(consumer_sha, "board", direct=True,
+                files=["arch/arm64/boot/dts/rockchip/rk3576-armsom-sige5.dts"])
+            provider = kbp.CommitNode(provider_sha, "base DTS",
+                files=["arch/arm64/boot/dts/rockchip/rk3576.dtsi"])
+            planner.nodes = {consumer_sha: consumer}
+            def ensure(sha, reason, required_by):
+                self.assertEqual(sha, provider_sha)
+                provider.add_reason(reason, required_by)
+                planner.nodes[sha] = provider
+                return provider
+            planner.ensure_node = ensure
+            self.assertEqual(planner.add_dt_include_dependencies([consumer]), 1)
+            self.assertEqual(provider.required_by, {consumer_sha})
+            self.assertIn("dt-include:arch/arm64/boot/dts/rockchip/rk3576.dtsi", provider.reasons)
+            self.assertEqual(planner.add_dt_include_dependencies([consumer]), 0)
+            consumer.advisor_decision = "TAKE"
+            provider.advisor_decision = "SKIP"
+            planner.ordered_missing = lambda: [provider_sha, consumer_sha]
+            planner._advisor_check_consistency()
+            self.assertEqual(planner.advisor_consistency_issues[0]["kind"], "DT_INCLUDE->SKIP")
+            provider.advisor_decision = "TAKE"
+            planner._advisor_check_consistency()
+            self.assertEqual(planner.advisor_consistency_issues, [])
+
+
+class DependencyClosure0415Tests(unittest.TestCase):
+    """Regression coverage for false DT dependencies and stable reorder."""
+
+    def git_repo(self, tmp):
+        root = Path(tmp)
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=root, text=True, check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+        def commit(message):
+            git("add", ".")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "-m", message)
+            return git("rev-parse", "HEAD")
+        git("init", "-q")
+        (root / "README").write_text("base\n")
+        baseline = commit("base")
+        return root, git, commit, baseline
+
+    def test_same_commit_introduces_dts_and_dtsi_without_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = self.git_repo(tmp)
+            folder = root / "arch/arm64/boot/dts/realtek"
+            folder.mkdir(parents=True)
+            dtsi = folder / "soc.dtsi"
+            dts = folder / "board.dts"
+            dtsi.write_text('/ { soc { }; };\n')
+            dts.write_text('/dts-v1/;\n#include "soc.dtsi"\n')
+            sha = commit("Add board with SoC DT")
+            node = kbp.CommitNode(sha, "board", direct=True,
+                 files=["arch/arm64/boot/dts/realtek/board.dts",
+                        "arch/arm64/boot/dts/realtek/soc.dtsi"])
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            planner.replay_start = baseline
+            planner.nodes = {sha: node}
+            planner.ensure_node = lambda *a, **kw: self.fail("same-commit prerequisite")
+            self.assertEqual(planner.add_dt_include_dependencies([node]), 0)
+            self.assertEqual(planner.dt_include_unresolved, [])
+            node.advisor_decision = "TAKE"
+            planner.ordered_missing = lambda: [sha]
+            planner._advisor_check_consistency()
+            self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_file_modified_by_consumer_still_requires_older_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = self.git_repo(tmp)
+            folder = root / "arch/arm64/boot/dts/rockchip"
+            folder.mkdir(parents=True)
+            (folder / "soc.dtsi").write_text('/ { soc { }; };\n')
+            provider_sha = commit("Add SoC DT")
+            (folder / "soc.dtsi").write_text('/ { soc { serial { }; }; };\n')
+            (folder / "board.dts").write_text('/dts-v1/;\n#include "soc.dtsi"\n')
+            consumer_sha = commit("Add board and update SoC DT")
+            consumer = kbp.CommitNode(consumer_sha, "board", direct=True,
+                files=["arch/arm64/boot/dts/rockchip/board.dts",
+                       "arch/arm64/boot/dts/rockchip/soc.dtsi"])
+            provider = kbp.CommitNode(provider_sha, "SoC")
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            planner.replay_start = baseline
+            planner.nodes = {consumer_sha: consumer}
+            def ensure(sha, reason, required_by):
+                self.assertEqual(sha, provider_sha)
+                provider.add_reason(reason, required_by)
+                planner.nodes[sha] = provider
+                return provider
+            planner.ensure_node = ensure
+            self.assertEqual(planner.add_dt_include_dependencies([consumer]), 1)
+            self.assertIn(consumer_sha, provider.required_by)
+            self.assertEqual(planner.dt_include_unresolved, [])
+
+    def test_binding_and_selected_ancestors_move_before_consumer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = self.git_repo(tmp)
+            git("checkout", "-qb", "board")
+            (root / "board").write_text("board\n")
+            consumer_sha = commit("board")
+            git("checkout", "-qb", "binding", baseline)
+            (root / "binding-ancestor").write_text("ancestor\n")
+            ancestor_sha = commit("binding ancestor")
+            (root / "binding").write_text("binding\n")
+            provider_sha = commit("binding")
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            consumer = kbp.CommitNode(consumer_sha, "board", direct=True)
+            consumer.advisor_decision = "TAKE"
+            consumer.advisor_prerequisites = [{"sha": provider_sha}]
+            ancestor = kbp.CommitNode(ancestor_sha, "ancestor", direct=True)
+            ancestor.advisor_decision = "TAKE"
+            provider = kbp.CommitNode(provider_sha, "binding", direct=True)
+            provider.advisor_decision = "TAKE"
+            planner.nodes = {n.sha: n for n in (consumer, ancestor, provider)}
+            self.assertEqual(planner._dependency_order(
+                [consumer_sha, ancestor_sha, provider_sha]),
+                [ancestor_sha, provider_sha, consumer_sha])
+
+    def test_git_ancestry_prevents_impossible_reorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = self.git_repo(tmp)
+            (root / "board").write_text("board\n")
+            consumer_sha = commit("board")
+            (root / "binding").write_text("binding\n")
+            provider_sha = commit("binding")
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            consumer = kbp.CommitNode(consumer_sha, "board", direct=True)
+            consumer.advisor_decision = "TAKE"
+            consumer.advisor_prerequisites = [{"sha": provider_sha}]
+            provider = kbp.CommitNode(provider_sha, "binding", direct=True)
+            provider.advisor_decision = "TAKE"
+            planner.nodes = {n.sha: n for n in (consumer, provider)}
+            self.assertEqual(planner._dependency_order([consumer_sha, provider_sha]),
+                             [consumer_sha, provider_sha])
+            planner.ordered_missing = lambda: planner._dependency_order(
+                [consumer_sha, provider_sha])
+            planner._advisor_check_consistency()
+            self.assertEqual(planner.advisor_consistency_issues[0]["kind"],
+                             "TAKE->OUT_OF_ORDER")
+
+    def test_dt_source_dependency_also_reorders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = self.git_repo(tmp)
+            git("checkout", "-qb", "board")
+            (root / "board").write_text("board\n")
+            consumer_sha = commit("board")
+            git("checkout", "-qb", "soc", baseline)
+            (root / "soc").write_text("soc\n")
+            provider_sha = commit("soc")
+            planner = object.__new__(kbp.Planner)
+            planner.git = kbp.Git(root)
+            consumer = kbp.CommitNode(consumer_sha, "board", direct=True)
+            consumer.advisor_decision = "TAKE"
+            provider = kbp.CommitNode(provider_sha, "soc", direct=True)
+            provider.advisor_decision = "TAKE"
+            provider.add_reason("dt-include:arch/arm64/boot/dts/soc.dtsi", consumer_sha)
+            planner.nodes = {n.sha: n for n in (consumer, provider)}
+            self.assertEqual(planner._dependency_order([consumer_sha, provider_sha]),
+                             [provider_sha, consumer_sha])
+
+
+class Packaging0415Tests(unittest.TestCase):
+    def fixtures(self, root):
+        prefix = Path(root) / "backport_plan_19"
+        prefix.with_suffix(".c").write_text("text plan\n")
+        prefix.with_suffix(".log").write_text("complete tee log\n")
+        cache = Path(root) / "backport_plan_19.c.advisor-cache.json"
+        cache.write_text('{"test": true}\n')
+        diag = Path(root) / "backport_plan_19.c.advisor-errors.jsonl"
+        diag.write_text('{"kind": "timeout"}\n')
+        prefix.with_suffix(".json").write_text(json.dumps({"advisor": {
+            "cache_path": str(cache), "error_log_path": str(diag)}}) + "\n")
+        return prefix
+
+    def test_package_finished_results_and_reject_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = self.fixtures(tmp)
+            rc = kbp.main(["--package-results", str(prefix) + ".c"])
+            self.assertEqual(rc, 0)
+            folder = prefix
+            archive = prefix.with_suffix(".zip")
+            self.assertTrue(folder.is_dir())
+            self.assertEqual(len(list(folder.iterdir())), 5)
+            with zipfile.ZipFile(archive) as zf:
+                self.assertEqual(sorted(zf.namelist()), sorted(
+                    f"{prefix.name}/{f.name}" for f in folder.iterdir()))
+                self.assertEqual(zf.read(f"{prefix.name}/{prefix.name}.log"),
+                                 b"complete tee log\n")
+            self.assertEqual(kbp.main(["--package-results", str(prefix)]), 1)
+            self.assertEqual((folder / (prefix.name + ".c")).read_text(), "text plan\n")
+
+    def test_missing_log_prevents_incomplete_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = self.fixtures(tmp)
+            prefix.with_suffix(".log").unlink()
+            self.assertEqual(kbp.main(["--package-results", str(prefix)]), 1)
+            self.assertFalse(prefix.exists())
+            self.assertFalse(prefix.with_suffix(".zip").exists())
+
+    def test_packaging_mode_does_not_require_base_target(self):
+        self.assertEqual(kbp.parse_args(["--package-results", "plan"]).package_results,
+                         "plan")
+        with self.assertRaises(SystemExit) as raised:
+            kbp.parse_args(["--package-results", "plan", "--base", "v6.19"])
+        self.assertEqual(raised.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class Performance0416Tests(unittest.TestCase):
+    """Performance measurements must be durable and avoid payload leakage."""
+
+    def test_partial_run_journal_survives_interruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plan.perf.jsonl"
+            profiler = kbp.PerformanceRecorder(path)
+            with self.assertRaises(KeyboardInterrupt):
+                try:
+                    with profiler.phase("collect.replay"):
+                        raise KeyboardInterrupt()
+                finally:
+                    profiler.abort()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([r["event"] for r in records],
+                             ["run_start", "phase_start", "phase_end"])
+            self.assertEqual(records[-1]["name"], "collect.replay")
+
+    def test_advisor_metrics_are_aggregated_without_prompt_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plan.perf.jsonl"
+            profiler = kbp.PerformanceRecorder(path)
+            profiler.advisor("a" * 40, 1, 1.25, input_bytes=12345,
+                             ollama={"prompt_eval_count": 300,
+                                     "eval_count": 100,
+                                     "eval_duration": 500000000,
+                                     "message": "secret kernel code"})
+            profiler.advisor("b" * 40, 2, 2.0, status="failed")
+            profiler.cache_hit("c" * 40)
+            profiler.git("log", 0.25)
+            profiler.git("log", 0.75)
+            summary = profiler.finish(Path(tmp) / "plan.perf.json")
+            self.assertEqual(summary["advisor"]["requests"], 2)
+            self.assertEqual(summary["advisor"]["failed_attempts"], 1)
+            self.assertEqual(summary["advisor"]["cache_hits"], 1)
+            self.assertEqual(summary["advisor"]["ollama"]["prompt_eval_count"], 300)
+            self.assertEqual(summary["git_commands"]["log"]["count"], 2)
+            self.assertNotIn("secret kernel code", path.read_text())
+            self.assertNotIn("secret kernel code", (Path(tmp) / "plan.perf.json").read_text())
+
+    def test_ollama_client_exposes_server_duration_fields(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return json.dumps({
+                    "message": {"content": json.dumps({"decision": "TAKE"})},
+                    "total_duration": 2000000000, "load_duration": 100000000,
+                    "prompt_eval_count": 900, "eval_count": 250,
+                    "eval_duration": 1400000000,
+                }).encode()
+        client = kbp.OllamaAdvisor("gemma4-kernel:128k", "127.0.0.1:11434",
+                                   3.0, 0.1, "10m")
+        with mock.patch.object(kbp.urllib.request, "urlopen", return_value=FakeResponse()):
+            self.assertEqual(client.advise("prompt", {"commit": {"sha": "a" * 40}}),
+                             {"decision": "TAKE"})
+        self.assertEqual(client.last_telemetry["total_duration"], 2000000000)
+        self.assertEqual(client.last_telemetry["eval_count"], 250)
+
+    def test_mocked_advisor_retries_record_attempts_without_sleep_time(self):
+        planner = object.__new__(kbp.Planner)
+        planner.args = types.SimpleNamespace(advisor_retries=1, advisor_retry_delay=0.0)
+        node = kbp.CommitNode("a" * 40, "arm64 change")
+        planner.nodes = {node.sha: node}
+        planner.advisor_calls = 0
+        planner.advisor_retries_used = 0
+        planner.info = lambda message: None
+        planner.advisor_prerequisite_evidence = lambda _sha: []
+        planner.advisor_inbound_take_recommendations = lambda _sha: []
+        planner.validate_advisor_result = lambda sha, result: result
+        class Client:
+            calls = 0
+            def advise(self, prompt, packet, schema):
+                self.calls += 1
+                if self.calls == 1:
+                    raise kbp.AdvisorError("failed", kind="timeout", retryable=True)
+                return {"decision": "TAKE"}
+        with tempfile.TemporaryDirectory() as tmp:
+            profiler = kbp.PerformanceRecorder(Path(tmp) / "plan.perf.jsonl")
+            planner.performance = profiler
+            result = planner._advisor_call_with_retries(
+                Client(), "prompt", node.sha, {"commit": {"sha": node.sha}})
+            summary = profiler.finish()
+        self.assertEqual(result["decision"], "TAKE")
+        self.assertEqual(summary["advisor"]["requests"], 2)
+        self.assertEqual(summary["advisor"]["failed_attempts"], 1)
+
+    def test_auto_package_includes_performance_summary_and_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "plan"
+            planner = mock.Mock()
+            planner.nodes = {}
+            planner.run_check_command.return_value = None
+            planner.report_text.return_value = "text\n"
+            planner.report_json.return_value = json.dumps({"advisor": None}) + "\n"
+            with mock.patch.object(kbp, "Planner", return_value=planner):
+                self.assertEqual(kbp.main([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--output", str(prefix) + ".c",
+                    "--json-output", str(prefix) + ".json",
+                ]), 0)
+            summary = json.loads(prefix.with_suffix(".perf.json").read_text())
+            self.assertGreaterEqual(summary["phases"]["collect"]["count"], 1)
+            with zipfile.ZipFile(prefix.with_suffix(".zip")) as archive:
+                members = archive.namelist()
+                self.assertIn("plan/plan.perf.json", members)
+                self.assertIn("plan/plan.perf.jsonl", members)
+                self.assertEqual(json.loads(archive.read("plan/plan.perf.json")), summary)
+
+    def test_preflight_prevents_reuse_of_partial_perf_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "plan"
+            prefix.with_suffix(".perf.jsonl").write_text('{"event":"run_start"}\n')
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                kbp.ensure_package_destinations_available(prefix)
