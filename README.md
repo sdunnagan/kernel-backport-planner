@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.16**.
+Current tool version: **0.4.18**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -152,6 +152,172 @@ is rejected before analysis, preventing a costly misnamed run. Use
 `--no-auto-package` for nonstandard independent output paths or when managing
 logs and archives externally. Standalone `--package-results PREFIX` remains
 available for packaging older completed runs.
+
+
+## Policy-aware small-model advisor and evidence efficiency (0.4.18)
+
+Version 0.4.18 addresses the Qwen 7B REVIEW inflation seen when comparing
+run 21 against the Gemma run 20. The latter remains the trusted reference for
+continued CS10 backporting; 0.4.18 does **not** automatically accept the Qwen
+output. The model and its hardware configuration do not need to change.
+
+### REVIEW policy correction
+
+The advisor prompt now explicitly distinguishes real semantic uncertainty from
+missing proof that a particular ARM64 board, SoC, peripheral, or platform is an
+*officially supported product*. Under the configured upstream-convergence
+policy, missing product endorsement alone does not warrant REVIEW or SKIP.
+For a supported architecture's in-scope change, TAKE is the starting point;
+REVIEW requires a specific technical or dependency uncertainty, and SKIP
+requires a concrete exclusion. Unsupported-architecture-only code continues
+to be excluded by the existing deterministic policy.
+
+A conservative reviewer checks whether a model's REVIEW rationale relies solely
+on absent product support/benefit without identifying a concrete technical
+issue. Such responses are **not** changed to TAKE. The planner makes **one**
+policy-aware retry using the same evidence and response schema. If the model
+repeats the objection, the candidate remains REVIEW and receives a diagnostic
+of kind `policy-review`. Genuine technical ambiguity is left untouched. The
+JSON advisor metadata includes `policy_rechecks`; the performance journal
+records `advisor_policy_recheck` events. The policy change increments the
+advisor prompt version from 13 to 14, so old advisor cache entries are not
+reused as if the instructions were unchanged.
+
+On the archived run 21 rationales, the conservative policy detector identifies
+244 of the 403 model-generated REVIEW entries as possible policy-only
+objections. That is a *diagnostic count*, not an assertion that those commits
+are all safe to TAKE or that the next run will eliminate those REVIEWs.
+
+### Evidence budget efficiency
+
+The Ollama request sends the advisor evidence as **compact JSON** instead of
+pretty-printed JSON. Under a request character cap, the budgeter can omit a
+redundant copy of `same_series_consumed_objects` when it exactly equals the
+retained authoritative `eligible_prerequisite_evidence`; all eligible evidence
+IDs, peer SHAs, and inbound TAKE relationships remain present. Optional peer
+and consumer diff excerpts may still be omitted in the previous safe order.
+The selected commit patch and required prerequisite evidence are never silently
+truncated. An overflow still becomes REVIEW (`evidence-budget`) without a
+model call. The planner reserves 600 characters of the configured cap for a
+single short policy recheck. The character budget is **not** a tokenizer and
+the context-token guard should remain enabled for Qwen's 32K model.
+
+### Small, targeted Qwen comparison with run 20
+
+The benchmark supports `--benchmark-reference-plan`. Supply the failed Qwen
+run 21 as the primary plan and the established Gemma run 20 as reference. If
+no explicit `--advisor-commit` is supplied, it prioritizes commits where the
+recorded decisions disagree, then other interesting commits. It checks that
+the reference target and downstream baseline match, and records both saved
+decisions and new Qwen responses in the output JSONL file.
+
+Example from a CS10 working tree containing the upstream commit objects:
+
+```bash
+kernel-backport-planner \
+    --advisor-benchmark-plan /path/to/backport_plan_21.json \
+    --benchmark-reference-plan /path/to/backport_plan_20.json \
+    --advisor-model kernel-planner:32k \
+    --advisor-base-url http://gondor:11434 \
+    --advisor-commit 4b6167b3a00f \
+    --advisor-commit b2473a359763 \
+    --advisor-max-request-chars 48000 \
+    --advisor-context-tokens 32768 \
+    --advisor-output-reserve 1024 \
+    --benchmark-output /path/to/qwen-policy-test-01.jsonl
+```
+
+For a small automatic disagreement sample, remove the explicit
+`--advisor-commit` options and add `--advisor-limit 10`.
+
+The benchmark constructs reduced evidence from the saved plan and targeted
+Git reads. It **does not** reproduce full advisor packets from the original
+run, so matching Gemma's result is not by itself proof of correctness, and a
+disagreement is not automatically a Qwen defect. This mode avoids repeating
+full-history collection, cherry-pick replay, and dependency reconciliation.
+The output path must be new. No run 20 or run 21 artifact is modified.
+
+Full planner execution is otherwise unchanged. Keep Qwen's existing 32K
+context guards when evaluating a future full run. Continue using the
+`execution_ready=true` plan from run 20 for production backporting until
+model-quality and dependency-readiness checks justify replacing it.
+
+## Smaller local advisors and offline benchmarks (0.4.17)
+
+Version 0.4.17 adds an **opt-in full-request character budget**, a conservative
+model-context guard, and a focused benchmark that avoids the full Git collection.
+These are intended for small GPU-resident models such as `kernel-planner:32k`
+(Qwen 2.5 Coder 7B). The existing large-model behavior stays unchanged if
+these flags are omitted.
+
+The request budget is based on *serialized characters*, not model tokens. It
+includes system instructions, the packet, and JSON schema, plus a small
+transport allowance. A character count is not a reliable tokenizer, so
+**48000 characters does not guarantee fitting in 32768 tokens**. To reduce the
+risk of silent truncation, also enable a context-token guard. After Ollama
+returns usage telemetry, a request too close to the configured context is
+rejected and its candidate is marked REVIEW rather than accepted or cached.
+This detects many problematic requests, but cannot prove that no text was lost
+on the server. Compare sampled model decisions before trusting a full plan.
+
+For a full planner run on `shire`, add these options to the existing command:
+
+```bash
+    --advisor-model kernel-planner:32k \
+    --advisor-base-url http://gondor:11434 \
+    --advisor-max-request-chars 48000 \
+    --advisor-context-tokens 32768 \
+    --advisor-output-reserve 1024 \
+```
+
+Optional same-series peer diffs, deterministic consumer diffs, and the commit
+message are omitted *in that order* only if a packet exceeds the character
+cap. Eligible prerequisite evidence IDs, inbound TAKE prerequisite records,
+selected commit patch excerpts, paths, and policy facts are never removed. If
+required evidence cannot fit, there is no model call; the candidate is REVIEW
+with an explicit `evidence-budget` error. The JSON commit entry records
+`advisor_budget`, and performance JSONL records packet-budget metadata without
+storing source code. No field is silently truncated as raw serialized JSON.
+
+### Fast advisor benchmark from a completed plan
+
+This tests a small set of candidate commits without rebuilding the dependency
+graph, replaying cherry-picks, or indexing the entire CS10 history. Run from a
+local Git repository that contains the target upstream commit objects:
+
+```bash
+kernel-backport-planner \
+    --repo ~/projects/rhel-223619/centos-stream-10 \
+    --advisor-benchmark-plan ~/projects/rhel-223619/backport_plan_20.json \
+    --advisor-model kernel-planner:32k \
+    --advisor-base-url http://gondor:11434 \
+    --advisor-commit 40f742b07ab2 \
+    --advisor-commit 57b1ce903966 \
+    --advisor-commit 87e0e43b9219 \
+    --advisor-max-request-chars 48000 \
+    --advisor-context-tokens 32768 \
+    --benchmark-output ~/projects/rhel-223619/qwen-benchmark-01.jsonl
+```
+
+The output file must not already exist. Each tested commit adds one durable
+JSONL record with latency, decision, prerequisite peer SHAs, and comparison to
+the saved plan. Without explicit `--advisor-commit`, the benchmark chooses
+prerequisite-bearing or non-TAKE records first, with a default limit of ten.
+You can use `--advisor-limit N` to change that count.
+
+**Important limitation:** run 20 did not save its complete advisor prompts.
+Benchmark packets therefore reconstruct *reduced evidence* from the archived
+JSON and selected local `git show` output. They are NOT identical to the
+original Gemma prompts and do not include the complete dynamic series/consumer
+context or original product-policy derivation. Agreement measures a useful
+smoke test of Qwen transport, JSON validity, latency, and potential decision
+differences; it does NOT validate full planner quality or replay the exact
+Gemma request. The original plan and cache are never modified.
+
+To validate Qwen's decisions for production, check difficult binding, symbol,
+and DTS/DTSI cases against the original reports and manually review
+recommendations that disagree. A full plan still needs compilation and
+backport testing even if `execution_ready` is true.
 
 ## Downstream identity matching
 

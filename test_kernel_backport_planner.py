@@ -2179,7 +2179,7 @@ class AutoPackagingTests(unittest.TestCase):
                 log = zf.read("backport_plan_19/backport_plan_19.log").decode()
                 self.assertIn("progress: collecting upstream", log)
                 self.assertIn("progress: advisor finished", log)
-                self.assertIn("0.4.16", log)
+                self.assertIn(kbp.VERSION, log)
                 self.assertEqual(log, prefix.with_suffix(".log").read_text())
 
     def test_package_preserves_analysis_exit_codes(self):
@@ -2744,3 +2744,309 @@ class Performance0416Tests(unittest.TestCase):
             prefix.with_suffix(".perf.jsonl").write_text('{"event":"run_start"}\n')
             with self.assertRaisesRegex(ValueError, "already exists"):
                 kbp.ensure_package_destinations_available(prefix)
+
+class AdvisorBudget0417Tests(unittest.TestCase):
+    """Context capping must fail closed and retain dependency evidence."""
+
+    @staticmethod
+    def packet():
+        return {
+            "planning_context": {"product": "rhel10"},
+            "commit": {
+                "sha": "a" * 40, "subject": "board DTS",
+                "patch_excerpt": "+" * 600,
+                "message": "M" * 1000,
+                "eligible_prerequisite_evidence": [{
+                    "evidence_id": "ev-test", "peer_sha": "b" * 40,
+                    "kind": "included-file", "object": "rk3576.dtsi",
+                }],
+                "actual_inbound_take_prerequisites": [{
+                    "evidence_id": "ev-inbound", "consumer_sha": "c" * 40,
+                }],
+                "same_series": [{"sha": "b" * 40,
+                                 "patch_excerpt": "P" * 3000}],
+                "deterministic_consumer_context": {
+                    "consumers": [{"sha": "c" * 40,
+                                   "patch_excerpt": "Q" * 2500}]},
+            },
+        }
+
+    def test_smaller_packet_is_unchanged(self):
+        packet = self.packet()
+        original = json.dumps(packet)
+        output, meta = kbp.budget_advisor_packet(packet, "prompt", {}, 20000)
+        self.assertIs(output, packet)
+        self.assertEqual(meta["omitted"], [])
+        self.assertEqual(json.dumps(packet), original)
+
+    def test_removes_optional_context_not_required_prerequisites(self):
+        packet = self.packet()
+        original = json.dumps(packet)
+        output, meta = kbp.budget_advisor_packet(packet, "prompt", {}, 5000)
+        self.assertLessEqual(meta["final_chars"], 5000)
+        self.assertTrue(meta["omitted"])
+        self.assertEqual(output["commit"]["patch_excerpt"], "+" * 600)
+        self.assertEqual(output["commit"]["eligible_prerequisite_evidence"],
+                         packet["commit"]["eligible_prerequisite_evidence"])
+        self.assertEqual(output["commit"]["actual_inbound_take_prerequisites"],
+                         packet["commit"]["actual_inbound_take_prerequisites"])
+        self.assertEqual(json.dumps(packet), original)
+
+    def test_oversized_required_evidence_fails_closed(self):
+        packet = self.packet()
+        packet["commit"]["eligible_prerequisite_evidence"] = [
+            {"evidence_id": "ev-test", "source": "X" * 12000}]
+        with self.assertRaisesRegex(kbp.AdvisorError, "required advisor evidence") as result:
+            kbp.budget_advisor_packet(packet, "prompt", {}, 2000)
+        self.assertEqual(result.exception.kind, "evidence-budget")
+        self.assertFalse(result.exception.retryable)
+
+    def test_evidence_overflow_does_not_call_model_and_sets_review(self):
+        planner = object.__new__(kbp.Planner)
+        sha = "a" * 40
+        node = kbp.CommitNode(sha, "DTS consumer")
+        planner.nodes = {sha: node}
+        planner.args = types.SimpleNamespace(advisor_max_request_chars=100,
+                                              no_advisor_cache=True)
+        planner.advisor_packet = lambda x: self.packet()
+        planner.advisor_policy_override = lambda sha, packet: None
+        planner.advisor_prerequisite_evidence = lambda x: []
+        planner.advisor_inbound_take_recommendations = lambda x: []
+        planner._advisor_note_failure = lambda n, error: (
+            setattr(n, "advisor_decision", "REVIEW"),
+            setattr(n, "advisor_error_kind", error.kind))
+        planner.info = lambda msg: None
+        class Client:
+            def advise(self, *args):
+                raise AssertionError("model should not be called")
+        planner._advisor_evaluate_one(Client(), "prompt", sha)
+        self.assertEqual(node.advisor_decision, "REVIEW")
+        self.assertEqual(node.advisor_error_kind, "evidence-budget")
+        self.assertTrue(node.advisor_budget["overflow"])
+
+    def test_context_limit_rejects_response_that_might_be_truncated(self):
+        planner = object.__new__(kbp.Planner)
+        sha = "a" * 40
+        planner.nodes = {sha: kbp.CommitNode(sha, "DTS")}
+        planner.args = types.SimpleNamespace(advisor_retries=0,
+                advisor_retry_delay=0, advisor_context_tokens=32768,
+                advisor_output_reserve=1024)
+        planner.advisor_calls = 0
+        planner.advisor_prerequisite_evidence = lambda _sha: []
+        planner.advisor_inbound_take_recommendations = lambda _sha: []
+        planner.validate_advisor_result = lambda _sha, result: result
+        planner._write_advisor_error_diagnostic = lambda *args: None
+        class Client:
+            last_telemetry = None
+            def advise(self, *args):
+                self.last_telemetry = {"prompt_eval_count": 32500}
+                return {"decision": "TAKE"}
+        with self.assertRaisesRegex(kbp.AdvisorError, "possible truncated") as caught:
+            planner._advisor_call_with_retries(Client(), "prompt", sha, self.packet())
+        self.assertEqual(caught.exception.kind, "context-limit")
+
+    def test_benchmark_reads_saved_plan_without_full_planner_collection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            sha = "a" * 40
+            plan = tmp / "plan.json"
+            plan.write_text(json.dumps({
+                "base": "v6.19", "target": "v7.0", "downstream": "base",
+                "paths": ["arch/arm64"], "order": [sha],
+                "commits": {sha: {"subject": "board", "direct": True,
+                                  "files": ["arch/arm64/boot/dts/test.dts"],
+                                  "advisor_decision": "TAKE",
+                                  "advisor_prerequisite_evidence": [],
+                                  "advisor_prerequisites": []}},
+            }))
+            target = tmp / "results.jsonl"
+            mock_result = {"decision": "TAKE", "rationale": "matches",
+                           "prerequisite_evidence_ids": [],
+                           "inbound_prerequisite_assessments": [], "risks": []}
+            with mock.patch.object(kbp.Git, "run", return_value="kernel evidence"), \
+                 mock.patch.object(kbp.OllamaAdvisor, "advise", return_value=mock_result), \
+                 mock.patch.object(kbp.Planner, "__init__", side_effect=AssertionError(
+                     "benchmark must not initialize planner")):
+                rc = kbp.main(["--advisor-benchmark-plan", str(plan),
+                    "--benchmark-output", str(target),
+                    "--advisor-model", "kernel-planner:32k",
+                    "--advisor-commit", sha[:12], "--repo", str(tmp)])
+            self.assertEqual(rc, 0)
+            record = json.loads(target.read_text().splitlines()[0])
+            self.assertEqual(record["status"], "ok")
+            self.assertTrue(record["agrees_with_baseline"])
+            self.assertIn("reconstructed-from-JSON", record["benchmark_packet"])
+
+
+class AdvisorPolicy0418Tests(unittest.TestCase):
+    """Policy remediation must not invent a TAKE or suppress technical risk."""
+
+    @staticmethod
+    def original_bad_review():
+        return {
+            "decision": "REVIEW",
+            "rationale": (
+                "The ArmSoM LM7 SoM has no concrete proof that it is an "
+                "officially supported product platform in RHEL 10. A manual "
+                "review of potential integration risks is appropriate."
+            ),
+            "risks": [],
+        }
+
+    def test_policy_only_product_review_detected(self):
+        self.assertTrue(kbp.policy_only_review_objection(self.original_bad_review()))
+        common_of_fdt = {
+            "decision": "REVIEW", "risks": [],
+            "rationale": (
+                "Changes to early_init_dt_scan have no concrete evidence "
+                "that they are necessary or beneficial for the supported "
+                "architectures. Manual review is required."
+            ),
+        }
+        self.assertTrue(kbp.policy_only_review_objection(common_of_fdt))
+
+    def test_concrete_technical_issue_does_not_trigger_policy_retry(self):
+        response = self.original_bad_review()
+        response["rationale"] += " The include has an unresolved symbol dependency."
+        self.assertFalse(kbp.policy_only_review_objection(response))
+        response["rationale"] = "The board uses an undefined symbol X."
+        self.assertFalse(kbp.policy_only_review_objection(response))
+        response["decision"] = "TAKE"
+        response["rationale"] = self.original_bad_review()["rationale"]
+        self.assertFalse(kbp.policy_only_review_objection(response))
+
+    def test_model_policy_review_gets_one_targeted_retry(self):
+        sha = "a" * 40
+        planner = object.__new__(kbp.Planner)
+        planner.nodes = {sha: kbp.CommitNode(sha, "ArmSoM LM7")}
+        planner.args = types.SimpleNamespace(
+            advisor_retries=2, advisor_retry_delay=0,
+            advisor_context_tokens=32768, advisor_output_reserve=1024)
+        planner.advisor_calls = 0
+        planner.advisor_retries_used = 0
+        planner.advisor_prerequisite_evidence = lambda _sha: []
+        planner.advisor_inbound_take_recommendations = lambda _sha: []
+        planner.validate_advisor_result = lambda _sha, raw: raw
+        planner._write_advisor_error_diagnostic = lambda *args: None
+        planner.info = lambda _line: None
+        class FakeOllama:
+            last_telemetry = None
+            def __init__(self): self.prompts = []
+            def advise(self, prompt, packet, schema):
+                self.prompts.append(prompt)
+                return (AdvisorPolicy0418Tests.original_bad_review()
+                        if len(self.prompts) == 1 else
+                        {"decision": "TAKE", "rationale": "In-scope arm64 support",
+                         "risks": []})
+        client = FakeOllama()
+        packet = {"commit": {"sha": sha}}
+        result = planner._advisor_call_with_retries(client, "BASE PROMPT", sha, packet)
+        self.assertEqual(result["decision"], "TAKE")
+        self.assertEqual(len(client.prompts), 2)
+        self.assertEqual(client.prompts[0], "BASE PROMPT")
+        self.assertIn("POLICY RECHECK", client.prompts[1])
+        self.assertEqual(planner.advisor_retries_used, 1)
+
+    def test_repeated_unsupported_product_review_fails_closed(self):
+        sha = "b" * 40
+        planner = object.__new__(kbp.Planner)
+        planner.nodes = {sha: kbp.CommitNode(sha, "board")}
+        planner.args = types.SimpleNamespace(
+            advisor_retries=5, advisor_retry_delay=0,
+            advisor_context_tokens=0, advisor_output_reserve=1024)
+        planner.advisor_calls = planner.advisor_retries_used = 0
+        planner.advisor_prerequisite_evidence = lambda _sha: []
+        planner.advisor_inbound_take_recommendations = lambda _sha: []
+        planner.validate_advisor_result = lambda _sha, raw: raw
+        planner._write_advisor_error_diagnostic = lambda *args: None
+        planner.info = lambda _line: None
+        class BadOllama:
+            def __init__(self): self.calls = 0
+            def advise(self, *args):
+                self.calls += 1
+                return AdvisorPolicy0418Tests.original_bad_review()
+        client = BadOllama()
+        with self.assertRaises(kbp.AdvisorError) as caught:
+            planner._advisor_call_with_retries(client, "prompt", sha, {})
+        self.assertEqual(caught.exception.kind, "policy-review")
+        self.assertEqual(client.calls, 2)
+
+    def test_policy_guard_does_not_override_valid_technical_review(self):
+        result = {"decision": "REVIEW", "rationale": (
+            "The commit introduces a new DTSI include but its provider "
+            "header is missing from the selected tree."), "risks": []}
+        self.assertFalse(kbp.policy_only_review_objection(result))
+
+    def test_prompt_has_updated_policy_and_cache_version(self):
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "14")
+        prompt = kbp.Planner.advisor_system_prompt(None)
+        self.assertIn("SKIP or REVIEW merely because", prompt)
+        self.assertIn("unresolved technical or dependency question", prompt)
+
+
+class AdvisorEvidence0418Tests(unittest.TestCase):
+    def test_compact_encoding_matches_model_payload(self):
+        packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "+x" * 300}}
+        wire = kbp.serialize_advisor_packet(packet)
+        self.assertNotIn('"commit": {', wire)
+        self.assertEqual(json.loads(wire), packet)
+        self.assertLess(len(wire), len(json.dumps(packet, indent=2)))
+        self.assertLess(kbp.advisor_request_size("prompt", packet, {}), 1250)
+
+    def test_duplicate_consumed_objects_are_omitted_but_evidence_preserved(self):
+        evidence = [{"evidence_id": "ev-binding", "peer_sha": "b" * 40,
+                     "object": "armsom,sige5", "detail": "X" * 2000}]
+        packet = {"commit": {
+            "sha": "a" * 40, "patch_excerpt": "+foo",
+            "same_series_consumed_objects": evidence,
+            "eligible_prerequisite_evidence": evidence,
+            "actual_inbound_take_prerequisites": [],
+            "deterministic_consumer_context": {"consumers": []},
+        }}
+        before = json.dumps(packet)
+        size_without_duplicate = kbp.advisor_request_size(
+            "prompt", {"commit": {k: v for k, v in packet["commit"].items()
+                if k != "same_series_consumed_objects"}}, {})
+        output, meta = kbp.budget_advisor_packet(packet, "prompt", {},
+                                                  size_without_duplicate + 320)
+        self.assertEqual(output["commit"]["eligible_prerequisite_evidence"], evidence)
+        self.assertNotIn("same_series_consumed_objects", output["commit"])
+        self.assertIn("duplicate-consumed-object-evidence", meta["omitted"])
+        self.assertEqual(before, json.dumps(packet))
+
+    def test_benchmark_reference_prioritizes_disagreements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            a, b = "a" * 40, "b" * 40
+            def record(sha, decision):
+                return {"subject": "board", "direct": True,
+                        "files": ["arch/arm64/boot/dts/board.dts"],
+                        "advisor_decision": decision,
+                        "advisor_prerequisite_evidence": [],
+                        "advisor_prerequisites": []}
+            primary = {"base": "v6.19", "target": "v7.0", "downstream": "base",
+                       "paths": ["arch/arm64"], "order": [a, b],
+                       "commits": {a: record(a, "TAKE"), b: record(b, "REVIEW")}}
+            reference = {"target": "v7.0", "downstream": "base",
+                         "commits": {a: record(a, "TAKE"), b: record(b, "TAKE")}}
+            (path / "run21.json").write_text(json.dumps(primary))
+            (path / "run20.json").write_text(json.dumps(reference))
+            response = {"decision": "TAKE", "rationale": "in scope",
+                        "prerequisite_evidence_ids": [],
+                        "inbound_prerequisite_assessments": [], "risks": []}
+            with mock.patch.object(kbp.Git, "run", return_value="patch") as run, \
+                 mock.patch.object(kbp.OllamaAdvisor, "advise", return_value=response):
+                code = kbp.main([
+                    "--advisor-benchmark-plan", str(path / "run21.json"),
+                    "--benchmark-reference-plan", str(path / "run20.json"),
+                    "--advisor-model", "kernel-planner:32k",
+                    "--advisor-limit", "1", "--benchmark-output", str(path / "out.jsonl"),
+                    "--repo", str(path)])
+            self.assertEqual(code, 0)
+            lines = (path / "out.jsonl").read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            entry = json.loads(lines[0])
+            self.assertEqual(entry["sha"], b)
+            self.assertEqual(entry["reference_decision"], "TAKE")
+            self.assertEqual(entry["baseline_decision"], "REVIEW")
+            self.assertTrue(entry["agrees_with_reference"])

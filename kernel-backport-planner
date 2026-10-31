@@ -41,8 +41,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.16"
-ADVISOR_PROMPT_VERSION = "13"
+VERSION = "0.4.18"
+ADVISOR_PROMPT_VERSION = "14"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -452,6 +452,69 @@ def normalize_http_base_url(value: str) -> str:
     return value
 
 
+# These patterns diagnose a narrow failure observed with small local
+# advisors. A model repeatedly treated missing product *endorsement* as a
+# blocker, contrary to the explicit upstream-convergence policy. This check
+# never changes a decision to TAKE; it only requests a policy-aware retry.
+_PRODUCT_SUPPORT_OBJECTION = re.compile(
+    r"(?:official(?:ly)?\s+supported|supported\s+product\s+platform|"
+    r"product\s+(?:support|target|relevance)|"
+    r"(?:necessary|beneficial|relevant)\s+for\s+(?:the\s+)?(?:specific\s+)?"
+    r"(?:product|supported\s+architectures?|RHEL|CS10)|"
+    r"lack\s+of\s+(?:proof|evidence)\s+(?:of|for)\s+(?:product|platform)\s+support)",
+    re.IGNORECASE,
+)
+_ABSENCE_OF_PRODUCT_EVIDENCE = re.compile(
+    r"(?:no|not|without|lack(?:s|ing)?|insufficient|absen(?:t|ce)|"
+    r"does\s+not\s+(?:provide|show|demonstrate|establish)|"
+    r"cannot\s+(?:verify|establish|confirm)|unclear|uncertain|"
+    r"fails\s+to\s+(?:show|establish|demonstrate))",
+    re.IGNORECASE,
+)
+# If a response names an actual technical blocker, do not classify it as a
+# policy-only objection. Some wording may still warrant human inspection.
+_CONCRETE_TECHNICAL_OBJECTION = re.compile(
+    r"(?:unresolved\s+(?:symbol|include|header|reference|dependency|binding)|"
+    r"(?:missing|undefined)\s+(?:symbol|header|include|function|provider)|"
+    r"(?:incompatible|incorrect)\s+(?:API|ABI|interface|binding|type|layout)|"
+    r"(?:compile|build|link|runtime)\s+(?:failure|error)|"
+    r"(?:specific|demonstrated)\s+(?:semantic|integration|security|regression)\s+(?:risk|conflict)|"
+    r"breaks\s+(?:the\s+)?(?:build|ABI|API)|"
+    r"conflicts?\s+with\s+(?:the\s+)?(?:existing|downstream)\s+(?:implementation|API))",
+    re.IGNORECASE,
+)
+
+
+def policy_only_review_objection(result: dict) -> bool:
+    """Spot unsupported-product-review loops; never silently select TAKE.
+
+    Requires an absence-of-evidence claim about product support/relevance
+    without a specific technical blocker. Fail conservatively on mixed cases.
+    """
+    if result.get("decision") != "REVIEW":
+        return False
+    rationale = result.get("rationale", "")
+    if not isinstance(rationale, str):
+        return False
+    material = " ".join([rationale] + [r for r in result.get("risks", [])
+                                     if isinstance(r, str)])
+    return (bool(_PRODUCT_SUPPORT_OBJECTION.search(material))
+            and bool(_ABSENCE_OF_PRODUCT_EVIDENCE.search(material))
+            and not bool(_CONCRETE_TECHNICAL_OBJECTION.search(material)))
+
+
+def policy_retry_prompt(prompt: str) -> str:
+    """Give one bounded policy correction without touching candidate evidence."""
+    return (prompt + "\n\nPOLICY RECHECK: Your previous REVIEW was based on "
+            "missing affirmative product/hardware support or product benefit. "
+            "Our upstream-convergence policy explicitly rejects that as a "
+            "reason for REVIEW. Re-evaluate the SAME evidence. Choose TAKE "
+            "unless there is a specific, evidence-backed technical/semantic "
+            "uncertainty or concrete exclusion; if there is, name it "
+            "precisely. Do not invent hardware support or technical hazards. "
+            "Return the same JSON schema.\n")
+
+
 def parse_advisor_structured_content(content: str) -> dict:
     """Parse one structured advisor object with conservative wrapper tolerance.
 
@@ -517,7 +580,7 @@ class OllamaAdvisor:
                     "content": (
                         "Evaluate this kernel backport candidate. Return only the "
                         "structured response required by the schema.\n\n"
-                        + json.dumps(packet, indent=2, sort_keys=True)
+                        + serialize_advisor_packet(packet)
                     ),
                 },
             ],
@@ -590,6 +653,84 @@ class OllamaAdvisor:
         return result
 
 
+
+def serialize_advisor_packet(packet: dict) -> str:
+    """Stable, compact JSON for Ollama. Avoid whitespace-heavy prompt inflation."""
+    return json.dumps(packet, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":"))
+
+
+def advisor_request_size(system_prompt: str, packet: dict, schema: dict) -> int:
+    """Conservative character count for the Ollama request's content/schema.
+
+    This is NOT a tokenizer. A limit protects common long packets, but cannot
+    guarantee a 32K model context will fit. Callers must check actual tokens.
+    """
+    return (len(system_prompt) + len(serialize_advisor_packet(packet))
+            + len(json.dumps(schema, sort_keys=True, ensure_ascii=True)) + 512)
+
+
+def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
+                          limit: int) -> tuple[dict, dict]:
+    """Remove only optional context excerpts; keep all prerequisite evidence.
+
+    Never remove identifiers, binding/namespace evidence, commit changed paths,
+    the selected commit patch, or inbound TAKE recommendations. If those exceed
+    the budget, raise instead of risking a decision on incomplete evidence.
+    """
+    before = advisor_request_size(prompt, packet, schema)
+    meta = {"initial_chars": before, "final_chars": before,
+            "limit_chars": limit, "omitted": []}
+    if not limit or before <= limit:
+        return packet, meta
+    output = json.loads(json.dumps(packet))
+    commit = output["commit"]
+    # This legacy field duplicates eligible_prerequisite_evidence verbatim.
+    # Keep its full authoritative counterpart; omit the redundant copy only
+    # when doing so helps fit an otherwise oversized request.
+    if ("same_series_consumed_objects" in commit and
+            commit["same_series_consumed_objects"] ==
+            commit.get("eligible_prerequisite_evidence")):
+        del commit["same_series_consumed_objects"]
+        meta["omitted"].append("duplicate-consumed-object-evidence")
+    # These are provenance/context excerpts, not eligible prerequisite evidence.
+    excerpts = []
+    for peer in commit.get("same_series", []):
+        if isinstance(peer, dict) and peer.get("patch_excerpt"):
+            excerpts.append((peer, "patch_excerpt", "series-peer-diff"))
+    for peer in (commit.get("deterministic_consumer_context", {})
+                 .get("consumers", [])):
+        if isinstance(peer, dict) and peer.get("patch_excerpt"):
+            excerpts.append((peer, "patch_excerpt", "consumer-context-diff"))
+    if commit.get("message"):
+        excerpts.append((commit, "message", "commit-message"))
+    for record, key, name in excerpts:
+        if advisor_request_size(prompt, output, schema) <= limit:
+            break
+        record[key] = "[OPTIONAL EXCERPT OMITTED FOR CONTEXT BUDGET]"
+        meta["omitted"].append(name)
+    after = advisor_request_size(prompt, output, schema)
+    meta["final_chars"] = after
+    if after > limit:
+        raise AdvisorError(
+            f"required advisor evidence exceeds character budget ({after} > {limit}); "
+            "manual REVIEW required (no model request was sent)",
+            kind="evidence-budget", retryable=False,
+        )
+    output["evidence_budget_notice"] = (
+        "Some optional source excerpts were omitted to fit the request. "
+        "If the remaining evidence is insufficient, answer REVIEW."
+    )
+    final = advisor_request_size(prompt, output, schema)
+    meta["final_chars"] = final
+    if final > limit:
+        raise AdvisorError(
+            "advisor budget notice exceeds remaining request capacity; manual REVIEW required",
+            kind="evidence-budget", retryable=False,
+        )
+    return output, meta
+
+
 class Planner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -637,6 +778,7 @@ class Planner:
         self.advisor_calls = 0
         self.advisor_cache_hits = 0
         self.advisor_retries_used = 0
+        self.advisor_policy_rechecks = 0
         self.advisor_failures = 0
         self.advisor_failure_kinds: collections.Counter[str] = collections.Counter()
         self.advisor_reconsiderations = 0
@@ -1978,15 +2120,24 @@ you do not execute Git operations and you must not invent evidence.
 Evidence discipline:
 - Treat repository/tool data in the packet as verified evidence. Clearly base your decision on it.
 - Do not invent commits, symbols, functions, source paths, product support, command results, or tests.
-- If the supplied evidence is insufficient for a product-policy or dependency judgment, use REVIEW.
+- Use REVIEW only for a *specific* unresolved technical or dependency question
+  that could change selection or make this commit unsafe. Name that question in
+  the rationale, with the missing evidence. Ordinary lack of product relevance
+  or affirmative hardware support is NOT material uncertainty here.
 
 Maintenance policy:
 - Upstream convergence is an explicit maintenance goal. Prefer TAKE for commits in the requested
   focus area, required common/supporting code, and clean upstream context when there is no concrete
   reason to exclude them. Immediate end-user feature relevance is not required.
+- For a change in a supported architecture or a supporting dependency, start with TAKE.
+  Ask whether the supplied evidence establishes a *concrete exclusion* or a
+  specific unresolved semantic hazard. "Does this board have official RHEL
+  support?" and "Is this feature beneficial for a product SKU?" are NOT
+  questions that need answering for upstream convergence.
 - When commit.default_policy_bias is TAKE_UNLESS_CONCRETE_EXCLUSION, TAKE is the default. Do NOT
-  SKIP merely because the packet lacks evidence that a particular board, laptop, SoC, or peripheral
-  is an officially supported product platform. Absence of such product-target evidence is not an exclusion reason.
+  SKIP or REVIEW merely because the packet lacks evidence that a particular board, laptop, SoC,
+  or peripheral is an officially supported product platform. Absence of such product-target evidence is not
+  a technical uncertainty and is not an exclusion reason.
   Apply this uniformly to direct commits in any requested focus path; do not give
   ARM64, Device Tree, or any other subsystem a special policy merely because it appears in examples.
 - When commit.default_policy_bias is SKIP_UNSUPPORTED_ARCHITECTURE_ONLY, the candidate changes only
@@ -2030,6 +2181,17 @@ Maintenance policy:
   code without a real cross-tree dependency, a known absent/inappropriate feature, obsolete/reverted
   code, or meaningful integration/risk cost that outweighs convergence. Do not invent product
   hardware-support policy that is not present in the evidence.
+- REVIEW must identify a specific semantic, build, dependency, safety, or
+  compatibility question that cannot be resolved from the supplied evidence.
+  Generic phrases like "requires manual review", "potential integration risks",
+  "not proven necessary", and "not officially supported" do NOT qualify.
+- Example: A new arm64 board DTS with no proven product SKU support and no
+  concrete technical exclusion is TAKE, not REVIEW.
+- Example: A shared OF/FDT API adjustment affecting supported architectures
+  is TAKE despite no product-specific benefit statement, unless the evidence
+  shows a particular technical hazard.
+- Example: A consumer uses a symbol whose provider's namespace is uncertain;
+  that concrete unresolved relationship can justify REVIEW.
 - Use REVIEW when evidence is materially ambiguous. Do not turn uncertainty into confident prose.
 - replay: conflict is an integration-cost signal, not by itself a reason for REVIEW or SKIP. Judge
   whether the commit belongs in the desired backport independently from how hard it may be to apply.
@@ -2042,8 +2204,9 @@ Same-series prerequisite policy:
 - prerequisite_evidence_ids is evidence-bound. Every recommendation MUST be one evidence_id from
   commit.eligible_prerequisite_evidence. Do not return peer SHAs or prerequisite prose; the planner
   deterministically maps each evidence ID back to its peer commit and evidence record.
-- commit.eligible_prerequisite_evidence / commit.same_series_consumed_objects are deterministic
-  lexical evidence produced by the planner. Records can include selected_path/provider_path and
+- commit.eligible_prerequisite_evidence is deterministic lexical evidence
+  produced by the planner. An optional same_series_consumed_objects field may
+  duplicate it and can be omitted solely to conserve context. Records can include selected_path/provider_path and
   selected_architecture/provider_architecture so architecture-local name matches are not mistaken
   for shared prerequisites. Evidence kinds can include DTS labels, macros,
   function definitions/declarations, included headers, compatible strings matched to DT bindings,
@@ -2327,6 +2490,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             self.advisor_inbound_take_recommendations(sha),
         )
         last_error: AdvisorError | None = None
+        policy_rechecks = 0
         for attempt in range(retries + 1):
             self.nodes[sha].advisor_attempts = attempt + 1
             self.advisor_calls += 1
@@ -2338,8 +2502,30 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 # A mock or future client may not expose Ollama measurements.
                 if hasattr(client, "last_telemetry"):
                     client.last_telemetry = None
-                raw = client.advise(prompt, packet, schema)
+                request_prompt = (policy_retry_prompt(prompt)
+                                  if last_error is not None and
+                                  last_error.kind == "policy-review" else prompt)
+                raw = client.advise(request_prompt, packet, schema)
                 validated = self.validate_advisor_result(sha, raw)
+                # Guard against a recurring policy misread by small models.
+                # Neither convert REVIEW to TAKE nor suppress concrete risks.
+                if policy_only_review_objection(validated):
+                    raise AdvisorError(
+                        "REVIEW cites absent official platform/product benefit "
+                        "without a specific technical uncertainty; recheck "
+                        "upstream-convergence policy",
+                        kind="policy-review", retryable=True)
+                window = getattr(self.args, "advisor_context_tokens", 0)
+                reserve = getattr(self.args, "advisor_output_reserve", 1024)
+                used = (getattr(client, "last_telemetry", None) or {}).get(
+                    "prompt_eval_count")
+                if (window and isinstance(used, int)
+                        and used >= window - reserve):
+                    raise AdvisorError(
+                        f"Ollama prompt_eval_count={used} approaches the "
+                        f"configured {window}-token context; possible truncated "
+                        "evidence, manual REVIEW required",
+                        kind="context-limit", retryable=False)
                 request_ok = True
                 request_finished = time.perf_counter()
                 return validated
@@ -2347,8 +2533,17 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 request_finished = time.perf_counter()
                 last_error = exc
                 self._write_advisor_error_diagnostic(sha, attempt + 1, exc, raw)
-                if not exc.retryable or attempt >= retries:
+                if exc.kind == "policy-review":
+                    policy_rechecks += 1
+                if (not exc.retryable or attempt >= retries or
+                        (exc.kind == "policy-review" and policy_rechecks > 1)):
                     raise
+                if exc.kind == "policy-review":
+                    self.advisor_policy_rechecks = getattr(
+                        self, "advisor_policy_rechecks", 0) + 1
+                    performance = getattr(self, "performance", None)
+                    if performance:
+                        performance.event("advisor_policy_recheck", sha=sha[:12])
                 self.advisor_retries_used += 1
                 self.info(
                     f"    advisor {exc.kind}; retry {attempt + 1}/{retries}: {exc}"
@@ -2536,6 +2731,32 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 f"{self._one_line(policy_result['rationale'])}"
             )
             return
+        node.advisor_budget = None
+        limit = getattr(self.args, "advisor_max_request_chars", 0)
+        if limit:
+            schema = advisor_response_schema(
+                self.advisor_prerequisite_evidence(sha),
+                self.advisor_inbound_take_recommendations(sha),
+            )
+            try:
+                # Leave room for one explicit policy correction on retry.
+                packet, budget = budget_advisor_packet(packet, prompt, schema,
+                                                       max(1, limit - 600))
+                budget["limit_chars"] = limit
+                node.advisor_budget = budget
+                if budget["omitted"]:
+                    self.info(f"    advisor packet budget: {budget['initial_chars']} -> "
+                              f"{budget['final_chars']} chars; "
+                              f"{len(budget['omitted'])} optional excerpts omitted")
+                if getattr(self, "performance", None):
+                    self.performance.event(
+                        "advisor_packet_budget", sha=sha[:12], **budget)
+            except AdvisorError as exc:
+                node.advisor_budget = {"limit_chars": limit, "overflow": True,
+                                       "error": str(exc)}
+                self._advisor_note_failure(node, exc)
+                self.info(f"    advisor {exc.kind}: {exc}")
+                return
         cache_key = self.advisor_cache_key(sha, packet)
         cached = None if self.args.no_advisor_cache else self.advisor_cache.get(cache_key)
         try:
@@ -4014,7 +4235,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             )
             lines.append(
                 f"advisor-run:  {getattr(self, 'advisor_calls', 0)} model call(s), "
-                f"{getattr(self, 'advisor_retries_used', 0)} retry/retries, "
+                f"{getattr(self, 'advisor_retries_used', 0)} retry/retries "
+                f"({getattr(self, 'advisor_policy_rechecks', 0)} policy rechecks), "
                 f"{getattr(self, 'advisor_cache_hits', 0)} cache hit(s), "
                 f"{getattr(self, 'advisor_reconsiderations', 0)} reconsideration(s), "
                 f"{getattr(self, 'advisor_error_log_entries', 0)} diagnostic error record(s)"
@@ -4288,6 +4510,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "prompt_version": ADVISOR_PROMPT_VERSION,
                 "model_calls": getattr(self, "advisor_calls", 0),
                 "retries_used": getattr(self, "advisor_retries_used", 0),
+                "policy_rechecks": getattr(self, "advisor_policy_rechecks", 0),
                 "reconsiderations": getattr(self, "advisor_reconsiderations", 0),
                 "failures": getattr(self, "advisor_failures", 0),
                 "failure_kinds": dict(getattr(self, "advisor_failure_kinds", {})),
@@ -4332,6 +4555,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_error": n.advisor_error,
                     "advisor_error_kind": n.advisor_error_kind,
                     "advisor_attempts": n.advisor_attempts,
+                    "advisor_budget": getattr(n, "advisor_budget", None),
                     "symbol_dependency_proofs": n.symbol_dependency_proofs,
                 }
                 for sha, n in self.nodes.items()
@@ -4471,6 +4695,193 @@ def ensure_package_destinations_available(prefix: Path) -> None:
             raise ValueError(f"automatic package output already exists: {path}")
     if not prefix.parent.is_dir():
         raise ValueError(f"output directory does not exist: {prefix.parent}")
+
+
+def run_advisor_benchmark(args: argparse.Namespace) -> int:
+    """Run small model checks from a saved plan, without planner collection.
+
+    Reconstructed packets include the saved provenance plus a fresh local Git
+    excerpt for each SHA. They are NOT exact replay of the original prompts;
+    this tests transport/JSON/speed and flags decisions worth reviewing.
+    """
+    plan_path = Path(args.advisor_benchmark_plan).expanduser().resolve()
+    destination = Path(args.benchmark_output).expanduser().absolute()
+    if os.path.lexists(destination):
+        print(f"benchmark output already exists: {destination}", file=sys.stderr)
+        return 1
+    try:
+        plan = json.loads(plan_path.read_text())
+        commits = plan["commits"]
+        ordered = [sha for sha in plan["order"] if sha in commits]
+        if not isinstance(commits, dict) or not ordered:
+            raise ValueError("missing commit records or order")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"cannot load benchmark plan: {exc}", file=sys.stderr)
+        return 1
+    reference_commits = {}
+    if args.benchmark_reference_plan:
+        try:
+            reference = json.loads(Path(args.benchmark_reference_plan).expanduser().read_text())
+            if (reference.get("downstream") != plan.get("downstream") or
+                    reference.get("target") != plan.get("target")):
+                raise ValueError("benchmark reference baseline/target differs")
+            reference_commits = reference["commits"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"cannot load benchmark reference plan: {exc}", file=sys.stderr)
+            return 1
+    if args.advisor_commit:
+        selected = []
+        for name in args.advisor_commit:
+            matches = [sha for sha in ordered if sha.startswith(name.lower())]
+            if len(matches) != 1:
+                print(f"benchmark commit {name}: expected one match, got {len(matches)}",
+                      file=sys.stderr)
+                return 1
+            if matches[0] not in selected:
+                selected.append(matches[0])
+    else:
+        # With a reference plan, prioritize disagreement cases without a
+        # multi-hour repository collection; otherwise use the old smoke test.
+        disagreements = [sha for sha in ordered if sha in reference_commits and
+            commits[sha].get("advisor_decision") !=
+            reference_commits[sha].get("advisor_decision")]
+        interesting = [sha for sha in ordered if
+                       commits[sha].get("advisor_prerequisites") or
+                       commits[sha].get("advisor_decision") != "TAKE"]
+        selected = list(dict.fromkeys([*disagreements, *interesting, *ordered]))
+    selected = selected[:args.advisor_limit or 10]
+    git = Git(Path(args.repo).resolve(), args.debug)
+    client = OllamaAdvisor(args.advisor_model, args.advisor_base_url,
+                           args.advisor_timeout, args.advisor_temperature,
+                           args.advisor_keep_alive, args.debug)
+    # Same advisor policy prompt, but reduced context; never claim equivalence.
+    prompt = Planner.advisor_system_prompt(None)
+    errors = 0
+    with destination.open("x", encoding="utf-8", buffering=1) as output:
+        for i, sha in enumerate(selected, 1):
+            record = commits[sha]
+            before = time.perf_counter()
+            entry = {"sha": sha, "subject": record.get("subject"),
+                     "baseline_decision": record.get("advisor_decision"),
+                     "reference_decision": (
+                         reference_commits[sha].get("advisor_decision")
+                         if sha in reference_commits else None),
+                     "benchmark_packet": "reconstructed-from-JSON-and-local-Git",
+                     "model": args.advisor_model}
+            try:
+                message = git.run(["show", "-s", "--format=%B", sha])
+                patch = git.run(["show", "--format=", "--no-ext-diff", sha])
+                evidence = record.get("advisor_prerequisite_evidence") or []
+                inbound = record.get("advisor_recommended_by") or []
+                if not isinstance(evidence, list) or not isinstance(inbound, list):
+                    raise ValueError("invalid evidence collection in saved plan")
+                packet = {
+                    "planning_context": {
+                        "base": plan.get("base"), "target": plan.get("target"),
+                        "downstream": plan.get("downstream"),
+                        "focus_paths": plan.get("paths", []),
+                        "product": {"product": "rhel10"},
+                        "policy": "Follow planner evidence and use REVIEW when unclear",
+                    },
+                    "commit": {
+                        "sha": sha, "subject": record.get("subject"),
+                        "message": message[:args.advisor_max_message_chars],
+                        "patch_excerpt": patch[:args.advisor_max_diff_chars],
+                        "changed_files": record.get("files", []),
+                        "direct": record.get("direct", False),
+                        "dependency_kind": record.get("dependency_kind"),
+                        "evidence": record.get("evidence", []),
+                        "replay": record.get("replay"),
+                        "conflict_files": record.get("conflict_files", []),
+                        "eligible_prerequisite_evidence": evidence,
+                        "same_series_consumed_objects": evidence,
+                        "actual_inbound_take_prerequisites": inbound,
+                        "actual_inbound_take_prerequisite_count": len(inbound),
+                        "default_policy_bias": (
+                            "TAKE_UNLESS_CONCRETE_EXCLUSION" if record.get("direct")
+                            else "NEUTRAL"),
+                    },
+                }
+                schema = advisor_response_schema(evidence, inbound)
+                # Leave a little room for one bounded policy-correction prompt.
+                cap = (max(1, args.advisor_max_request_chars - 600)
+                       if args.advisor_max_request_chars else 0)
+                packet, budget = budget_advisor_packet(
+                    packet, prompt, schema, cap)
+                entry["request_chars"] = budget["final_chars"]
+                entry["optional_excerpts_omitted"] = budget["omitted"]
+                result = client.advise(prompt, packet, schema)
+                entry["policy_recheck"] = False
+                if policy_only_review_objection(result):
+                    entry["policy_recheck"] = True
+                    result = client.advise(policy_retry_prompt(prompt), packet, schema)
+                    if policy_only_review_objection(result):
+                        raise AdvisorError(
+                            "model still recommends REVIEW solely for absent product "
+                            "support after corrective retry", kind="policy-review",
+                            retryable=False)
+                used = (client.last_telemetry or {}).get("prompt_eval_count")
+                if (args.advisor_context_tokens and isinstance(used, int) and
+                        used >= args.advisor_context_tokens - args.advisor_output_reserve):
+                    raise AdvisorError("Ollama prompt token count near context limit; "
+                                       "possible truncation", kind="context-limit",
+                                       retryable=False)
+                decision = result.get("decision")
+                ids = result.get("prerequisite_evidence_ids")
+                assessments = result.get("inbound_prerequisite_assessments")
+                risks = result.get("risks")
+                if (decision not in ("TAKE", "SKIP", "REVIEW") or
+                    not isinstance(result.get("rationale"), str) or
+                    not result["rationale"].strip() or
+                    not isinstance(ids, list) or not isinstance(assessments, list) or
+                    not isinstance(risks, list) or not all(isinstance(x, str) for x in risks)):
+                    raise AdvisorError("invalid benchmark structured fields",
+                                       kind="invalid-response", retryable=False)
+                allowed_ids = {e["evidence_id"] for e in evidence}
+                if len(ids) != len(set(ids)) or not set(ids) <= allowed_ids:
+                    raise AdvisorError("invalid prerequisite evidence IDs",
+                                       kind="invalid-prerequisite", retryable=False)
+                inbound_ids = {e["evidence_id"] for e in inbound}
+                returned_ids = [x.get("evidence_id") for x in assessments
+                                if isinstance(x, dict)]
+                if (len(returned_ids) != len(assessments) or
+                    len(returned_ids) != len(set(returned_ids)) or
+                    set(returned_ids) != inbound_ids or
+                    any(x.get("disposition") not in ("REQUIRED", "NOT_REQUIRED")
+                        or not isinstance(x.get("reason"), str) or
+                        not x["reason"].strip() for x in assessments) or
+                    (decision == "SKIP" and any(x["disposition"] == "REQUIRED"
+                                                 for x in assessments))):
+                    raise AdvisorError("invalid inbound prerequisite assessments",
+                                       kind="invalid-response", retryable=False)
+                selected_peers = {e["peer_sha"] for e in evidence
+                                  if e["evidence_id"] in ids}
+                reference_peers = {e["sha"] for e in
+                                   record.get("advisor_prerequisites", [])}
+                entry.update(status="ok", decision=decision,
+                             agrees_with_baseline=decision == entry["baseline_decision"],
+                             agrees_with_reference=(
+                                 decision == entry["reference_decision"]
+                                 if entry["reference_decision"] is not None else None),
+                             selected_prerequisite_peers=sorted(selected_peers),
+                             reference_prerequisite_peers=sorted(reference_peers),
+                             prerequisite_peers_agree=selected_peers == reference_peers,
+                             rationale=result["rationale"], risks=risks,
+                             ollama=getattr(client, "last_telemetry", None))
+            except (GitError, AdvisorError, OSError, ValueError, KeyError) as exc:
+                errors += 1
+                entry.update(status="error", error=str(exc))
+            entry["elapsed_seconds"] = round(time.perf_counter() - before, 3)
+            output.write(json.dumps(entry, sort_keys=True) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+            print(f"  benchmark {i}/{len(selected)}: {sha[:12]} "
+                  f"{entry['status']} {entry.get('decision', '')} "
+                  f"{entry['elapsed_seconds']:.1f}s")
+    print(f"Benchmark saved: {destination}; errors={errors}; "
+          "reconstructed evidence is NOT a full planner validation")
+    return 2 if errors else 0
+
 
 
 def run_planner(args: argparse.Namespace) -> int:
@@ -4635,6 +5046,33 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--no-advisor-cache", action="store_true",
         help="disable persistent advisor response caching",
     )
+    p.add_argument(
+        "--advisor-context-tokens", type=int, default=0,
+        help="optional expected Ollama context size; reject responses with prompt "
+             "token counts too near this limit (0=disabled)",
+    )
+    p.add_argument(
+        "--advisor-output-reserve", type=int, default=1024,
+        help="context token allowance for JSON output (default: 1024)",
+    )
+    p.add_argument(
+        "--advisor-max-request-chars", type=int, default=0,
+        help="optional complete advisor request character cap (0=disabled); "
+             "48000 is a conservative starting point for a 32K model, NOT a token limit",
+    )
+    p.add_argument(
+        "--advisor-benchmark-plan", metavar="PLAN.json",
+        help="benchmark selected commits from a completed JSON plan without full collection",
+    )
+    p.add_argument(
+        "--benchmark-reference-plan", metavar="PLAN.json",
+        help="optional second plan; prioritize decisions that disagree with "
+             "--advisor-benchmark-plan without repeating full collection",
+    )
+    p.add_argument(
+        "--benchmark-output", metavar="FILE.jsonl",
+        help="new JSONL output path for --advisor-benchmark-plan (will not overwrite)",
+    )
     p.add_argument("--advisor-max-message-chars", type=int, default=6000)
     p.add_argument("--advisor-max-diff-chars", type=int, default=12000)
     p.add_argument("--advisor-max-peer-diff-chars", type=int, default=6000)
@@ -4663,6 +5101,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    if args.advisor_max_request_chars < 0:
+        p.error("--advisor-max-request-chars must be >= 0")
+    if args.advisor_context_tokens < 0 or args.advisor_output_reserve < 0:
+        p.error("--advisor-context-tokens and --advisor-output-reserve must be >= 0")
+    if args.advisor_context_tokens and (args.advisor_context_tokens <= args.advisor_output_reserve):
+        p.error("advisor context must exceed the reserved output tokens")
+    if args.advisor_limit is not None and args.advisor_limit < 1:
+        p.error("--advisor-limit must be >= 1")
+    if args.advisor_benchmark_plan:
+        if not args.advisor_model or not args.benchmark_output:
+            p.error("benchmark mode requires --advisor-model and --benchmark-output")
+        if args.update or args.output or args.json_output or args.package_results:
+            p.error("benchmark mode cannot update remotes or generate normal reports")
+        return args
+    if args.benchmark_output:
+        p.error("--benchmark-output requires --advisor-benchmark-plan")
+    if args.benchmark_reference_plan:
+        p.error("--benchmark-reference-plan requires --advisor-benchmark-plan")
     if args.package_results:
         if args.base or args.target or args.output or args.json_output:
             p.error("--package-results is a separate post-run operation")
@@ -4680,6 +5136,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.advisor_benchmark_plan:
+        return run_advisor_benchmark(args)
     if args.package_results:
         print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
         try:
