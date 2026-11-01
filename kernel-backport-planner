@@ -41,8 +41,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.18"
-ADVISOR_PROMPT_VERSION = "14"
+VERSION = "0.4.20"
+ADVISOR_PROMPT_VERSION = "16"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -311,6 +311,7 @@ class CommitNode:
     advisor_decision: str | None = None
     advisor_rationale: str | None = None
     advisor_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_binding_assessments: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_rejected_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_consumed_objects: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_recommended_by: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -368,6 +369,19 @@ ADVISOR_RESPONSE_SCHEMA = {
             "items": {"type": "string"},
             "uniqueItems": True,
         },
+        "binding_evidence_assessments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "disposition": {"type": "string", "enum": ["REQUIRED", "NOT_REQUIRED"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["evidence_id", "disposition", "reason"],
+                "additionalProperties": False,
+            },
+        },
         "inbound_prerequisite_assessments": {
             "type": "array",
             "items": {
@@ -385,7 +399,7 @@ ADVISOR_RESPONSE_SCHEMA = {
     },
     "required": [
         "decision", "rationale", "prerequisite_evidence_ids",
-        "inbound_prerequisite_assessments", "risks"
+        "binding_evidence_assessments", "inbound_prerequisite_assessments", "risks"
     ],
     "additionalProperties": False,
 }
@@ -411,6 +425,20 @@ def advisor_response_schema(
         prereqs["maxItems"] = len(evidence_ids)
     else:
         prereqs["maxItems"] = 0
+
+    bindings = schema["properties"]["binding_evidence_assessments"]
+    binding_ids = list(dict.fromkeys(
+        x["evidence_id"] for x in evidence
+        if x.get("kind") in ("compatible-binding", "dt-property-binding")
+    ))
+    if binding_ids:
+        bindings["items"]["properties"]["evidence_id"] = {
+            "type": "string", "enum": binding_ids
+        }
+        # SKIP/REVIEW decisions need no binding assessment; TAKE does.
+        bindings["maxItems"] = len(binding_ids)
+    else:
+        bindings["maxItems"] = 0
 
     inbound = schema["properties"]["inbound_prerequisite_assessments"]
     inbound_ids = list(dict.fromkeys(
@@ -513,6 +541,16 @@ def policy_retry_prompt(prompt: str) -> str:
             "uncertainty or concrete exclusion; if there is, name it "
             "precisely. Do not invent hardware support or technical hazards. "
             "Return the same JSON schema.\n")
+
+
+def binding_retry_prompt(prompt: str) -> str:
+    """Request missing binding dispositions without fabricating dependencies."""
+    return (prompt + "\n\nBINDING EVIDENCE RECHECK: For a TAKE decision, "
+            "assess EVERY compatible-binding and dt-property-binding evidence_id "
+            "as REQUIRED or NOT_REQUIRED with a concrete reason. Include REQUIRED "
+            "IDs in prerequisite_evidence_ids. If NOT_REQUIRED, explain why the "
+            "binding is dispensable for this patch; lack of official board support "
+            "is not an answer. Do not change Git evidence or invent dependencies.\n")
 
 
 def parse_advisor_structured_content(content: str) -> dict:
@@ -693,6 +731,17 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
             commit.get("eligible_prerequisite_evidence")):
         del commit["same_series_consumed_objects"]
         meta["omitted"].append("duplicate-consumed-object-evidence")
+    # Redundant identity/provenance indexes have authoritative counterparts
+    # in the per-evidence records and same-series context. Remove them only
+    # under budget pressure; never trim evidence IDs or selected patch bytes.
+    if (advisor_request_size(prompt, output, schema) > limit
+            and "eligible_prerequisite_peer_shas" in commit):
+        del commit["eligible_prerequisite_peer_shas"]
+        meta["omitted"].append("redundant-prerequisite-peer-index")
+    if (advisor_request_size(prompt, output, schema) > limit
+            and "all_missing_earlier_peer_shas" in commit):
+        del commit["all_missing_earlier_peer_shas"]
+        meta["omitted"].append("optional-earlier-peer-index")
     # These are provenance/context excerpts, not eligible prerequisite evidence.
     excerpts = []
     for peer in commit.get("same_series", []):
@@ -709,6 +758,34 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
             break
         record[key] = "[OPTIONAL EXCERPT OMITTED FOR CONTEXT BUDGET]"
         meta["omitted"].append(name)
+    # The consumer graph below is optional discovery provenance, NOT an
+    # actual_inbound_take_prerequisites recommendation. Its nested records can
+    # be enormous even after all optional patch excerpts have been removed.
+    # Keep the authoritative inbound recommendations and eligible evidence;
+    # remove only this independent, provenance-only context when necessary.
+    if advisor_request_size(prompt, output, schema) > limit:
+        context = commit.get("deterministic_consumer_context")
+        if isinstance(context, dict) and context.get("consumers"):
+            count = len(context["consumers"])
+            context["consumers"] = []
+            context["note"] = (
+                "Optional discovery provenance was omitted for request budget; "
+                "only actual_inbound_take_prerequisites lists actionable inbound "
+                "advisor recommendations."
+            )
+            meta["omitted"].append(f"optional-consumer-provenance:{count}")
+    # Large same-series summaries can repeat the authoritative evidence IDs,
+    # SHAs and changed paths in eligible_prerequisite_evidence. Retain the
+    # latter in full and only drop optional summary metadata, not source data.
+    if advisor_request_size(prompt, output, schema) > limit:
+        peers = commit.get("same_series")
+        if isinstance(peers, list):
+            for peer in peers:
+                if advisor_request_size(prompt, output, schema) <= limit:
+                    break
+                if isinstance(peer, dict) and "scope" in peer:
+                    del peer["scope"]  # changed_files remain in the same record
+                    meta["omitted"].append("optional-series-peer-scope")
     after = advisor_request_size(prompt, output, schema)
     meta["final_chars"] = after
     if after > limit:
@@ -717,17 +794,20 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
             "manual REVIEW required (no model request was sent)",
             kind="evidence-budget", retryable=False,
         )
-    output["evidence_budget_notice"] = (
-        "Some optional source excerpts were omitted to fit the request. "
-        "If the remaining evidence is insufficient, answer REVIEW."
-    )
+    # The full evidence still fits. A notice is useful but it is OPTIONAL:
+    # do not turn an otherwise valid packet into a REVIEW merely because
+    # adding the notice would push it across the configured ceiling.
+    notice = ("Some optional source excerpts were omitted to fit the request. "
+              "If the remaining evidence is insufficient, answer REVIEW.")
+    output["evidence_budget_notice"] = notice
     final = advisor_request_size(prompt, output, schema)
-    meta["final_chars"] = final
     if final > limit:
-        raise AdvisorError(
-            "advisor budget notice exceeds remaining request capacity; manual REVIEW required",
-            kind="evidence-budget", retryable=False,
-        )
+        del output["evidence_budget_notice"]
+        meta["notice_embedded"] = False
+        meta["final_chars"] = after
+    else:
+        meta["notice_embedded"] = True
+        meta["final_chars"] = final
     return output, meta
 
 
@@ -2216,6 +2296,19 @@ Same-series prerequisite policy:
   appearing only in binding YAML examples are documentation, not providers. Compatible-binding
   evidence follows the first, most-specific compatible in a DTS assignment and requires schema-like
   YAML additions rather than arbitrary mentions in examples or descriptions.
+- If commit.binding_conflict_context is present, another TAKE commit assessed
+  this exact binding relationship REQUIRED while this provider previously
+  assessed it NOT_REQUIRED. Reexamine the explicit evidence and report a
+  technically grounded inbound disposition. Do not assume an existing schema
+  defines the same compatible merely because the SoC family is supported.
+- For every compatible-binding or dt-property-binding evidence record on a TAKE,
+  return exactly one binding_evidence_assessments entry keyed by its evidence_id.
+  REQUIRED means the schema patch must accompany this commit for the chosen
+  integration scope, and its evidence_id MUST also be in prerequisite_evidence_ids.
+  NOT_REQUIRED means the binding is not necessary for this backport; give an
+  evidence-specific technical reason. "Not officially supported" and silence
+  are NOT valid reasons. Binding-schema completeness can matter even when dtc
+  itself does not require the binding. For SKIP/REVIEW, return an empty list.
 - Recommend a peer only when one of these evidence records is a real semantic prerequisite for the
   selected patch. Choose one strongest evidence record per peer. Do not recommend a peer merely
   because it is in commit.all_missing_earlier_peer_shas.
@@ -2312,6 +2405,62 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "reason": reason,
             })
 
+        # All binding evidence on a TAKE must be explicitly disposed of.
+        # A compatible binding is generally schema completeness rather than
+        # a hard dtc requirement, so NOT_REQUIRED is permitted with a reason.
+        binding_ids = {
+            item["evidence_id"] for item in evidence
+            if item["kind"] in ("compatible-binding", "dt-property-binding")
+        }
+        raw_binding = result.get("binding_evidence_assessments", [])
+        if not isinstance(raw_binding, list):
+            raise AdvisorError("binding evidence assessments must be an array",
+                               kind="invalid-response", retryable=True)
+        binding_assessments = []
+        used_binding_ids = set()
+        for item in raw_binding:
+            if not isinstance(item, dict):
+                raise AdvisorError("invalid binding evidence assessment",
+                                   kind="invalid-response", retryable=True)
+            evidence_id = item.get("evidence_id")
+            disposition = item.get("disposition")
+            reason = item.get("reason")
+            if (evidence_id not in binding_ids or evidence_id in used_binding_ids
+                    or disposition not in ("REQUIRED", "NOT_REQUIRED")
+                    or not isinstance(reason, str) or not reason.strip()):
+                raise AdvisorError("invalid/duplicate binding evidence disposition",
+                                   kind="invalid-response", retryable=True)
+            if (disposition == "NOT_REQUIRED"
+                    and _PRODUCT_SUPPORT_OBJECTION.search(reason)
+                    and _ABSENCE_OF_PRODUCT_EVIDENCE.search(reason)
+                    and not _CONCRETE_TECHNICAL_OBJECTION.search(reason)):
+                raise AdvisorError(
+                    "binding NOT_REQUIRED disposition relies only on missing "
+                    "official product support; give a technical reason",
+                    kind="binding-unassessed", retryable=True)
+            used_binding_ids.add(evidence_id)
+            binding_assessments.append({
+                "evidence_id": evidence_id,
+                "disposition": disposition,
+                "reason": reason.strip(),
+            })
+        if decision == "TAKE" and used_binding_ids != binding_ids:
+            raise AdvisorError(
+                "TAKE omits explicit binding evidence dispositions: "
+                + ", ".join(sorted(binding_ids - used_binding_ids)),
+                kind="binding-unassessed", retryable=True)
+        required_binding = {item["evidence_id"] for item in binding_assessments
+                            if item["disposition"] == "REQUIRED"}
+        if decision == "TAKE" and required_binding - set(seen_ids):
+            raise AdvisorError(
+                "binding evidence marked REQUIRED without prerequisite selection: "
+                + ", ".join(sorted(required_binding - set(seen_ids))),
+                kind="binding-unassessed", retryable=True)
+        if decision == "TAKE" and (set(seen_ids) & binding_ids) - required_binding:
+            raise AdvisorError(
+                "binding prerequisite selected but not assessed REQUIRED",
+                kind="binding-unassessed", retryable=True)
+
         inbound_recommendations = self.advisor_inbound_take_recommendations(sha)
         inbound_by_id = {
             item["evidence_id"]: item
@@ -2377,7 +2526,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         return {
             "decision": decision,
             "rationale": rationale.strip(),
+            # Persist the original evidence IDs as well as resolved peer data,
+            # so cached normalized results can be validated again on reuse.
+            "prerequisite_evidence_ids": [x for x in raw_prereq_ids
+                                           if isinstance(x, str)] if decision != "SKIP" else [],
             "prerequisite_peers": prereqs,
+            "binding_evidence_assessments": binding_assessments,
             "inbound_prerequisite_assessments": inbound_assessments,
             "risks": risks,
         }
@@ -2502,9 +2656,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 # A mock or future client may not expose Ollama measurements.
                 if hasattr(client, "last_telemetry"):
                     client.last_telemetry = None
-                request_prompt = (policy_retry_prompt(prompt)
-                                  if last_error is not None and
-                                  last_error.kind == "policy-review" else prompt)
+                request_prompt = prompt
+                if last_error is not None:
+                    if last_error.kind == "policy-review":
+                        request_prompt = policy_retry_prompt(prompt)
+                    elif last_error.kind == "binding-unassessed":
+                        request_prompt = binding_retry_prompt(prompt)
                 raw = client.advise(request_prompt, packet, schema)
                 validated = self.validate_advisor_result(sha, raw)
                 # Guard against a recurring policy misread by small models.
@@ -2613,6 +2770,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             f"Advisor failed ({exc.kind}); manual review required. {exc}"
         )
         node.advisor_prerequisites = []
+        node.advisor_binding_assessments = []
         node.advisor_rejected_prerequisites = []
         node.advisor_inbound_assessments = []
         node.advisor_risks = []
@@ -2710,6 +2868,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         node.advisor_decision = result["decision"]
         node.advisor_rationale = result["rationale"]
         node.advisor_prerequisites = result["prerequisite_peers"]
+        node.advisor_binding_assessments = result.get("binding_evidence_assessments", [])
         node.advisor_rejected_prerequisites = []
         node.advisor_inbound_assessments = result["inbound_prerequisite_assessments"]
         node.advisor_risks = result["risks"]
@@ -2718,10 +2877,16 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         self._record_advisor_prerequisite_recommendations(node.sha)
 
     def _advisor_evaluate_one(
-        self, client: OllamaAdvisor, prompt: str, sha: str, *, reconsideration: bool = False
+        self, client: OllamaAdvisor, prompt: str, sha: str, *,
+        reconsideration: bool = False,
+        binding_conflict_context: list[dict] | None = None,
     ) -> None:
         node = self.nodes[sha]
         packet = self.advisor_packet(sha)
+        if binding_conflict_context:
+            # Included in the cache fingerprint. A corrective response must
+            # never be reused as if it came from the ordinary prompt packet.
+            packet["commit"]["binding_conflict_context"] = binding_conflict_context
         policy_result = self.advisor_policy_override(sha, packet)
         if policy_result is not None:
             node.advisor_attempts = 0
@@ -2838,33 +3003,104 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 client, prompt, candidate, reconsideration=True
             )
 
-    def _advisor_resolve_rejected_prerequisites(self) -> None:
-        """Remove prerequisite edges explicitly rejected by the candidate peer.
+    def _advisor_binding_conflicts(self) -> dict[str, list[dict]]:
+        """Find conflicting consumer/provider binding decisions by evidence ID.
 
-        A TAKE consumer may nominate concrete evidence, while the candidate peer may
-        later assess that exact inbound evidence as NOT_REQUIRED. That is a resolved
-        relationship, not a consistency failure. Preserve the rejected edge for audit
-        while removing it from the active execution graph.
+        A consumer's REQUIRED assessment is not negated by an independent
+        NOT_REQUIRED opinion. Neither opinion is silently discarded.
+        """
+        result: dict[str, list[dict]] = collections.defaultdict(list)
+        for consumer in self.nodes.values():
+            if consumer.advisor_decision != "TAKE":
+                continue
+            required = {x.get("evidence_id"): x for x in
+                        consumer.advisor_binding_assessments
+                        if x.get("disposition") == "REQUIRED"}
+            for prereq in consumer.advisor_prerequisites:
+                if prereq.get("evidence_kind") not in (
+                        "compatible-binding", "dt-property-binding"):
+                    continue
+                evidence_id = prereq.get("evidence_id", "")
+                consumer_assessment = required.get(evidence_id)
+                peer = self.nodes.get(prereq.get("sha", ""))
+                if not consumer_assessment or peer is None:
+                    continue
+                assessment = next((a for a in peer.advisor_inbound_assessments
+                                   if a.get("evidence_id") == evidence_id and
+                                   a.get("disposition") == "NOT_REQUIRED"), None)
+                if assessment is None:
+                    continue
+                result[peer.sha].append({
+                    "consumer_sha": consumer.sha,
+                    "evidence_id": evidence_id,
+                    "evidence_kind": prereq["evidence_kind"],
+                    "evidence_object": prereq.get("evidence_object", ""),
+                    "consumer_disposition": "REQUIRED",
+                    "consumer_reason": consumer_assessment.get("reason", ""),
+                    "provider_disposition": "NOT_REQUIRED",
+                    "provider_reason": assessment.get("reason", ""),
+                })
+        return dict(result)
+
+    def _advisor_reconcile_binding_conflicts(
+        self, client: OllamaAdvisor, prompt: str,
+    ) -> None:
+        """Give each conflicting TAKE provider one evidence-specific recheck.
+
+        Remaining conflicts are left for the consistency audit and block
+        execution readiness. Rechecks are bounded to one per provider per run.
+        """
+        conflicts = self._advisor_binding_conflicts()
+        self.advisor_binding_rechecks = 0
+        for peer_sha, context in sorted(conflicts.items()):
+            peer = self.nodes[peer_sha]
+            if peer.advisor_decision != "TAKE" or peer.match.status == "present":
+                continue
+            self.advisor_binding_rechecks += 1
+            self.info(f"  advisor binding disagreement recheck "
+                      f"{self.advisor_binding_rechecks}: {peer_sha[:12]} "
+                      f"({len(context)} disputed evidence ID(s))")
+            if getattr(self, "performance", None):
+                self.performance.event("advisor_binding_disagreement_recheck",
+                                       sha=peer_sha[:12], count=len(context))
+            self._advisor_evaluate_one(
+                client, prompt, peer_sha, reconsideration=True,
+                binding_conflict_context=context,
+            )
+
+    def _advisor_resolve_rejected_prerequisites(self) -> None:
+        """Record unopposed NOT_REQUIRED decisions without hiding disagreements.
+
+        A non-binding peer may reject an inbound recommendation. A binding
+        provider cannot cancel a consumer's explicit REQUIRED evidence with a
+        conflicting NOT_REQUIRED opinion: preserve the active dependency and
+        let the consistency audit reject the unresolved disagreement.
         """
         for consumer in self.nodes.values():
             consumer.advisor_rejected_prerequisites = []
             if consumer.advisor_decision != "TAKE" or not consumer.advisor_prerequisites:
                 continue
             active: list[dict[str, str]] = []
+            required = {x.get("evidence_id") for x in
+                        consumer.advisor_binding_assessments
+                        if x.get("disposition") == "REQUIRED"}
             for prereq in consumer.advisor_prerequisites:
                 peer = self.nodes.get(prereq.get("sha", ""))
                 evidence_id = prereq.get("evidence_id", "")
                 assessment = None
                 if peer is not None and evidence_id:
                     assessment = next(
-                        (
-                            item for item in peer.advisor_inbound_assessments
-                            if item.get("evidence_id") == evidence_id
-                            and item.get("disposition") == "NOT_REQUIRED"
-                        ),
+                        (item for item in peer.advisor_inbound_assessments
+                         if item.get("evidence_id") == evidence_id
+                         and item.get("disposition") == "NOT_REQUIRED"),
                         None,
                     )
                 if assessment is None:
+                    active.append(prereq)
+                    continue
+                if (prereq.get("evidence_kind") in
+                        ("compatible-binding", "dt-property-binding")
+                        and evidence_id in required):
                     active.append(prereq)
                     continue
                 rejected = dict(prereq)
@@ -2940,9 +3176,23 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 evidence_id = prereq.get("evidence_id", "")
                 assessment = next((item for item in peer.advisor_inbound_assessments
                                    if item.get("evidence_id") == evidence_id), None) if peer else None
-                if assessment and assessment.get("disposition") == "NOT_REQUIRED":
+                consumer_assessment = next((item for item in
+                    consumer.advisor_binding_assessments
+                    if item.get("evidence_id") == evidence_id), None)
+                conflict = bool(
+                    prereq.get("evidence_kind") in
+                    ("compatible-binding", "dt-property-binding")
+                    and consumer_assessment is not None
+                    and consumer_assessment.get("disposition") == "REQUIRED"
+                    and assessment is not None
+                    and assessment.get("disposition") == "NOT_REQUIRED"
+                    and peer is not None and peer.match.status != "present"
+                )
+                if conflict:
+                    kind = "DT_BINDING->DISAGREEMENT"
+                elif assessment and assessment.get("disposition") == "NOT_REQUIRED":
                     continue
-                if peer is None:
+                elif peer is None:
                     kind = "TAKE->ABSENT"
                 elif peer.match.status == "present":
                     continue
@@ -2971,11 +3221,52 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "reason": prereq.get("reason", ""),
                     "assessment_disposition": assessment.get("disposition", "") if assessment else "",
                     "assessment_reason": assessment.get("reason", "") if assessment else "",
+                    "consumer_assessment_reason": (
+                        consumer_assessment.get("reason", "")
+                        if consumer_assessment else ""),
                 }
                 self.advisor_consistency_issues.append(issue)
                 consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
                 if peer:
                     peer.advisor_consistency_warnings.append({"role": "prerequisite", **issue})
+
+        # Independent audit: every known binding edge on a TAKE needs an
+        # evidence-specific REQUIRED or NOT_REQUIRED disposition, even when
+        # the model never nominated the peer. This catches silent omissions.
+        for consumer in list(self.nodes.values()):
+            if (consumer.advisor_decision != "TAKE"
+                    or not self.is_actionable_node(consumer)
+                    or consumer.match.status != "missing"):
+                continue
+            assessments = {item.get("evidence_id"): item
+                           for item in consumer.advisor_binding_assessments}
+            for proof in self.advisor_prerequisite_evidence(consumer.sha):
+                if proof.get("kind") not in ("compatible-binding", "dt-property-binding"):
+                    continue
+                evidence_id = proof["evidence_id"]
+                item = assessments.get(evidence_id)
+                if item and item.get("disposition") == "NOT_REQUIRED":
+                    continue
+                if item and item.get("disposition") == "REQUIRED":
+                    # The ordinary TAKE-edge check above validates this edge.
+                    # One peer may be supported by several evidence IDs;
+                    # normalized prerequisite_peers keeps one edge per peer.
+                    if any(edge.get("sha") == proof["peer_sha"]
+                           for edge in consumer.advisor_prerequisites):
+                        continue
+                issue = {
+                    "kind": "DT_BINDING->UNASSESSED",
+                    "consumer_sha": consumer.sha,
+                    "consumer_subject": consumer.subject,
+                    "prerequisite_sha": proof["peer_sha"],
+                    "prerequisite_subject": proof.get("peer_subject", ""),
+                    "evidence_id": evidence_id,
+                    "evidence_kind": proof["kind"],
+                    "evidence_object": proof["object"],
+                    "reason": "binding relationship lacks a recorded disposition",
+                }
+                self.advisor_consistency_issues.append(issue)
+                consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
 
         # DT source includes are stricter than binding-schema suggestions:
         # these are verified file dependencies needed for DT compilation.
@@ -3120,6 +3411,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             self.info(f"  final expanded-plan replay: {len(conflicts)} conflict(s)")
         self._advisor_reconciliation_pass(client, prompt, list(dict.fromkeys(
             [*ordered, *self.ordered_missing()])))
+        self._advisor_reconcile_binding_conflicts(client, prompt)
         self._advisor_resolve_rejected_prerequisites()
         self._advisor_check_consistency()
 
@@ -4239,6 +4531,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 f"({getattr(self, 'advisor_policy_rechecks', 0)} policy rechecks), "
                 f"{getattr(self, 'advisor_cache_hits', 0)} cache hit(s), "
                 f"{getattr(self, 'advisor_reconsiderations', 0)} reconsideration(s), "
+                f"{getattr(self, 'advisor_binding_rechecks', 0)} binding disagreement recheck(s), "
                 f"{getattr(self, 'advisor_error_log_entries', 0)} diagnostic error record(s)"
             )
             if getattr(self, "advisor_error_log_entries", 0) and self.advisor_error_log_path:
@@ -4356,6 +4649,11 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     lines.append(
                         f'      advisor-prerequisite: {peer_sha[:12]} '
                         f'("{self.subject(peer_sha)}"){evidence} - {self._one_line(item["reason"])}'
+                    )
+                for item in n.advisor_binding_assessments:
+                    lines.append(
+                        f'      advisor-binding-assessment: {item["evidence_id"]} '
+                        f'{item["disposition"]} - {self._one_line(item["reason"])}'
                     )
                 for item in n.advisor_rejected_prerequisites:
                     peer_sha = item["sha"]
@@ -4512,6 +4810,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "retries_used": getattr(self, "advisor_retries_used", 0),
                 "policy_rechecks": getattr(self, "advisor_policy_rechecks", 0),
                 "reconsiderations": getattr(self, "advisor_reconsiderations", 0),
+                "binding_disagreement_rechecks": getattr(self, "advisor_binding_rechecks", 0),
                 "failures": getattr(self, "advisor_failures", 0),
                 "failure_kinds": dict(getattr(self, "advisor_failure_kinds", {})),
                 "cache_hits": getattr(self, "advisor_cache_hits", 0),
@@ -4545,6 +4844,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_decision": n.advisor_decision,
                     "advisor_rationale": n.advisor_rationale,
                     "advisor_prerequisites": n.advisor_prerequisites,
+                    "advisor_binding_assessments": n.advisor_binding_assessments,
                     "advisor_rejected_prerequisites": n.advisor_rejected_prerequisites,
                     "advisor_consumed_objects": n.advisor_consumed_objects,
                     "advisor_prerequisite_evidence": n.advisor_consumed_objects,
@@ -4841,6 +5141,31 @@ def run_advisor_benchmark(args: argparse.Namespace) -> int:
                 if len(ids) != len(set(ids)) or not set(ids) <= allowed_ids:
                     raise AdvisorError("invalid prerequisite evidence IDs",
                                        kind="invalid-prerequisite", retryable=False)
+                binding_ids = {e["evidence_id"] for e in evidence
+                               if e.get("kind") in ("compatible-binding",
+                                                    "dt-property-binding")}
+                binding_assessments = result.get("binding_evidence_assessments", [])
+                if not isinstance(binding_assessments, list):
+                    raise AdvisorError("invalid binding assessments",
+                                       kind="invalid-response", retryable=False)
+                disposition_by_id = {}
+                for assessment in binding_assessments:
+                    if (not isinstance(assessment, dict)
+                            or assessment.get("evidence_id") not in binding_ids
+                            or assessment["evidence_id"] in disposition_by_id
+                            or assessment.get("disposition") not in ("REQUIRED", "NOT_REQUIRED")
+                            or not isinstance(assessment.get("reason"), str)
+                            or not assessment["reason"].strip()):
+                        raise AdvisorError("invalid binding evidence assessment",
+                                           kind="binding-unassessed", retryable=False)
+                    disposition_by_id[assessment["evidence_id"]] = assessment["disposition"]
+                if decision == "TAKE":
+                    if (set(disposition_by_id) != binding_ids
+                            or any((i in ids) != (v == "REQUIRED")
+                                   for i, v in disposition_by_id.items())):
+                        raise AdvisorError("unassessed or contradictory binding evidence",
+                                           kind="binding-unassessed", retryable=False)
+                entry["binding_evidence_assessments"] = binding_assessments
                 inbound_ids = {e["evidence_id"] for e in inbound}
                 returned_ids = [x.get("evidence_id") for x in assessments
                                 if isinstance(x, dict)]

@@ -1047,6 +1047,12 @@ class AdvisorTests(unittest.TestCase):
             "decision": "TAKE",
             "rationale": "Binding is needed.",
             "prerequisite_evidence_ids": ["ev-one", "ev-two"],
+            "binding_evidence_assessments": [
+                {"evidence_id": "ev-one", "disposition": "REQUIRED",
+                 "reason": "Board binding is needed."},
+                {"evidence_id": "ev-two", "disposition": "REQUIRED",
+                 "reason": "Property definition is needed."},
+            ],
             "inbound_prerequisite_assessments": [],
             "risks": [],
         })
@@ -2360,11 +2366,11 @@ class DependencyClosure0414Tests(unittest.TestCase):
         planner.advisor_reconsiderations = 0
         planner.advisor_order = lambda shas: list(shas)
         planner.advisor_system_prompt = lambda: "prompt"
-        planner.advisor_prerequisite_evidence = lambda sha: [{
+        planner.advisor_prerequisite_evidence = lambda sha: ([{
             "evidence_id": "ev-binding", "peer_sha": provider.sha,
             "kind": "compatible-binding", "object": "armsom,sige5",
             "selected_use": "board compatible", "peer_provides": "schema",
-        }]
+        }] if sha == consumer.sha else [])
         planner.advisor_allowed_prerequisite_peers = lambda sha: [provider.sha]
         planner.ensure_node = lambda sha, reason, required_by: provider
         def ensure(sha, reason, required_by):
@@ -2380,6 +2386,10 @@ class DependencyClosure0414Tests(unittest.TestCase):
         def evaluate(_client, _prompt, sha):
             seen.append(sha)
             planner.nodes[sha].advisor_decision = "TAKE"
+            if sha == consumer.sha:
+                planner.nodes[sha].advisor_binding_assessments = [
+                    {"evidence_id": "ev-binding", "disposition": "REQUIRED",
+                     "reason": "Board integration requires schema."}]
         planner._advisor_evaluate_one = evaluate
         with mock.patch.object(kbp, "OllamaAdvisor"):
             planner.run_advisor()
@@ -2978,7 +2988,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "14")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "16")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -3050,3 +3060,326 @@ class AdvisorEvidence0418Tests(unittest.TestCase):
             self.assertEqual(entry["reference_decision"], "TAKE")
             self.assertEqual(entry["baseline_decision"], "REVIEW")
             self.assertTrue(entry["agrees_with_reference"])
+
+class AdvisorBinding0419Tests(unittest.TestCase):
+    """0.4.19: an unassessed compatible binding must not disappear."""
+
+    @staticmethod
+    def fixture():
+        planner = object.__new__(kbp.Planner)
+        sha = "c" * 40
+        peer = "b" * 40
+        proof = {
+            "evidence_id": "ev-26b76f5fd77f3164",
+            "peer_sha": peer,
+            "peer_subject": "ArmSoM binding",
+            "kind": "compatible-binding", "object": "armsom,sige5",
+            "selected_use": 'compatible = "armsom,sige5"',
+            "peer_provides": "rockchip.yaml binding armsom,sige5",
+        }
+        consumer = kbp.CommitNode(sha, "ArmSoM Sige 5 board", direct=True)
+        consumer.advisor_decision = "TAKE"
+        planner.nodes = {sha: consumer}
+        planner.advisor_prerequisite_evidence = lambda _sha: [proof]
+        planner.advisor_inbound_take_recommendations = lambda _sha: []
+        planner.ordered_missing = lambda: [sha]
+        return planner, consumer, proof
+
+    @staticmethod
+    def answer(ids=(), assessments=(), decision="TAKE"):
+        return {
+            "decision": decision, "rationale": "Arm64 convergence change",
+            "prerequisite_evidence_ids": list(ids),
+            "binding_evidence_assessments": list(assessments),
+            "inbound_prerequisite_assessments": [], "risks": [],
+        }
+
+    def test_missing_binding_disposition_rejected(self):
+        planner, consumer, evidence = self.fixture()
+        with self.assertRaises(kbp.AdvisorError) as ctx:
+            planner.validate_advisor_result(consumer.sha, self.answer())
+        self.assertEqual(ctx.exception.kind, "binding-unassessed")
+        self.assertTrue(ctx.exception.retryable)
+
+    def test_binding_required_is_selected_and_cached(self):
+        planner, consumer, proof = self.fixture()
+        assessment = {"evidence_id": proof["evidence_id"],
+                      "disposition": "REQUIRED",
+                      "reason": "Board compatible should be declared in schema."}
+        result = planner.validate_advisor_result(consumer.sha,
+             self.answer([proof["evidence_id"]], [assessment]))
+        self.assertEqual(result["prerequisite_peers"][0]["sha"], proof["peer_sha"])
+        self.assertEqual(result["binding_evidence_assessments"], [assessment])
+        # A normalized cached result must survive the same validation.
+        roundtrip = planner.validate_advisor_result(consumer.sha, result)
+        self.assertEqual(roundtrip["prerequisite_peers"], result["prerequisite_peers"])
+
+    def test_binding_not_required_has_recorded_reason(self):
+        planner, consumer, proof = self.fixture()
+        assessment = {"evidence_id": proof["evidence_id"],
+                      "disposition": "NOT_REQUIRED",
+                      "reason": "Schema annotation is not required for this staged change."}
+        result = planner.validate_advisor_result(consumer.sha,
+                                                 self.answer([], [assessment]))
+        self.assertEqual(result["prerequisite_peers"], [])
+        consumer.advisor_binding_assessments = result["binding_evidence_assessments"]
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_required_binding_without_selected_edge_rejected(self):
+        planner, consumer, proof = self.fixture()
+        with self.assertRaises(kbp.AdvisorError) as ctx:
+            planner.validate_advisor_result(consumer.sha, self.answer([], [{
+                "evidence_id": proof["evidence_id"], "disposition": "REQUIRED",
+                "reason": "Schema needed for DT validation."}]))
+        self.assertEqual(ctx.exception.kind, "binding-unassessed")
+
+    def test_unselected_binding_audit_detects_run22_pattern(self):
+        planner, consumer, proof = self.fixture()
+        consumer.advisor_prerequisites = []
+        consumer.advisor_binding_assessments = []
+        planner._advisor_check_consistency()
+        issues = planner.advisor_consistency_issues
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["kind"], "DT_BINDING->UNASSESSED")
+        self.assertEqual(issues[0]["prerequisite_sha"], proof["peer_sha"])
+
+    def test_schema_requires_explicit_binding_field(self):
+        _, _, proof = self.fixture()
+        schema = kbp.advisor_response_schema([proof])
+        self.assertIn("binding_evidence_assessments", schema["required"])
+        item = schema["properties"]["binding_evidence_assessments"]["items"]
+        self.assertEqual(item["properties"]["evidence_id"]["enum"],
+                         [proof["evidence_id"]])
+
+    def test_optional_notice_does_not_create_spurious_review(self):
+        evidence = [{"evidence_id": "ev-test", "peer_sha": "b" * 40,
+                     "kind": "included-file", "object": "board.dtsi"}]
+        packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "+" * 1500,
+                              "same_series_consumed_objects": evidence,
+                              "eligible_prerequisite_evidence": evidence}}
+        reduced = {"commit": {"sha": "a" * 40, "patch_excerpt": "+" * 1500,
+                              "eligible_prerequisite_evidence": evidence}}
+        cap = kbp.advisor_request_size("prompt", reduced, {}) + 2
+        output, meta = kbp.budget_advisor_packet(packet, "prompt", {}, cap)
+        self.assertEqual(output["commit"]["eligible_prerequisite_evidence"], evidence)
+        self.assertNotIn("evidence_budget_notice", output)
+        self.assertFalse(meta["notice_embedded"])
+        self.assertLessEqual(meta["final_chars"], cap)
+
+    def test_oversized_mandatory_patch_still_fails_closed(self):
+        packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "+" * 50000,
+                              "eligible_prerequisite_evidence": []}}
+        with self.assertRaises(kbp.AdvisorError) as ctx:
+            kbp.budget_advisor_packet(packet, "prompt", {}, 48000)
+        self.assertEqual(ctx.exception.kind, "evidence-budget")
+
+    def test_binding_recheck_prompt_is_bounded(self):
+        extra = len(kbp.binding_retry_prompt("base")) - len("base")
+        self.assertLess(extra, 600)
+        self.assertIn("BINDING EVIDENCE RECHECK", kbp.binding_retry_prompt("base"))
+
+class MultipleBindingEvidence0419Tests(unittest.TestCase):
+    def test_two_required_evidence_ids_for_one_peer_are_consistent(self):
+        planner = object.__new__(kbp.Planner)
+        consumer = kbp.CommitNode("c" * 40, "board", direct=True)
+        provider = kbp.CommitNode("b" * 40, "binding")
+        consumer.advisor_decision = provider.advisor_decision = "TAKE"
+        provider.add_reason("advisor-prerequisite:compatible-binding", consumer.sha)
+        consumer.advisor_prerequisites = [{
+            "sha": provider.sha, "evidence_id": "ev-compatible",
+            "evidence_kind": "compatible-binding", "evidence_object": "vendor,board",
+            "reason": "required",
+        }]
+        consumer.advisor_binding_assessments = [
+            {"evidence_id": "ev-compatible", "disposition": "REQUIRED",
+             "reason": "schema"},
+            {"evidence_id": "ev-property", "disposition": "REQUIRED",
+             "reason": "property"},
+        ]
+        planner.nodes = {consumer.sha: consumer, provider.sha: provider}
+        planner.ordered_missing = lambda: [provider.sha, consumer.sha]
+        planner.advisor_prerequisite_evidence = lambda sha: ([
+            {"evidence_id": "ev-compatible", "peer_sha": provider.sha,
+             "kind": "compatible-binding", "object": "vendor,board"},
+            {"evidence_id": "ev-property", "peer_sha": provider.sha,
+             "kind": "dt-property-binding", "object": "vendor,board:clocks"},
+        ] if sha == consumer.sha else [])
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+class BindingReasonPolicy0419Tests(unittest.TestCase):
+    def test_official_support_only_binding_dismissal_is_not_valid(self):
+        planner, consumer, proof = AdvisorBinding0419Tests.fixture()
+        assessment = {"evidence_id": proof["evidence_id"],
+                      "disposition": "NOT_REQUIRED",
+                      "reason": "This board is not officially supported by RHEL."}
+        with self.assertRaises(kbp.AdvisorError) as caught:
+            planner.validate_advisor_result(
+                consumer.sha, AdvisorBinding0419Tests.answer([], [assessment]))
+        self.assertEqual(caught.exception.kind, "binding-unassessed")
+
+
+class BindingDisagreement0420Tests(unittest.TestCase):
+    """The real run 23 ArmSoM binding was REQUIRED / NOT_REQUIRED."""
+
+    @staticmethod
+    def fixture(kind="compatible-binding"):
+        planner = object.__new__(kbp.Planner)
+        consumer = kbp.CommitNode("c" * 40, "Sige 5 board", direct=True)
+        provider = kbp.CommitNode("b" * 40, "ArmSoM compatible binding")
+        consumer.advisor_decision = provider.advisor_decision = "TAKE"
+        eid = "ev-26b76f5fd77f3164"
+        consumer.advisor_prerequisites = [{
+            "sha": provider.sha, "evidence_id": eid,
+            "evidence_kind": kind, "evidence_object": "armsom,sige5",
+            "reason": "schema provides exact compatible",
+        }]
+        consumer.advisor_binding_assessments = [{
+            "evidence_id": eid, "disposition": "REQUIRED",
+            "reason": "DTS declares an armsom,sige5 compatible requiring schema",
+        }] if "binding" in kind else []
+        provider.advisor_inbound_assessments = [{
+            "evidence_id": eid, "disposition": "NOT_REQUIRED",
+            "reason": "rk3576 already covers it",
+        }]
+        planner.nodes = {consumer.sha: consumer, provider.sha: provider}
+        planner.ordered_missing = lambda: [provider.sha, consumer.sha]
+        planner.advisor_prerequisite_evidence = lambda sha: ([{
+            "evidence_id": eid, "peer_sha": provider.sha,
+            "kind": kind, "object": "armsom,sige5",
+        }] if sha == consumer.sha else [])
+        return planner, consumer, provider
+
+    def test_run23_binding_conflict_preserves_edge_and_is_explicit(self):
+        planner, consumer, provider = self.fixture()
+        conflicts = planner._advisor_binding_conflicts()
+        self.assertEqual(len(conflicts[provider.sha]), 1)
+        self.assertIn("DTS declares", conflicts[provider.sha][0]["consumer_reason"])
+        planner._advisor_resolve_rejected_prerequisites()
+        self.assertEqual(len(consumer.advisor_prerequisites), 1)
+        self.assertEqual(consumer.advisor_rejected_prerequisites, [])
+        planner._advisor_check_consistency()
+        self.assertEqual([x["kind"] for x in planner.advisor_consistency_issues],
+                         ["DT_BINDING->DISAGREEMENT"])
+        issue = planner.advisor_consistency_issues[0]
+        self.assertEqual(issue["assessment_disposition"], "NOT_REQUIRED")
+        self.assertIn("rk3576", issue["assessment_reason"])
+        self.assertIn("schema", issue["consumer_assessment_reason"])
+
+    def test_peer_recheck_can_resolve_disagreement(self):
+        planner, consumer, provider = self.fixture()
+        seen = []
+        planner.performance = None
+        planner.info = lambda msg: None
+        def evaluate(client, prompt, sha, **kwargs):
+            seen.append((sha, kwargs["binding_conflict_context"]))
+            provider.advisor_inbound_assessments[0]["disposition"] = "REQUIRED"
+        planner._advisor_evaluate_one = evaluate
+        planner._advisor_reconcile_binding_conflicts(None, "prompt")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], provider.sha)
+        self.assertEqual(planner.advisor_binding_rechecks, 1)
+        planner._advisor_resolve_rejected_prerequisites()
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_disagreement_persisting_after_recheck_still_blocks(self):
+        planner, consumer, provider = self.fixture()
+        planner.info = lambda msg: None
+        planner.performance = None
+        calls = []
+        planner._advisor_evaluate_one = lambda *a, **kw: calls.append(kw)
+        planner._advisor_reconcile_binding_conflicts(None, "prompt")
+        planner._advisor_resolve_rejected_prerequisites()
+        planner._advisor_check_consistency()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(planner.advisor_consistency_issues[0]["kind"],
+                         "DT_BINDING->DISAGREEMENT")
+        self.assertEqual(len(consumer.advisor_prerequisites), 1)
+
+    def test_nonbinding_not_required_retains_old_rejection_semantics(self):
+        planner, consumer, provider = self.fixture(kind="symbol-definition")
+        planner._advisor_resolve_rejected_prerequisites()
+        self.assertEqual(consumer.advisor_prerequisites, [])
+        self.assertEqual(len(consumer.advisor_rejected_prerequisites), 1)
+        planner._advisor_check_consistency()
+        self.assertEqual(planner.advisor_consistency_issues, [])
+
+    def test_recheck_cache_packet_is_distinct_from_ordinary_packet(self):
+        planner = object.__new__(kbp.Planner)
+        planner.base, planner.target, planner.downstream = "a", "b", "c"
+        planner.advisor_model = "kernel-planner:32k"
+        sha = "e" * 40
+        packet = {"commit": {"sha": sha}}
+        original = planner.advisor_cache_key(sha, packet)
+        revised = {"commit": {**packet["commit"], "binding_conflict_context": [
+            {"evidence_id": "ev-test", "consumer_disposition": "REQUIRED"}]}}
+        self.assertNotEqual(original, planner.advisor_cache_key(sha, revised))
+
+    def test_two_binding_evidence_ids_one_peer_still_reports_conflict(self):
+        planner, consumer, provider = self.fixture()
+        consumer.advisor_binding_assessments.append({
+            "evidence_id": "ev-property", "disposition": "REQUIRED",
+            "reason": "schema includes required property",
+        })
+        old = planner.advisor_prerequisite_evidence
+        planner.advisor_prerequisite_evidence = lambda sha: (
+            old(sha) + [{"evidence_id": "ev-property", "peer_sha": provider.sha,
+                         "kind": "dt-property-binding", "object": "foo"}]
+            if sha == consumer.sha else [])
+        planner._advisor_resolve_rejected_prerequisites()
+        planner._advisor_check_consistency()
+        self.assertEqual([x["kind"] for x in planner.advisor_consistency_issues],
+                         ["DT_BINDING->DISAGREEMENT"])
+
+
+class EvidenceBudget0420Tests(unittest.TestCase):
+    def test_optional_consumer_provenance_removed_before_required_patch(self):
+        evidence = [{"evidence_id": "ev-1", "peer_sha": "b" * 40,
+                     "kind": "included-file", "object": "board.dtsi"}]
+        packet = {"commit": {
+            "sha": "a" * 40, "patch_excerpt": "+" * 2000,
+            "eligible_prerequisite_evidence": evidence,
+            "actual_inbound_take_prerequisites": [
+                {"evidence_id": "ev-in", "consumer_sha": "d" * 40}],
+            "deterministic_consumer_context": {
+                "relationship_status": "provenance_only",
+                "consumers": [{"sha": "c" * 40,
+                               "changed_files": ["arch/arm64/boot/dts/board.dts"],
+                               "patch_excerpt": "x" * 60000,
+                               "other_provenance": "y" * 60000}],
+            },
+        }}
+        out, meta = kbp.budget_advisor_packet(packet, "prompt", {}, 4000)
+        commit = out["commit"]
+        self.assertEqual(commit["patch_excerpt"], packet["commit"]["patch_excerpt"])
+        self.assertEqual(commit["eligible_prerequisite_evidence"], evidence)
+        self.assertEqual(commit["actual_inbound_take_prerequisites"],
+                         packet["commit"]["actual_inbound_take_prerequisites"])
+        self.assertEqual(commit["deterministic_consumer_context"]["consumers"], [])
+        self.assertTrue(any(s.startswith("optional-consumer-provenance")
+                            for s in meta["omitted"]))
+        self.assertLessEqual(meta["final_chars"], 4000)
+
+    def test_optional_series_peer_scope_removed_without_losing_paths(self):
+        peer = {"sha": "b" * 40, "subject": "binding",
+                "changed_files": ["Documentation/devicetree/bindings/arm/a.yaml"],
+                "scope": {"verbose_context": "x" * 8000}}
+        packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "+" * 1200,
+                              "eligible_prerequisite_evidence": [],
+                              "same_series": [peer]}}
+        out, meta = kbp.budget_advisor_packet(packet, "prompt", {}, 3000)
+        kept = out["commit"]["same_series"][0]
+        self.assertEqual(kept["changed_files"], peer["changed_files"])
+        self.assertNotIn("scope", kept)
+        self.assertIn("optional-series-peer-scope", meta["omitted"])
+
+    def test_large_mandatory_evidence_still_fails_closed(self):
+        packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "p" * 1300,
+            "eligible_prerequisite_evidence": [
+                {"evidence_id": "ev", "peer_sha": "b" * 40,
+                 "selected_use": "s" * 6000}]}}
+        with self.assertRaises(kbp.AdvisorError) as e:
+            kbp.budget_advisor_packet(packet, "prompt", {}, 4000)
+        self.assertEqual(e.exception.kind, "evidence-budget")

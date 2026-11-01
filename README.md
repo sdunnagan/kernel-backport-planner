@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.18**.
+Current tool version: **0.4.20**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -153,6 +153,115 @@ is rejected before analysis, preventing a costly misnamed run. Use
 logs and archives externally. Standalone `--package-results PREFIX` remains
 available for packaging older completed runs.
 
+
+## Binding disagreement reconciliation and evidence budgets (0.4.20)
+
+Version 0.4.20 addresses two failures observed in the complete run 23:
+17 binding assessment warnings and 39 evidence-budget REVIEW decisions.
+The changes do not automatically make a REVIEW into TAKE and do not
+supersede the verified run 20 for backport execution.
+
+### Preserve conflicting binding assessments
+
+When a TAKE consumer marks a compatible/property binding REQUIRED, but the
+provider independently marks that exact inbound evidence NOT_REQUIRED, the
+planner no longer discards the prerequisite edge. It records the conflicting
+rationales and emits `DT_BINDING->DISAGREEMENT` in the final consistency
+report. That issue blocks `advisor.execution_ready` until resolved.
+
+One targeted re-evaluation of each conflicting TAKE provider is allowed, with
+the consumer's and provider's original explanations supplied as distinct
+context. The corrective request uses a separate cache fingerprint and cannot
+be mistaken for an ordinary advisor response. If the model still disagrees,
+returns REVIEW, or cannot fit the request, the conflict or unresolved
+prerequisite remains visible. Non-binding prerequisite rejections retain
+the existing behavior. The JSON advisor summary now includes
+`binding_disagreement_rechecks`, and the text report counts these rechecks.
+
+This does not prove that the model's binding rationale is technically correct.
+The independent disposition and remaining unresolved relationships still
+require review before the JSON is used for automated backporting.
+
+### Reduce optional context under budget pressure
+
+When the complete request exceeds `--advisor-max-request-chars`, the planner
+already removes duplicated evidence copies and optional patch excerpts.
+Version 0.4.20 can additionally drop the *optional* deterministic-consumer
+provenance list and redundant series-peer scope summaries. Each omission is
+recorded in `advisor_budget` metadata, and the model is told when optional
+context was removed. It preserves the selected patch excerpt, eligible
+prerequisite evidence and evidence IDs, changed-file paths, and actionable
+inbound TAKE recommendations. If that required content remains oversized,
+the commit still becomes an `evidence-budget` REVIEW without an Ollama call.
+
+The advisor prompt/cache version is 16. Previous Qwen cache entries are not
+silently reused for the changed conflict-aware behavior.
+
+### Run 24 integration
+
+Keep run 20 as the backport baseline, and runs 22 and 23 as regression
+references. After installing 0.4.20 on `shire`, retain the existing model
+and context flags and set both report filenames to `backport_plan_24`. The
+planner automatically packages reports and performance logs. Inspect the
+count of binding disagreements, DTSI REVIEW blockers, evidence-budget
+failures, and `advisor.execution_ready` before using the new plan.
+
+The regression suite checks synthetic examples. A full Qwen/CS10 integration
+run is still required; no number of fixed issues is assumed in advance.
+
+## Binding coverage and fail-closed evidence budgeting (0.4.19)
+
+Version 0.4.19 targets two concrete problems in the Qwen-generated run 22:
+known `compatible-binding` evidence for the ArmSoM Sige 5 board disappeared
+when the model returned an empty prerequisite list, and 39 commits failed
+request budgeting (four because an OPTIONAL budget notice overflowed).
+
+### Explicit Device Tree binding dispositions
+
+For every `compatible-binding` and `dt-property-binding` evidence record on
+an advisor TAKE decision, the model must return exactly one
+`binding_evidence_assessments` entry containing the evidence ID, a
+`REQUIRED` or `NOT_REQUIRED` disposition, and a technical reason.
+
+- REQUIRED must also select the evidence ID in `prerequisite_evidence_ids`.
+  Existing peer promotion and dependency ordering still apply. This does
+  **not** automatically mark the binding patch TAKE.
+- NOT_REQUIRED is an explicit judgment, retained in the text and JSON
+  reports. A binding may be schema completeness rather than a strict DTS
+  compile prerequisite. Lack of official product support is not a reason.
+- An absent, duplicate, or contradictory disposition causes a bounded
+  corrected advisor retry; persistent failures become REVIEW.
+- The independent final consistency audit emits `DT_BINDING->UNASSESSED`
+  if a TAKE has binding evidence without a recorded disposition. A plan
+  with such an issue cannot report `execution_ready=true`.
+
+The JSON commit record now includes `advisor_binding_assessments`. This
+makes the missing ArmSoM binding auditable, but does **not** establish
+that an advisor's NOT_REQUIRED reasoning is semantically correct. The
+backporter must still operate only on an inspected executable plan.
+
+### Conservative request-budget refinements
+
+The planner continues to protect the selected patch excerpt, evidence IDs,
+and inbound TAKE prerequisites. Under budget pressure it can also omit
+redundant peer-SHA indexes (which duplicate structured provenance) and
+an optional explanatory notice. The notice no longer causes a REVIEW
+when the remaining required packet itself fits. Excessive mandatory
+patch data still becomes `evidence-budget` REVIEW: no silent truncation.
+
+The advisor prompt/cache version is 15, deliberately invalidating older
+Qwen responses that lack binding dispositions. Validated normalized
+responses preserve prerequisite evidence IDs for correct cache reuse.
+
+### Full CS10 ARM run 23
+
+Keep run 20 as the known-good reference and run 22 for regression comparison.
+After installing 0.4.19 on `shire`, use the normal `run-planner` command
+with both report output names changed to `backport_plan_23` and the same
+Qwen model/context settings. The planner creates its log, performance
+summary, directory, and ZIP automatically. Review binding dispositions,
+REVIEW counts, unresolved issues, and `execution_ready` before backporting.
+The full live Qwen/Ollama run is **not** part of the unit-test suite.
 
 ## Policy-aware small-model advisor and evidence efficiency (0.4.18)
 
