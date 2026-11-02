@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.machinery
 import io
+import collections
 import json
 import subprocess
 import zipfile
@@ -2988,7 +2989,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "16")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "19")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -3383,3 +3384,566 @@ class EvidenceBudget0420Tests(unittest.TestCase):
         with self.assertRaises(kbp.AdvisorError) as e:
             kbp.budget_advisor_packet(packet, "prompt", {}, 4000)
         self.assertEqual(e.exception.kind, "evidence-budget")
+
+class BindingCoverage0421Tests(unittest.TestCase):
+    """Exercise cross-series provider indexing with real temporary Git history."""
+
+    def fixture(self, *, downstream_has_compatible=False):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        def git(*args):
+            cp = subprocess.run(["git", *args], cwd=root, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=True)
+            return cp.stdout.strip()
+        git("init", "-q")
+        git("config", "user.name", "Planner Tests")
+        git("config", "user.email", "planner@example.invalid")
+        bpath = root / "Documentation/devicetree/bindings/vendor,board.yaml"
+        bpath.parent.mkdir(parents=True)
+        if downstream_has_compatible:
+            bpath.write_text("properties:\n  compatible:\n    const: vendor,new-board\n")
+        else:
+            bpath.write_text("properties:\n  compatible:\n    const: vendor,old-board\n")
+        git("add", ".")
+        git("commit", "-qm", "Downstream baseline")
+        base = git("rev-parse", "HEAD")
+        bpath.write_text("properties:\n  compatible:\n    enum:\n"
+                         "      - vendor,old-board\n"
+                         "      - vendor,new-board\n")
+        git("add", ".")
+        git("commit", "-qm", "Add optional vendor,new-board binding")
+        provider = git("rev-parse", "HEAD")
+        dpath = root / "arch/arm64/boot/dts/vendor/new-board.dts"
+        dpath.parent.mkdir(parents=True)
+        dpath.write_text('/dts-v1/;\n/ {\n  compatible = "vendor,new-board", '
+                         '"vendor,old-board";\n};\n')
+        git("add", ".")
+        git("commit", "-qm", "Add a new ARM64 board")
+        board = git("rev-parse", "HEAD")
+        planner = object.__new__(kbp.Planner)
+        planner.git = kbp.Git(root)
+        planner.base = base
+        planner.target = board
+        planner.replay_start = base
+        planner.nodes = {board: kbp.CommitNode(
+            board, "ARM64 board", direct=True,
+            files=["arch/arm64/boot/dts/vendor/new-board.dts"])}
+        planner.series_groups = {}
+        planner.dt_binding_candidate_links = {}
+        planner._dt_binding_provider_index_cache = None
+        planner._dt_binding_audit_scanned = set()
+        planner._tree_file_text_cache = {}
+        planner.info = lambda msg: None
+        planner._advisor_path_product_relevant = lambda path: True
+        planner.patch_excerpt = lambda sha, limit: planner.git.run([
+            "show", "--pretty=format:", "--unified=0", sha,
+        ])[:limit]
+        planner.args = types.SimpleNamespace(
+            advisor_max_diff_chars=12000, advisor_max_peer_diff_chars=6000,
+        )
+        planner.subject = planner.git.subject
+        planner.changed_files = planner.git.changed_files
+        def ensure(sha, reason, required_by):
+            node = planner.nodes.get(sha)
+            if node is None:
+                node = kbp.CommitNode(sha, "binding", files=[
+                    "Documentation/devicetree/bindings/vendor,board.yaml"
+                ])
+                planner.nodes[sha] = node
+            node.add_reason(reason, required_by,
+                            tentative=planner.is_tentative_dependency_reason(reason))
+            return node
+        planner.ensure_node = ensure
+        return planner, board, provider
+
+    def test_discovers_cross_series_provider_without_force_take(self):
+        planner, board, provider = self.fixture()
+        index = planner._dt_binding_provider_index()
+        self.assertIn((provider,
+            "Documentation/devicetree/bindings/vendor,board.yaml"),
+            index["vendor,new-board"])
+        planner._audit_dt_binding_candidates(board)
+        self.assertEqual(planner.dt_binding_candidate_links[board][0]["peer_sha"],
+                         provider)
+        self.assertFalse(planner.is_actionable_node(planner.nodes[provider]))
+        self.assertIn(provider, planner.advisor_allowed_prerequisite_peers(board))
+        evidence = planner.advisor_prerequisite_evidence(board)
+        self.assertTrue(any(item["kind"] == "compatible-binding" and
+                            item["peer_sha"] == provider for item in evidence))
+
+    def test_present_downstream_compatible_is_not_a_candidate(self):
+        planner, board, provider = self.fixture(downstream_has_compatible=True)
+        planner._audit_dt_binding_candidates(board)
+        self.assertFalse(planner.dt_binding_candidate_links.get(board))
+        self.assertNotIn(provider, planner.nodes)
+
+    def test_selected_provider_is_promoted_only_after_required(self):
+        planner, board, provider = self.fixture()
+        planner._audit_dt_binding_candidates(board)
+        evidence = next(item for item in planner.advisor_prerequisite_evidence(board)
+                        if item["peer_sha"] == provider and
+                        item["kind"] == "compatible-binding")
+        consumer = planner.nodes[board]
+        consumer.advisor_decision = "TAKE"
+        consumer.advisor_prerequisites = [{
+            "sha": provider, "evidence_id": evidence["evidence_id"],
+            "evidence_kind": evidence["kind"], "reason": "schema required",
+        }]
+        planner._record_advisor_prerequisite_recommendations = lambda sha: None
+        self.assertEqual(planner._advisor_promote_prerequisites(), 1)
+        self.assertTrue(planner.is_actionable_node(planner.nodes[provider]))
+        self.assertIsNone(planner.nodes[provider].advisor_decision)
+
+    def test_compatible_evidence_survives_short_peer_excerpt(self):
+        planner, board, provider = self.fixture()
+        planner._audit_dt_binding_candidates(board)
+        planner.args.advisor_max_peer_diff_chars = 40
+        evidence = planner.advisor_prerequisite_evidence(board)
+        matches = [x for x in evidence if x["peer_sha"] == provider and
+                   x["kind"] == "compatible-binding"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["object"], "vendor,new-board")
+
+class BindingCoverageSafety0421Tests(unittest.TestCase):
+    def test_coverage_exceeding_evidence_cap_blocks_take(self):
+        planner = object.__new__(kbp.Planner)
+        consumer = kbp.CommitNode("a" * 40, "consumer", direct=True)
+        consumer.advisor_decision = "TAKE"
+        planner.nodes = {consumer.sha: consumer}
+        planner.dt_binding_coverage_overflow = {consumer.sha: 70}
+        planner.ordered_missing = lambda: [consumer.sha]
+        planner.dt_include_unresolved = []
+        planner.advisor_prerequisite_evidence = lambda _sha: []
+        planner._advisor_check_consistency()
+        self.assertEqual(len(planner.advisor_consistency_issues), 1)
+        self.assertEqual(planner.advisor_consistency_issues[0]["kind"],
+                         "DT_BINDING->COVERAGE_OVERFLOW")
+
+    def test_optional_coverage_summary_can_be_budgeted_away(self):
+        packet = {"commit": {
+            "sha": "a" * 40, "patch_excerpt": "+required patch\n",
+            "changed_files": ["arch/arm64/boot/dts/test.dts"],
+            "eligible_prerequisite_evidence": [{
+                "evidence_id": "ev-required", "peer_sha": "b" * 40,
+                "kind": "compatible-binding", "object": "vendor,board",
+            }],
+            "binding_coverage_candidates": [{"detail": "x" * 600}],
+        }}
+        prompt, schema = "prompt", {}
+        minimum = kbp.advisor_request_size(prompt, {
+            "commit": {k: v for k, v in packet["commit"].items()
+                       if k != "binding_coverage_candidates"}}, schema)
+        reduced, budget = kbp.budget_advisor_packet(
+            packet, prompt, schema, minimum + 40)
+        self.assertNotIn("binding_coverage_candidates", reduced["commit"])
+        self.assertIn("eligible_prerequisite_evidence", reduced["commit"])
+        self.assertIn("optional-binding-coverage-summary", budget["omitted"])
+
+    def test_take_consumer_dt_include_provider_evidence_is_explicit(self):
+        planner = object.__new__(kbp.Planner)
+        planner.args = types.SimpleNamespace(
+            advisor_product="rhel10", advisor_max_message_chars=5000,
+            advisor_max_diff_chars=8000, advisor_required_by_depth=1,
+            advisor_max_related_commits=3, advisor_max_related_diff_chars=0,
+        )
+        planner.base = "a" * 40
+        planner.target = "b" * 40
+        planner.downstream = "c" * 40
+        planner.downstream_ref = "cs10/main"
+        planner.paths = ["arch/arm64/"]
+        consumer = kbp.CommitNode("d" * 40, "board", direct=True)
+        consumer.advisor_decision = "TAKE"
+        provider = kbp.CommitNode("e" * 40, "SoC dtsi", files=[
+            "arch/arm64/boot/dts/test/soc.dtsi"])
+        provider.add_reason("dt-include:arch/arm64/boot/dts/test/soc.dtsi",
+                            consumer.sha)
+        planner.nodes = {consumer.sha: consumer, provider.sha: provider}
+        planner.git = types.SimpleNamespace(is_ancestor=lambda *a: True)
+        planner.series_groups = {}
+        planner.body = lambda sha: "test"
+        planner.patch_excerpt = lambda sha, count: "+test"
+        planner.advisor_obsolescence_context = lambda sha, files: {
+            "all_changed_files_deleted_by_take_consumers": False}
+        planner.advisor_required_by_context = lambda sha: []
+        planner.advisor_series_context = lambda sha: []
+        planner.advisor_prerequisite_evidence = lambda sha: []
+        planner.advisor_inbound_take_recommendations = lambda sha: []
+        planner.advisor_allowed_prerequisite_peers = lambda sha: []
+        planner.advisor_product_context = lambda: {
+            "product": "rhel10", "supported_kernel_arch_dirs": ["arm64"]}
+        result = planner.advisor_packet(provider.sha)
+        paths = result["commit"]["deterministic_dt_include_requirements"]
+        self.assertEqual(paths[0]["include_path"],
+                         "arch/arm64/boot/dts/test/soc.dtsi")
+        self.assertEqual(paths[0]["take_consumer_shas"], [consumer.sha])
+
+class VerifiedSourceClaims0422Tests(unittest.TestCase):
+    """Use actual run-25 explanation patterns without inventing schema facts."""
+
+    REALTEK_REASON = (
+        "The compatible string 'realtek,krypton' is already covered by the "
+        "existing binding schema for RTD1501s SoC based boards."
+    )
+    BINDING = "Documentation/devicetree/bindings/arm/realtek.yaml"
+
+    def test_realtek_false_downstream_schema_claim_requires_recheck(self):
+        feedback = kbp.binding_claim_feedback(
+            self.REALTEK_REASON, "realtek,krypton", "const: realtek,old",
+            self.BINDING, {"realtek,old"})
+        self.assertIn("exact compatible is absent", feedback)
+        self.assertIn(self.BINDING, feedback)
+
+    def test_existing_exact_downstream_compatible_is_not_rejected(self):
+        self.assertIsNone(kbp.binding_claim_feedback(
+            self.REALTEK_REASON, "realtek,krypton",
+            "enum: [realtek,krypton]", self.BINDING, {"realtek,krypton"}))
+
+    def test_other_schema_coverage_is_not_declared_impossible(self):
+        feedback = kbp.binding_claim_feedback(
+            self.REALTEK_REASON, "realtek,krypton", None, self.BINDING, set())
+        self.assertIn("A broader pattern or a different schema may cover it", feedback)
+
+    def test_dts_compatible_is_not_equivalent_to_binding_schema(self):
+        feedback = kbp.binding_claim_feedback(
+            "The DTS already contains the compatible string, so no new binding "
+            "is required.", "qnap,ts133", None, self.BINDING, set())
+        self.assertIn("not binding-schema coverage", feedback)
+
+    def test_not_required_source_claim_fails_closed_in_validation(self):
+        planner, consumer, evidence = AdvisorBinding0419Tests.fixture()
+        evidence["provider_path"] = self.BINDING
+        evidence["object"] = "realtek,krypton"
+        planner.replay_start = "a" * 40
+        planner._tree_file_text = lambda tree, path: "const: realtek,old"
+        assessment = {"evidence_id": evidence["evidence_id"],
+                      "disposition": "NOT_REQUIRED", "reason": self.REALTEK_REASON}
+        with self.assertRaises(kbp.AdvisorError) as caught:
+            planner.validate_advisor_result(
+                consumer.sha, AdvisorBinding0419Tests.answer([], [assessment]))
+        self.assertEqual(caught.exception.kind, "binding-source-claim")
+        self.assertTrue(caught.exception.retryable)
+
+    def test_verified_include_fact_does_not_infer_yaml_requirement(self):
+        planner = object.__new__(kbp.Planner)
+        consumer = kbp.CommitNode("a" * 40, "TAKE board")
+        consumer.advisor_decision = "TAKE"
+        provider = kbp.CommitNode("b" * 40, "DTSI provider")
+        path = "arch/arm64/boot/dts/rockchip/rk3576.dtsi"
+        provider.add_reason("dt-include:" + path, consumer.sha)
+        planner.nodes = {consumer.sha: consumer, provider.sha: provider}
+        planner.replay_start = "c" * 40
+        planner._tree_file_text = lambda rev, path: (
+            None if rev == planner.replay_start else "/ { test; };"
+        )
+        facts = planner._advisor_hard_dt_include_facts(provider.sha)
+        self.assertEqual(facts[0]["include_path"], path)
+        self.assertEqual(facts[0]["take_consumer_shas"], [consumer.sha])
+        self.assertEqual(facts[0]["downstream_file"], "absent")
+        self.assertIn("source #include", kbp.dt_include_retry_prompt("base", facts))
+
+    def test_include_provider_review_gets_targeted_retry_not_forced_take(self):
+        planner = object.__new__(kbp.Planner)
+        sha = "b" * 40
+        planner.nodes = {sha: kbp.CommitNode(sha, "DTSI provider")}
+        planner.args = types.SimpleNamespace(advisor_retries=2,
+                         advisor_retry_delay=0, advisor_context_tokens=0)
+        planner.advisor_calls = planner.advisor_retries_used = 0
+        planner.advisor_prerequisite_evidence = lambda _: []
+        planner.advisor_inbound_take_recommendations = lambda _: []
+        planner.validate_advisor_result = lambda _, response: response
+        planner._advisor_hard_dt_include_facts = lambda _: [{
+            "include_path": "arch/arm64/boot/dts/test.dtsi",
+            "take_consumer_shas": ["a" * 40]}]
+        planner._write_advisor_error_diagnostic = lambda *args: None
+        planner.info = lambda _: None
+        class Client:
+            last_telemetry = None
+            def __init__(self): self.prompts = []
+            def advise(self, prompt, packet, schema):
+                self.prompts.append(prompt)
+                return {"decision": "REVIEW", "rationale":
+                        "Not sure if the platform needs the DTSI source.",
+                        "risks": []}
+        client = Client()
+        result = planner._advisor_call_with_retries(client, "base", sha, {})
+        self.assertEqual(result["decision"], "REVIEW")
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("HARD DT INCLUDE RECHECK", client.prompts[1])
+
+
+class ExactTrace0422Tests(unittest.TestCase):
+    def test_capture_and_git_free_exact_replay(self):
+        with tempfile.TemporaryDirectory() as td:
+            trace = Path(td) / "requests.jsonl"
+            output = Path(td) / "results.jsonl"
+            packet = {"commit": {"sha": "a" * 40, "patch_excerpt": "+x"}}
+            schema = {"type": "object"}
+            response = {"decision": "TAKE", "rationale": "works"}
+            planner = object.__new__(kbp.Planner)
+            planner.advisor_trace_path = trace
+            planner._write_advisor_trace({
+                "trace_format": "exact-advisor-request-v1", "sha": "a" * 40,
+                "attempt": 1, "model": "kernel-planner:32k",
+                "prompt_version": "18", "system_prompt": "original prompt",
+                "packet": packet, "response_schema": schema,
+                "response": response, "error_kind": None})
+            self.assertEqual(json.loads(trace.read_text().splitlines()[0])
+                             ["packet"], packet)
+            calls = []
+            class FakeClient:
+                def __init__(self, *args): self.last_telemetry = None
+                def advise(self, prompt, packet_arg, schema_arg):
+                    calls.append((prompt, packet_arg, schema_arg))
+                    return response
+            with mock.patch.object(kbp, "OllamaAdvisor", FakeClient), \
+                 mock.patch.object(kbp, "run_planner", side_effect=AssertionError(
+                     "must not run collection")):
+                rc = kbp.main(["--advisor-replay-trace", str(trace),
+                               "--advisor-model", "kernel-planner:32k",
+                               "--advisor-commit", "a" * 12,
+                               "--benchmark-output", str(output)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, [("original prompt", packet, schema)])
+            replay = json.loads(output.read_text().splitlines()[0])
+            self.assertTrue(replay["matches_original"])
+            self.assertEqual(replay["replay_type"],
+                             "exact-saved-prompt-packet-schema")
+            self.assertEqual(replay["status"], "ok")
+            with mock.patch.object(kbp, "OllamaAdvisor", FakeClient):
+                self.assertEqual(kbp.main(["--advisor-replay-trace", str(trace),
+                    "--advisor-model", "kernel-planner:32k",
+                    "--benchmark-output", str(output)]), 1)
+
+    def test_trace_cli_requires_output_and_model(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                kbp.parse_args(["--advisor-replay-trace", "/tmp/trace.jsonl"])
+
+class ExactTracePackaging0422Tests(unittest.TestCase):
+    def test_trace_is_included_in_auto_package(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix = Path(td) / "backport_plan_26"
+            trace = Path(td) / "backport_plan_26.c.advisor-trace.jsonl"
+            trace.write_text('{"sha":"example"}\n')
+            prefix.with_suffix(".c").write_text("plan\n")
+            prefix.with_suffix(".log").write_text("log\n")
+            prefix.with_suffix(".json").write_text(json.dumps({
+                "advisor": {"trace_path": str(trace)}
+            }))
+            _, archive = kbp.package_results(str(prefix))
+            with zipfile.ZipFile(archive) as result:
+                names = result.namelist()
+                self.assertIn("backport_plan_26/" + trace.name, names)
+                self.assertEqual(result.read(
+                    "backport_plan_26/" + trace.name), trace.read_bytes())
+
+
+class DualAdvisor0423Tests(unittest.TestCase):
+    def make_planner(self):
+        planner = object.__new__(kbp.Planner)
+        planner.nodes = {
+            "a" * 40: kbp.CommitNode("a" * 40, "missing include", direct=True),
+            "b" * 40: kbp.CommitNode("b" * 40, "binding conflict", direct=True),
+        }
+        for node in planner.nodes.values():
+            node.match = kbp.Match(status="missing")
+            node.advisor_decision = "REVIEW"
+            node.advisor_rationale = "Qwen uncertainty"
+            node.advisor_decision_model = "kernel-planner:32k"
+        planner.advisor_model = "kernel-planner:32k"
+        planner.advisor_primary_model = planner.advisor_model
+        planner.advisor_fallback_model = "gemma4-kernel:128k"
+        planner.advisor_calls = 0
+        planner.advisor_failures = 0
+        planner.advisor_failure_kinds = collections.Counter()
+        planner.advisor_fallback_evaluated = 0
+        planner.advisor_fallback_accepted = 0
+        planner.advisor_fallback_changed = 0
+        planner.advisor_fallback_take = 0
+        planner.advisor_fallback_failures = 0
+        planner.advisor_fallback_unprocessed = 0
+        planner.advisor_consistency_issues = [{
+            "kind": "DT_INCLUDE->REVIEW", "consumer_sha": "b" * 40,
+            "prerequisite_sha": "a" * 40,
+        }]
+        planner.args = types.SimpleNamespace(
+            advisor_fallback_limit=0, advisor_base_url="http://gondor:11434",
+            advisor_temperature=0.0, advisor_keep_alive="10m", debug=False,
+            advisor_max_request_chars=48000, advisor_context_tokens=32768,
+            advisor_fallback_max_request_chars=120000,
+            advisor_fallback_context_tokens=131072,
+            advisor_fallback_timeout=900,
+        )
+        planner.performance = None
+        planner._advisor_stage = "primary"
+        planner.info = lambda msg: None
+        planner.advisor_system_prompt = lambda: "policy"
+        planner._record_advisor_prerequisite_recommendations = lambda sha: None
+        planner._advisor_promote_prerequisites = lambda: 0
+        planner._advisor_resolve_rejected_prerequisites = lambda: None
+        planner._advisor_check_consistency = lambda: setattr(
+            planner, "advisor_consistency_issues", [])
+        planner._advisor_binding_conflicts = lambda: {}
+        return planner
+
+    def test_prioritizes_blocked_provider_then_other_reviews(self):
+        p = self.make_planner()
+        candidates = p._advisor_fallback_candidates()
+        self.assertEqual([s for s, _ in candidates], ["a" * 40, "b" * 40])
+        self.assertIn("dependency:DT_INCLUDE->REVIEW", candidates[0][1])
+
+    def test_full_two_phase_changes_valid_review_to_take(self):
+        p = self.make_planner()
+        calls = []
+        class Primary:
+            def unload(self): calls.append("unload-primary")
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            calls.append((p.advisor_model, sha))
+            self.assertEqual(p.args.advisor_max_request_chars, 120000)
+            self.assertEqual(p.args.advisor_context_tokens, 131072)
+            p.nodes[sha].advisor_decision = "TAKE"
+            p.nodes[sha].advisor_rationale = "verified source prerequisites"
+            p.nodes[sha].advisor_error = None
+            p.nodes[sha].advisor_error_kind = None
+            p.nodes[sha].advisor_decision_model = p.advisor_model
+        p._advisor_evaluate_one = fake_evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor") as client:
+            p._advisor_fallback_pass(Primary())
+        self.assertEqual(calls[0], "unload-primary")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(item[0] == "gemma4-kernel:128k"
+                            for item in calls[1:]))
+        self.assertEqual(p.advisor_fallback_evaluated, 2)
+        self.assertEqual(p.advisor_fallback_accepted, 2)
+        self.assertEqual(p.advisor_fallback_changed, 2)
+        self.assertEqual(p.advisor_fallback_take, 2)
+        self.assertEqual(p.nodes["a" * 40].advisor_primary_result["advisor_decision"],
+                         "REVIEW")
+        self.assertEqual(p.nodes["a" * 40].advisor_decision_model,
+                         "gemma4-kernel:128k")
+        self.assertEqual(p.advisor_model, "kernel-planner:32k")
+        self.assertEqual(p.args.advisor_max_request_chars, 48000)
+        self.assertEqual(p.args.advisor_context_tokens, 32768)
+        client.assert_called_once()
+
+    def test_fallback_failure_preserves_primary_error_and_decision(self):
+        p = self.make_planner()
+        first = p.nodes["a" * 40]
+        first.advisor_error_kind = "policy-review"
+        first.advisor_error = "Qwen policy objection"
+        p.advisor_failures = 1
+        p.advisor_failure_kinds["policy-review"] = 1
+        p.advisor_model = p.advisor_fallback_model
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            p._advisor_note_failure(p.nodes[sha], kbp.AdvisorError(
+                "Gemma timeout", kind="timeout"))
+        p._advisor_evaluate_one = fake_evaluate
+        p._advisor_fallback_one(None, "policy", "a" * 40, ["review"])
+        self.assertEqual(first.advisor_error_kind, "policy-review")
+        self.assertEqual(first.advisor_rationale, "Qwen uncertainty")
+        self.assertEqual(first.advisor_decision_model, "kernel-planner:32k")
+        self.assertEqual(first.advisor_fallback_result["advisor_error_kind"],
+                         "timeout")
+        self.assertEqual(p.advisor_fallback_failures, 1)
+        self.assertEqual(p.advisor_failures, 1)
+        self.assertEqual(dict(p.advisor_failure_kinds), {"policy-review": 1})
+
+    def test_fallback_skip_does_not_override_review(self):
+        p = self.make_planner()
+        p.advisor_model = p.advisor_fallback_model
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            p.nodes[sha].advisor_decision = "SKIP"
+            p.nodes[sha].advisor_decision_model = p.advisor_model
+        p._advisor_evaluate_one = fake_evaluate
+        p._advisor_fallback_one(None, "policy", "a" * 40, ["review"])
+        self.assertEqual(p.nodes["a" * 40].advisor_decision, "REVIEW")
+        self.assertEqual(p.nodes["a" * 40].advisor_fallback_result["advisor_decision"],
+                         "SKIP")
+        self.assertEqual(p.advisor_fallback_accepted, 0)
+
+    def test_limit_does_not_silently_make_report_execution_ready(self):
+        p = self.make_planner()
+        p.args.advisor_fallback_limit = 1
+        p._advisor_evaluate_one = lambda *a, **kw: None
+        class Primary:
+            def unload(self): pass
+        with mock.patch.object(kbp, "OllamaAdvisor"):
+            p._advisor_fallback_pass(Primary())
+        self.assertEqual(p.advisor_fallback_unprocessed, 1)
+        self.assertIn("ADVISOR_FALLBACK->INCOMPLETE",
+                      [x["kind"] for x in p.advisor_consistency_issues])
+
+    def test_model_specific_cache_fingerprint(self):
+        p = self.make_planner()
+        p.base, p.target, p.downstream = "base", "target", "downstream"
+        packet = {"commit": {"sha": "a" * 40}}
+        key1 = p.advisor_cache_key("a" * 40, packet)
+        p.advisor_model = p.advisor_fallback_model
+        key2 = p.advisor_cache_key("a" * 40, packet)
+        self.assertNotEqual(key1, key2)
+
+    def test_unload_uses_ollama_api_without_generating(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{}'
+        def urlopen(request, timeout):
+            self.assertEqual(request.full_url, "http://gondor:11434/api/chat")
+            body = json.loads(request.data)
+            self.assertEqual(body, {"model": "kernel-planner:32k",
+                "messages": [], "keep_alive": 0, "stream": False})
+            return Response()
+        client = kbp.OllamaAdvisor("kernel-planner:32k",
+            "http://gondor:11434", 100, 0, "10m")
+        with mock.patch.object(kbp.urllib.request, "urlopen", urlopen):
+            client.unload()
+
+    def test_fallback_model_is_verified_before_collection(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps({"models": [
+                {"name": "gemma4-kernel:128k"}]}).encode()
+        with mock.patch.object(kbp.urllib.request, "urlopen",
+                               return_value=Response()):
+            kbp.verify_advisor_fallback_model("http://gondor:11434",
+                                              "gemma4-kernel:128k")
+            with self.assertRaises(SystemExit):
+                kbp.verify_advisor_fallback_model("http://gondor:11434",
+                                                  "missing:latest")
+
+    def test_cli_requires_distinct_primary_and_fallback(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                kbp.parse_args(["--advisor-fallback-model", "gemma4:26b"])
+            with self.assertRaises(SystemExit):
+                kbp.parse_args(["--advisor-model", "x",
+                                "--advisor-fallback-model", "x"])
+
+    def test_per_model_performance_counters(self):
+        p = kbp.PerformanceRecorder()
+        p.advisor("a" * 40, 1, 2.5, model="kernel-planner:32k",
+                  stage="primary")
+        p.advisor("b" * 40, 1, 7.5, model="gemma4-kernel:128k",
+                  stage="fallback", status="failed")
+        summary = p.summary()
+        stats = summary["advisor"]["per_model"]
+        self.assertEqual(stats["kernel-planner:32k"]["requests"], 1)
+        self.assertEqual(stats["gemma4-kernel:128k"]["failed_attempts"], 1)
+        self.assertEqual(stats["gemma4-kernel:128k"]["seconds"], 7.5)
+
+    def test_secondary_failure_without_primary_error_does_not_invent_one(self):
+        p = self.make_planner()
+        p.advisor_model = p.advisor_fallback_model
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            p._advisor_note_failure(p.nodes[sha], kbp.AdvisorError(
+                "No response", kind="timeout"))
+        p._advisor_evaluate_one = fake_evaluate
+        p._advisor_fallback_one(None, "policy", "a" * 40, ["review"])
+        node = p.nodes["a" * 40]
+        self.assertEqual(node.advisor_decision, "REVIEW")
+        self.assertIsNone(node.advisor_error_kind)
+        self.assertEqual(p.advisor_failures, 0)
+        self.assertFalse(p.advisor_failure_kinds)

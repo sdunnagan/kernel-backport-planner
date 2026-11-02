@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.20**.
+Current tool version: **0.4.23**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -23,6 +23,89 @@ The key distinction is that `--base` limits the **focus candidate range**, not
 the dependency universe. A required prerequisite may predate `--base` if there
 is concrete evidence that a selected commit depends on it and that prerequisite
 is not already downstream.
+
+## Selective dual-model advisor (0.4.23)
+
+The planner can use a fast local Ollama model for the complete first pass,
+then **batch** difficult decisions through a stronger model on the **same
+Ollama server**. It never needs to keep both models resident simultaneously.
+
+- Primary Qwen performs the normal full planning pass, corrective rechecks,
+  prerequisite promotion, and consistency audit.
+- The secondary model examines all remaining REVIEW decisions (including
+  budget failures and advisor errors), unresolved TAKE-prerequisite providers,
+  and consumers involved in binding disagreements. Providers blocking multiple
+  TAKE commits receive priority.
+- The primary model is explicitly unloaded before the secondary batch.
+  `OLLAMA_MAX_LOADED_MODELS=1` is recommended on systems with limited VRAM.
+- Each secondary response passes the same structured schema, source-fact,
+  policy, token-context, and graph consistency validation. A secondary SKIP
+  does **not** silently replace a primary REVIEW or TAKE. If the secondary
+  evaluation fails, the original primary decision is restored.
+- Secondary-model answers have independent cache fingerprints and the exact
+  request trace identifies the model and stage. The output JSON includes
+  `advisor_primary_result`, `advisor_fallback_result`,
+  `advisor_decision_model`, and `advisor_escalation_reasons` per escalated
+  commit. Report metadata includes fallback counts and per-model timings.
+- Newly promoted prerequisites are evaluated within the secondary batch and
+  replay-verified if simulation is enabled. Unresolved edges continue to
+  prevent `execution_ready=true`.
+
+The `--advisor-fallback-model` switch is **opt-in**. Omitting it preserves
+single-model behavior. `--advisor-fallback-limit 0` evaluates all eligible
+cases (default); a positive cap leaves an explicit `INCOMPLETE` consistency
+warning if cases were skipped. The planner checks `/api/tags` before costly
+Git analysis to confirm that the fallback model is installed on Ollama.
+
+### Restoring the previous Gemma 4 model on gondor
+
+Gemma 4 26B A4B is much larger than Qwen 7B and will offload layers to RAM
+on an RTX 3070 (8 GB). With 32 GB of system RAM and the same configuration
+as previous Gemma runs, use:
+
+```bash
+ollama pull gemma4:26b
+mkdir -p ~/ai/gemma4-kernel
+cat > ~/ai/gemma4-kernel/Modelfile.128k <<'EOF'
+FROM gemma4:26b
+PARAMETER num_ctx 131072
+EOF
+ollama create gemma4-kernel:128k -f ~/ai/gemma4-kernel/Modelfile.128k
+ollama list
+```
+
+Do not run Gemma concurrently with Qwen. Set the Ollama service to
+`OLLAMA_MAX_LOADED_MODELS=1` on gondor. Both models can remain stored on disk.
+
+### Complete run example, run 27 on shire
+
+Add the following switches to the existing `~/bin/run-planner` invocation;
+keep the current Git remotes, file list and primary Qwen settings:
+
+```bash
+--advisor-model kernel-planner:32k \
+--advisor-base-url http://gondor:11434 \
+--advisor-max-request-chars 48000 \
+--advisor-context-tokens 32768 \
+--advisor-output-reserve 1024 \
+--advisor-fallback-model gemma4-kernel:128k \
+--advisor-fallback-timeout 900 \
+--advisor-fallback-max-request-chars 120000 \
+--advisor-fallback-context-tokens 131072 \
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_27.c.advisor-trace.jsonl" \
+--output "$KERNEL_WORKSPACE_DIR/backport_plan_27.c" \
+--json-output "$KERNEL_WORKSPACE_DIR/backport_plan_27.json"
+```
+
+`--advisor-fallback-limit 0` is the default and places no cap on the number
+of secondary evaluations; the run may therefore take substantially longer
+than Qwen-only run 26. The fallback has a longer timeout because Gemma uses
+CPU offloading. The 120000-character budget is a separate safety limit,
+not a claim that character count is a reliable token count.
+
+A full CS10 / Qwen / Gemma integration run has not been performed as part of
+this release's unit tests. Preserve run 26 and inspect both model judgments
+before using run 27 as an automated execution plan.
 
 ## Why this exists
 
@@ -153,6 +236,102 @@ is rejected before analysis, preventing a costly misnamed run. Use
 logs and archives externally. Standalone `--package-results PREFIX` remains
 available for packaging older completed runs.
 
+
+## Verified binding claims, source includes, and exact advisor replay (0.4.22)
+
+Version 0.4.22 responds to run 25's remaining Qwen policy and binding
+misclassifications. It does **not** force previously rejected YAML binding
+candidates to TAKE, and it does not treat a successful dependency consistency
+audit as proof that a kernel backport will build or function correctly.
+
+- For a TAKE consumer that marks compatible-binding evidence NOT_REQUIRED, the
+  planner checks a claim of *existing downstream schema coverage* against the
+  actual downstream version of the cited YAML binding file. If the file is
+  absent, or the exact compatible does not appear there, the assertion is not
+  accepted without an evidence-specific correction. A broader schema pattern
+  or a different binding might still cover the value; the model must identify
+  its path and matching rule rather than merely guessing.
+- Saying that the DTS already declares a compatible is not sufficient proof
+  that a YAML binding exists. Such a NOT_REQUIRED explanation is rejected for
+  corrective evaluation. As before, an uncorrected assessment stays REVIEW;
+  the planner never silently promotes the YAML schema to a required patch.
+- The planner now distinguishes **missing DT source includes** from YAML
+  schema completeness. A TAKE consumer's verified missing DTS/DTSI source
+  gets an evidence-specific recheck when its source provider is dismissed
+  without a concrete technical obstacle. This does not suppress independent
+  API, integration, conflict, or build risks.
+- The advisor prompt/cache version is **18**, so older Qwen responses without
+  these guardrails do not silently bypass the new checks.
+
+Exact request tracing is opt-in (traces may contain substantial kernel source
+text). On `shire`, keep the other run options unchanged and use:
+
+```bash
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_26.c.advisor-trace.jsonl" \
+--output "$KERNEL_WORKSPACE_DIR/backport_plan_26.c" \
+--json-output "$KERNEL_WORKSPACE_DIR/backport_plan_26.json"
+```
+
+The trace writes each *actual* Ollama system prompt, compact evidence packet,
+structured response schema, raw structured model reply, retry type, and
+telemetry to append-only JSONL, without running an additional model request.
+It is included in the normal auto-packaged ZIP and is never overwritten if
+that trace path already exists. Cached recommendations do not generate a
+model request and therefore do not create trace entries.
+
+To replay only the Realtek Kent consumer from the captured run, without a
+fresh Git collection or reconstructed packet:
+
+```bash
+kernel-backport-planner \
+  --advisor-replay-trace backport_plan_26.c.advisor-trace.jsonl \
+  --advisor-model kernel-planner:32k \
+  --advisor-base-url http://gondor:11434 \
+  --advisor-commit b095c27fc874 \
+  --benchmark-output realtek-replay-01.jsonl
+```
+
+The replay resends the saved prompt, packet, and schema exactly and saves the
+new model output in a new file. It does not repeat the planner's graph
+reconciliation or guarantee identical responses, particularly if the model,
+quantization, or Ollama settings change. Existing
+`--advisor-benchmark-plan` remains a separate **reconstructed** benchmark.
+
+## Cross-series binding coverage and corrective evidence (0.4.21)
+
+Version 0.4.21 audits upstream Device Tree binding *compatible additions*
+against added `compatible` strings in selected DTS/DTSI patches. A single
+batch `git log` scan of added YAML lines indexes potential provider commits in
+`--base..--target`. For each upstream DT change being advised, the planner:
+
+- Matches the most-specific newly added DTS compatible to YAML binding additions.
+- Verifies that a provider precedes the consumer in upstream Git ancestry.
+- Ignores providers whose schema already advertises the exact compatible in
+  the frozen downstream baseline, or whose commit is already present.
+- Records other providers as **tentative**, including cross-series commits.
+  The provider is not a selected dependency unless the advisor explicitly
+  judges its evidence REQUIRED. A NOT_REQUIRED disposition requires a
+  technical explanation; absent coverage is never silently interpreted TAKE.
+- Adds the evidence to the consumer's advisor packet, preserving it even when
+  bounded peer diff excerpts omit the actual compatible declaration.
+- Surfaces coverage candidates and aggregate counts in the JSON and text
+  reports. A promoted candidate still receives its own advisor evaluation.
+
+This is a bounded *candidate discovery*, not a claim of complete semantic
+prerequisite closure. It currently covers new compatible declarations in YAML
+within the planning range, but not every possible property binding, existing
+pre-base schema, dynamic overlay relationship, or C-language symbol. An
+`execution_ready=true` result is therefore a consistency check for known
+relationships, not proof that every possible prerequisite was discovered.
+
+For a provider with verified DTS/DTSI includes, the advisor packet now keeps
+concise exact-path evidence of the TAKE consumers requiring the file. Binding
+conflict rechecks likewise include the path's downstream existence and
+compatible state and explicitly ask for a source-based resolution.
+
+The advisor prompt version is 17 to prevent stale cached decisions lacking
+this evidence from being reused. Run 25 is the first intended full validation;
+previous run 24 results remain unmodified.
 
 ## Binding disagreement reconciliation and evidence budgets (0.4.20)
 

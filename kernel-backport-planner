@@ -41,8 +41,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.20"
-ADVISOR_PROMPT_VERSION = "16"
+VERSION = "0.4.23"
+ADVISOR_PROMPT_VERSION = "19"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -111,6 +111,7 @@ class PerformanceRecorder:
         self.advisor_cache_hits = 0
         self.advisor_input_bytes = 0
         self.advisor_metrics: dict[str, int] = collections.defaultdict(int)
+        self.advisor_models: dict[str, dict[str, float | int]] = {}
         self._pending_events = 0
         self.event("run_start", version=VERSION)
 
@@ -150,10 +151,18 @@ class PerformanceRecorder:
 
     def advisor(self, sha: str, attempt: int, seconds: float, *,
                 input_bytes: int = 0, status: str = "ok",
-                ollama: dict | None = None) -> None:
+                ollama: dict | None = None, model: str | None = None,
+                stage: str = "primary") -> None:
         self.advisor_requests += 1
         self.advisor_seconds += seconds
         self.advisor_input_bytes += input_bytes
+        if model:
+            entry = self.advisor_models.setdefault(model, {"requests": 0,
+                "seconds": 0.0, "failed_attempts": 0})
+            entry["requests"] += 1
+            entry["seconds"] += seconds
+            if status != "ok":
+                entry["failed_attempts"] += 1
         if status != "ok":
             self.advisor_failures += 1
         measurements = {}
@@ -164,6 +173,7 @@ class PerformanceRecorder:
                 measurements[key] = value
                 self.advisor_metrics[key] += value
         self.event("advisor_request", sha=sha[:12], attempt=attempt,
+                   model=model, stage=stage,
                    seconds=round(seconds, 3), status=status,
                    input_bytes=input_bytes, ollama=measurements)
 
@@ -186,7 +196,10 @@ class PerformanceRecorder:
                         "failed_attempts": self.advisor_failures,
                         "cache_hits": self.advisor_cache_hits,
                         "packet_input_bytes": self.advisor_input_bytes,
-                        "ollama": dict(self.advisor_metrics)},
+                        "ollama": dict(self.advisor_metrics),
+                        "per_model": {k: {**v,
+                            "seconds": round(v["seconds"], 3)}
+                            for k, v in sorted(self.advisor_models.items())}},
             "events_path": str(self.events_path) if self.events_path else None,
         }
 
@@ -321,6 +334,10 @@ class CommitNode:
     advisor_error: str | None = None
     advisor_error_kind: str | None = None
     advisor_attempts: int = 0
+    advisor_decision_model: str | None = None
+    advisor_primary_result: dict | None = None
+    advisor_fallback_result: dict | None = None
+    advisor_escalation_reasons: list[str] = dataclasses.field(default_factory=list)
     symbol_dependency_proofs: list[dict[str, object]] = dataclasses.field(default_factory=list)
 
     def add_reason(
@@ -543,14 +560,77 @@ def policy_retry_prompt(prompt: str) -> str:
             "Return the same JSON schema.\n")
 
 
-def binding_retry_prompt(prompt: str) -> str:
+def binding_retry_prompt(prompt: str, evidence_feedback: str = "") -> str:
     """Request missing binding dispositions without fabricating dependencies."""
     return (prompt + "\n\nBINDING EVIDENCE RECHECK: For a TAKE decision, "
             "assess EVERY compatible-binding and dt-property-binding evidence_id "
             "as REQUIRED or NOT_REQUIRED with a concrete reason. Include REQUIRED "
             "IDs in prerequisite_evidence_ids. If NOT_REQUIRED, explain why the "
             "binding is dispensable for this patch; lack of official board support "
-            "is not an answer. Do not change Git evidence or invent dependencies.\n")
+            "is not an answer. Do not change Git evidence or invent dependencies.\n"
+            + ("SOURCE FACT RECHECK: " + evidence_feedback + "\n"
+               if evidence_feedback else ""))
+
+
+# This is intentionally a narrowly scoped language check, not semantic YAML
+# validation. The planner can disprove exact downstream-compatible presence,
+# but it cannot prove that every broader pattern in another binding is invalid.
+_EXISTING_SCHEMA_CLAIM = re.compile(
+    r"(?:\b(?:existing|downstream|current|pre[- ]existing|already)\b.{0,120}"
+    r"\b(?:schema|binding)\b.{0,80}\b(?:covers?|supports?|defines?|"
+    r"contains?|accepts?|handles?|matches?)\b|"
+    r"\b(?:covers?|supports?|defines?|contains?|accepts?|handles?|matches?)\b"
+    r".{0,80}\b(?:existing|downstream|current|pre[- ]existing|already)\b"
+    r".{0,100}\b(?:schema|binding)\b|"
+    r"\b(?:covered|supported|defined|present)\s+by\s+(?:the\s+)?"
+    r"(?:existing|downstream|current|pre[- ]existing)?\s*(?:binding|schema)\b)",
+    re.IGNORECASE,
+)
+_DTS_IS_SCHEMA_CLAIM = re.compile(
+    r"\b(?:dts|dtsi|device\s+tree|board\s+file)\b.{0,130}"
+    r"\b(?:already|itself|includes?|contains?|declares?|defines?)\b.{0,130}"
+    r"\bcompatible\b|\bcompatible\b.{0,110}"
+    r"\b(?:already|itself)\b.{0,70}\b(?:dts|dtsi|device\s+tree)\b",
+    re.IGNORECASE,
+)
+
+
+def binding_claim_feedback(reason: str, compatible: str, schema_text: str | None,
+                           binding_path: str, exact_compatibles: set[str]) -> str | None:
+    """Flag source-unsupported NOT_REQUIRED claims, never manufacture TAKE.
+
+    Absence of the exact compatible in one downstream schema is not proof that
+    no other schema or wildcard pattern can match it. Require evidence of the
+    *alternative* schema rather than accepting unsupported 'already covered'.
+    """
+    if _DTS_IS_SCHEMA_CLAIM.search(reason):
+        return ("DTS compatible declarations are not binding-schema coverage; "
+                "identify the actual downstream YAML schema or an independent "
+                "technical reason the binding patch can be omitted")
+    if _EXISTING_SCHEMA_CLAIM.search(reason):
+        if schema_text is None:
+            status = "the referenced downstream binding path is absent"
+        elif compatible not in exact_compatibles:
+            status = "the exact compatible is absent from the referenced downstream YAML schema"
+        else:
+            return None
+        return (f"{status}: {binding_path} ({compatible}). A broader pattern "
+                "or a different schema may cover it, but that claim needs its "
+                "path and matching rule; "
+                "do not infer coverage from the SoC family or DTS declaration")
+    return None
+
+
+def dt_include_retry_prompt(prompt: str, facts: list[dict]) -> str:
+    """Show exact missing source-file evidence without forcing a decision."""
+    return (prompt + "\nHARD DT INCLUDE RECHECK: Git verified the following "
+            "missing source files required by already-TAKE consumers: "
+            + serialize_advisor_packet(facts) + "\nA DT source #include "
+            "is different from an optional YAML binding. Do not dismiss "
+            "these providers because hardware lacks official support or "
+            "because a schema might be optional. TAKE unless a concrete "
+            "technical obstacle makes this particular provider unsafe; "
+            "otherwise use REVIEW and name that obstacle.\n")
 
 
 def parse_advisor_structured_content(content: str) -> dict:
@@ -602,6 +682,19 @@ class OllamaAdvisor:
         self.keep_alive = keep_alive
         self.debug = debug
         self.last_telemetry: dict | None = None
+
+    def unload(self) -> None:
+        """Ask Ollama to release VRAM/RAM before loading another model.
+
+        No model content is sent; Ollama still enforces its loaded-model cap.
+        """
+        request = urllib.request.Request(
+            self.base_url + "/api/chat",
+            data=json.dumps({"model": self.model, "messages": [],
+                             "keep_alive": 0, "stream": False}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=min(self.timeout, 60)) as response:
+            response.read()
 
     def advise(self, system_prompt: str, packet: dict, response_schema: dict | None = None) -> dict:
         self.last_telemetry = None
@@ -692,6 +785,25 @@ class OllamaAdvisor:
 
 
 
+def verify_advisor_fallback_model(base_url: str, model: str) -> None:
+    """Fail before expensive collection if the secondary model is not local.
+
+    Ollama /api/tags lists installed models and does not load model weights.
+    """
+    url = normalize_http_base_url(base_url) + "/api/tags"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            tags = json.load(response)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise SystemExit("cannot verify Ollama fallback model " + model +
+                         " at " + url + ": " + str(exc)) from exc
+    available = {item.get("name") for item in tags.get("models", [])
+                 if isinstance(item, dict)}
+    if model not in available:
+        raise SystemExit("Ollama fallback model " + model +
+                         " is not installed; check 'ollama list' on gondor")
+
+
 def serialize_advisor_packet(packet: dict) -> str:
     """Stable, compact JSON for Ollama. Avoid whitespace-heavy prompt inflation."""
     return json.dumps(packet, sort_keys=True, ensure_ascii=True,
@@ -742,6 +854,12 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
             and "all_missing_earlier_peer_shas" in commit):
         del commit["all_missing_earlier_peer_shas"]
         meta["omitted"].append("optional-earlier-peer-index")
+    # The binding coverage summary duplicates full authoritative evidence
+    # records. It can be omitted, but the actual evidence IDs cannot.
+    if (advisor_request_size(prompt, output, schema) > limit
+            and "binding_coverage_candidates" in commit):
+        del commit["binding_coverage_candidates"]
+        meta["omitted"].append("optional-binding-coverage-summary")
     # These are provenance/context excerpts, not eligible prerequisite evidence.
     excerpts = []
     for peer in commit.get("same_series", []):
@@ -847,12 +965,29 @@ class Planner:
         self._changed_files_cache: dict[str, list[str]] = {}
         self._tree_file_text_cache: dict[tuple[str, str], str | None] = {}
         self._dt_include_closure_cache: dict[tuple[str, str], set[str]] = {}
+        # Evidence-backed compatible providers beyond a commit's patch series.
+        # These are only candidate leads until an advisor selects REQUIRED.
+        self.dt_binding_candidate_links: dict[str, list[dict[str, str]]] = {}
+        self._dt_binding_provider_index_cache: (
+            dict[str, list[tuple[str, str]]] | None
+        ) = None
+        self._dt_binding_audit_scanned: set[str] = set()
+        self.dt_binding_coverage_overflow: dict[str, int] = {}
         self._match_cache: dict[str, Match] = {}
         self._fixes_children: dict[str, set[str]] | None = None
         self._dependency_expanded: set[str] = set()
         self._pre_base_cache: dict[str, bool] = {}
         self.series_groups: dict[str, list[tuple[int, str]]] = {}
         self.advisor_model = args.advisor_model
+        self.advisor_primary_model = args.advisor_model
+        self.advisor_fallback_model = getattr(args, "advisor_fallback_model", None)
+        self.advisor_fallback_evaluated = 0
+        self.advisor_fallback_accepted = 0
+        self.advisor_fallback_failures = 0
+        self.advisor_fallback_changed = 0
+        self.advisor_fallback_take = 0
+        self.advisor_fallback_unprocessed = 0
+        self._advisor_stage = "primary"
         self.advisor_cache_path: Path | None = None
         self.advisor_cache: dict[str, dict] = {}
         self.advisor_calls = 0
@@ -865,6 +1000,7 @@ class Planner:
         self.advisor_consistency_issues: list[dict[str, str]] = []
         self.advisor_error_log_path: Path | None = None
         self.advisor_error_log_entries = 0
+        self.advisor_trace_path: Path | None = None
         if self.advisor_model:
             if args.advisor_error_log:
                 self.advisor_error_log_path = Path(args.advisor_error_log).expanduser().resolve()
@@ -876,6 +1012,14 @@ class Planner:
                 self.advisor_error_log_path.unlink(missing_ok=True)
             except OSError:
                 self.info(f"Could not clear advisor error log: {self.advisor_error_log_path}")
+            trace_arg = getattr(args, "advisor_trace", None)
+            if trace_arg:
+                self.advisor_trace_path = Path(trace_arg).expanduser().resolve()
+                if os.path.lexists(self.advisor_trace_path):
+                    raise SystemExit("advisor trace already exists: " +
+                                     str(self.advisor_trace_path))
+                self.advisor_trace_path.parent.mkdir(parents=True, exist_ok=True)
+                self.advisor_trace_path.touch(exist_ok=False)
             if args.advisor_cache:
                 self.advisor_cache_path = Path(args.advisor_cache).expanduser().resolve()
             elif args.output:
@@ -1202,7 +1346,106 @@ class Planner:
                 for patch_no, member_sha in members
                 if patch_no < selected_patch and self.match(member_sha).status == "missing"
             )
+        links = getattr(self, "dt_binding_candidate_links", {}).get(sha, [])
+        allowed.extend(record["peer_sha"] for record in links)
         return list(dict.fromkeys(allowed))
+
+    def _dt_binding_provider_index(self) -> dict[str, list[tuple[str, str]]]:
+        """Index exact compatible additions to upstream binding YAML once.
+
+        This is a candidate index, NOT proof that a binding patch is needed.
+        Restricting to added lines in the selected base..target interval avoids
+        treating ancient unchanged bindings as new prerequisite commits.
+        """
+        cached = getattr(self, "_dt_binding_provider_index_cache", None)
+        if cached is not None:
+            return cached
+        self.info("Indexing upstream binding compatible additions...")
+        raw = self.git.run([
+            "log", "--no-merges", "--no-ext-diff", "--unified=0",
+            "--format=%x1e%H", f"{self.base}..{self.target}", "--",
+            "Documentation/devicetree/bindings/",
+        ])
+        index: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+        for record in raw.split("\x1e"):
+            header, _, patch = record.partition("\n")
+            sha = header.strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                continue
+            for path, added in self._added_patch_text_by_file(patch).items():
+                if not (path.startswith("Documentation/devicetree/bindings/")
+                        and path.endswith((".yaml", ".yml"))):
+                    continue
+                compatibles = self._yaml_binding_compatible_candidates(added)
+                for compatible in compatibles:
+                    entry = (sha, path)
+                    if entry not in index[compatible]:
+                        index[compatible].append(entry)
+        self._dt_binding_provider_index_cache = dict(index)
+        self.info(f"  indexed {len(index)} distinct binding compatibles")
+        return self._dt_binding_provider_index_cache
+
+    def _audit_dt_binding_candidates(self, sha: str) -> None:
+        """Expose exact cross-series binding providers without forcing TAKE.
+
+        A matching YAML compatible is evidence worth evaluating, not a hard DT
+        build prerequisite. Existing downstream schemas and unverified ancestry
+        are excluded. Advisor binding dispositions audit the remaining leads.
+        """
+        scanned = getattr(self, "_dt_binding_audit_scanned", None)
+        if scanned is None or sha in scanned:
+            return
+        scanned.add(sha)
+        node = self.nodes[sha]
+        if node.match.status != "missing":
+            return
+        paths = [path for path in node.files if self._is_dt_source_path(path)
+                 and self._advisor_path_product_relevant(path)]
+        if not paths:
+            return
+        patch = self.git.run([
+            "show", "--pretty=format:", "--no-ext-diff", "--unified=0",
+            sha, "--", *paths,
+        ])
+        compatibles: set[str] = set()
+        for path, added in self._added_patch_text_by_file(patch).items():
+            if path in paths:
+                compatibles.update(self._dt_compatible_strings(added))
+        if not compatibles:
+            return
+        index = self._dt_binding_provider_index()
+        links: list[dict[str, str]] = []
+        for compat in sorted(compatibles):
+            for peer_sha, binding_path in index.get(compat, []):
+                if peer_sha == sha or not self.upstream_before(peer_sha, sha):
+                    continue
+                # A downstream schema already advertising the compatible
+                # makes a new upstream provider optional/redundant here.
+                downstream_schema = self._tree_file_text(
+                    self.replay_start, binding_path)
+                if (downstream_schema is not None
+                        and compat in self._yaml_binding_compatible_candidates(
+                            downstream_schema)):
+                    continue
+                peer = self.ensure_node(
+                    peer_sha, reason=f"dt-binding-candidate:{compat}",
+                    required_by=sha,
+                )
+                if peer.match.status == "present":
+                    continue
+                links.append({
+                    "peer_sha": peer.sha, "compatible": compat,
+                    "binding_path": binding_path,
+                    "status": "evidence-only",
+                })
+        if links:
+            if len(links) > 64:
+                self.dt_binding_coverage_overflow[sha] = len(links)
+                self.info(f"    binding coverage limit: {sha[:12]} has "
+                          f"{len(links)} candidates; manual review required")
+            self.dt_binding_candidate_links[sha] = links
+            self.info(f"    binding coverage: {sha[:12]} has "
+                      f"{len(links)} upstream provider candidate(s)")
 
     @staticmethod
     def _added_patch_text(patch: str) -> str:
@@ -1729,6 +1972,22 @@ class Planner:
                 "provider_architecture": provider_arch,
             })
 
+        # Full-diff provider indexing can find cross-series bindings whose
+        # excerpts are too short to expose their compatible lines. Retain
+        # that independently verified evidence before the 64-record cap.
+        coverage = getattr(self, "dt_binding_candidate_links", {}).get(sha, [])
+        for record in coverage:
+            compat = record["compatible"]
+            selected_path = next((path for path, text in
+                selected_added_by_file.items()
+                if self._is_dt_source_path(path) and
+                compat in self._dt_compatible_strings(text)), "")
+            add(record["peer_sha"], "compatible-binding", compat,
+                f'compatible = "{compat}"',
+                f"binding schema adds compatible {compat}",
+                selected_path=selected_path,
+                provider_path=record["binding_path"])
+
         for peer_sha in allowed:
             peer_patch = self.patch_excerpt(peer_sha, self.args.advisor_max_peer_diff_chars)
             peer_added = self._added_patch_text(peer_patch)
@@ -2001,6 +2260,7 @@ class Planner:
         return result
 
     def advisor_packet(self, sha: str) -> dict:
+        self._audit_dt_binding_candidates(sha)
         n = self.nodes[sha]
         fixes = [
             {"sha": fixed, "subject": self.subject(fixed)}
@@ -2132,6 +2392,19 @@ class Planner:
                 "same_series": self.advisor_series_context(sha),
                 "same_series_consumed_objects": consumed_objects,
                 "eligible_prerequisite_evidence": consumed_objects,
+                "binding_coverage_candidates": list(getattr(
+                    self, "dt_binding_candidate_links", {}).get(sha, [])),
+                "verified_missing_dt_include_requirements": (
+                    self._advisor_hard_dt_include_facts(sha)),
+                "deterministic_dt_include_requirements": [
+                    {"include_path": reason[len("dt-include:"):],
+                     "take_consumer_shas": sorted(
+                         parent for parent in n.required_by
+                         if parent in self.nodes and
+                         self.nodes[parent].advisor_decision == "TAKE")}
+                    for reason in sorted(n.reasons)
+                    if reason.startswith("dt-include:")
+                ],
                 "eligible_prerequisite_peer_shas": evidence_backed_peers,
                 "all_missing_earlier_peer_shas": all_missing_earlier_peers,
                 "actual_inbound_take_prerequisites": inbound_take,
@@ -2253,6 +2526,16 @@ Maintenance policy:
   include multiple graph levels. It is NOT an inbound prerequisite recommendation. Use its changed
   files, scope, diff excerpts, and deterministic evidence only to understand why the deterministic
   planner connected commits. Another advisor decision is context, not verified evidence.
+- commit.binding_coverage_candidates are exact compatible additions found by scanning
+  upstream binding YAML patch additions, including candidates outside the same series.
+  They are *not* automatically mandatory. For TAKE, classify each provided eligible
+  compatible-binding evidence ID as REQUIRED or NOT_REQUIRED with a technical reason;
+  check downstream schema state and avoid support-status conjecture.
+- commit.deterministic_dt_include_requirements lists exact DTS/DTSI source paths
+  that TAKE consumers need, based on full-file include resolution. An included
+  source absent from downstream is a build dependency, not merely product policy.
+  Prefer TAKE for a verified provider unless there is concrete incompatibility;
+  never dismiss it solely because the device is not officially supported.
 - commit.actual_inbound_take_prerequisites is the only field containing concrete prerequisite
   recommendations already made by TAKE consumers. If actual_inbound_take_prerequisite_count is 0,
   there are NO inbound TAKE prerequisite recommendations. Never infer one from deterministic
@@ -2301,6 +2584,13 @@ Same-series prerequisite policy:
   assessed it NOT_REQUIRED. Reexamine the explicit evidence and report a
   technically grounded inbound disposition. Do not assume an existing schema
   defines the same compatible merely because the SoC family is supported.
+- A deterministic_dt_include_requirements source file is a hard source
+  dependency when a TAKE consumer includes the file and that file is absent
+  downstream. Do not conflate this with optional YAML schema completeness.
+  A binding schema merely matching a compatible cannot supply a DTSI file.
+- NOT_REQUIRED binding assessments claiming an exact compatible is already
+  covered must identify the downstream YAML schema and basis for coverage.
+  A compatible declared in a DTS is not itself binding-schema coverage.
 - For every compatible-binding or dt-property-binding evidence record on a TAKE,
   return exactly one binding_evidence_assessments entry keyed by its evidence_id.
   REQUIRED means the schema patch must accompany this commit for the chosen
@@ -2336,6 +2626,47 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         value = value.strip().lower()
         matches = [sha for sha in allowed if sha.startswith(value)]
         return matches[0] if len(matches) == 1 else None
+
+    def _advisor_binding_claim_feedback(self, evidence: dict, reason: str) -> str | None:
+        if evidence.get("kind") != "compatible-binding":
+            return None
+        path = evidence.get("provider_path", "")
+        compatible = evidence.get("object", "")
+        if not (path.startswith("Documentation/devicetree/bindings/")
+                and path.endswith((".yaml", ".yml")) and compatible):
+            return None
+        downstream_text = self._tree_file_text(self.replay_start, path)
+        exact = (self._yaml_binding_compatible_candidates(downstream_text)
+                 if downstream_text is not None else set())
+        return binding_claim_feedback(reason, compatible, downstream_text,
+                                      path, exact)
+
+    def _advisor_hard_dt_include_facts(self, sha: str) -> list[dict]:
+        """Prove missing .dts/.dtsi source includes needed by TAKE consumers.
+
+        No assumptions about optional YAML schemas or build success follow.
+        """
+        node = self.nodes[sha]
+        facts: list[dict] = []
+        for reason in sorted(node.reasons):
+            if not hasattr(self, "replay_start"):
+                break
+            if not reason.startswith("dt-include:"):
+                continue
+            path = reason.split(":", 1)[1]
+            if (not self._is_dt_source_path(path)
+                    or self._tree_file_text(self.replay_start, path) is not None
+                    or self._tree_file_text(sha, path) is None):
+                continue
+            consumers = sorted(parent for parent in node.required_by
+                               if parent in self.nodes and
+                               self.nodes[parent].advisor_decision == "TAKE")
+            if consumers:
+                facts.append({"include_path": path,
+                              "take_consumer_shas": consumers,
+                              "downstream_file": "absent",
+                              "provider_file": "present"})
+        return facts
 
     def validate_advisor_result(self, sha: str, result: dict) -> dict:
         if not isinstance(result, dict):
@@ -2438,6 +2769,13 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "binding NOT_REQUIRED disposition relies only on missing "
                     "official product support; give a technical reason",
                     kind="binding-unassessed", retryable=True)
+            if disposition == "NOT_REQUIRED":
+                feedback = self._advisor_binding_claim_feedback(
+                    evidence_by_id[evidence_id], reason)
+                if feedback:
+                    raise AdvisorError(
+                        "binding NOT_REQUIRED source claim unverified: " + feedback,
+                        kind="binding-source-claim", retryable=True)
             used_binding_ids.add(evidence_id)
             binding_assessments.append({
                 "evidence_id": evidence_id,
@@ -2540,7 +2878,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         fingerprint = json.dumps(
             {
                 "prompt_version": ADVISOR_PROMPT_VERSION,
-                "model": self.advisor_model,
+                "model": getattr(self, "advisor_model", None),
                 "base": self.base,
                 "target": self.target,
                 "downstream": self.downstream,
@@ -2635,6 +2973,20 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             return
         self.advisor_error_log_entries = getattr(self, "advisor_error_log_entries", 0) + 1
 
+    def _write_advisor_trace(self, entry: dict) -> None:
+        """Save EXACT sent packets, schema, system prompt and raw model reply.
+
+        Trace capture is opt-in, append-only, and deliberately never rewrites
+        the evidence or records API credentials. Each write is flushed to disk.
+        """
+        path = getattr(self, "advisor_trace_path", None)
+        if path is None:
+            return
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, sort_keys=True, ensure_ascii=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
     def _advisor_call_with_retries(
         self, client: OllamaAdvisor, prompt: str, sha: str, packet: dict
     ) -> dict:
@@ -2652,6 +3004,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             request_ok = False
             request_finished = None
             started = time.perf_counter()
+            request_prompt = prompt
             try:
                 # A mock or future client may not expose Ollama measurements.
                 if hasattr(client, "last_telemetry"):
@@ -2660,8 +3013,14 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 if last_error is not None:
                     if last_error.kind == "policy-review":
                         request_prompt = policy_retry_prompt(prompt)
-                    elif last_error.kind == "binding-unassessed":
-                        request_prompt = binding_retry_prompt(prompt)
+                    elif last_error.kind in ("binding-unassessed",
+                                                   "binding-source-claim"):
+                        request_prompt = binding_retry_prompt(
+                            prompt, str(last_error) if
+                            last_error.kind == "binding-source-claim" else "")
+                    elif last_error.kind == "dt-include-recheck":
+                        request_prompt = dt_include_retry_prompt(
+                            prompt, self._advisor_hard_dt_include_facts(sha))
                 raw = client.advise(request_prompt, packet, schema)
                 validated = self.validate_advisor_result(sha, raw)
                 # Guard against a recurring policy misread by small models.
@@ -2672,6 +3031,17 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         "without a specific technical uncertainty; recheck "
                         "upstream-convergence policy",
                         kind="policy-review", retryable=True)
+                hard_dt = self._advisor_hard_dt_include_facts(sha)
+                if (hard_dt and validated["decision"] != "TAKE"
+                        and not _CONCRETE_TECHNICAL_OBJECTION.search(
+                            " ".join([validated["rationale"],
+                                      *validated.get("risks", [])]))
+                        and last_error is None):
+                    raise AdvisorError(
+                        "REVIEW/SKIP of missing DT source-file provider lacks "
+                        "a concrete technical objection; recheck verified "
+                        "TAKE-consumer include requirements",
+                        kind="dt-include-recheck", retryable=True)
                 window = getattr(self.args, "advisor_context_tokens", 0)
                 reserve = getattr(self.args, "advisor_output_reserve", 1024)
                 used = (getattr(client, "last_telemetry", None) or {}).get(
@@ -2709,6 +3079,22 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 if delay:
                     time.sleep(min(delay, 10.0))
             finally:
+                self._write_advisor_trace({
+                    "trace_format": "exact-advisor-request-v1",
+                    "sha": sha, "attempt": attempt + 1,
+                    "model": getattr(self, "advisor_model", None),
+                    "stage": getattr(self, "_advisor_stage", "primary"),
+                    "prompt_version": ADVISOR_PROMPT_VERSION,
+                    "system_prompt": request_prompt,
+                    "packet": packet,
+                    "response_schema": schema,
+                    "response": raw,
+                    "error_kind": None if request_ok else (
+                        last_error.kind if last_error is not None else "unknown"),
+                    "error_message": None if request_ok else (
+                        str(last_error) if last_error is not None else "unknown"),
+                    "ollama": getattr(client, "last_telemetry", None),
+                })
                 performance = getattr(self, "performance", None)
                 if performance:
                     performance.advisor(
@@ -2716,6 +3102,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         input_bytes=len(json.dumps(packet, sort_keys=True).encode("utf-8")),
                         status="ok" if request_ok else "failed",
                         ollama=getattr(client, "last_telemetry", None),
+                        model=getattr(self, "advisor_model", None),
+                        stage=getattr(self, "_advisor_stage", "primary"),
                     )
         assert last_error is not None
         raise last_error
@@ -2776,6 +3164,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         node.advisor_risks = []
         node.advisor_error = str(exc)
         node.advisor_error_kind = exc.kind
+        node.advisor_decision_model = self.advisor_model
 
     @staticmethod
     def _namespace_only_objection(text: str, *, allow_conclusion_only: bool = False) -> bool:
@@ -2874,6 +3263,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         node.advisor_risks = result["risks"]
         node.advisor_error = None
         node.advisor_error_kind = None
+        node.advisor_decision_model = self.advisor_model
         self._record_advisor_prerequisite_recommendations(node.sha)
 
     def _advisor_evaluate_one(
@@ -2887,10 +3277,19 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             # Included in the cache fingerprint. A corrective response must
             # never be reused as if it came from the ordinary prompt packet.
             packet["commit"]["binding_conflict_context"] = binding_conflict_context
+            prompt += (
+                "\nBinding conflict recheck: for each listed evidence_id, "
+                "compare the consumer's REQUIRED reason with the provider's "
+                "NOT_REQUIRED reason and the actual downstream schema state. "
+                "Give a concrete source-level explanation for REQUIRED or "
+                "NOT_REQUIRED. Product support status is irrelevant. "
+                "Do not invent downstream files or change evidence IDs.\n"
+            )
         policy_result = self.advisor_policy_override(sha, packet)
         if policy_result is not None:
             node.advisor_attempts = 0
             self._advisor_note_success(node, policy_result)
+            node.advisor_decision_model = "deterministic-policy"
             self.info(
                 f"    advisor policy override: {policy_result['decision']} - "
                 f"{self._one_line(policy_result['rationale'])}"
@@ -3030,7 +3429,20 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                                    a.get("disposition") == "NOT_REQUIRED"), None)
                 if assessment is None:
                     continue
+                proof = next((e for e in self.advisor_prerequisite_evidence(
+                    consumer.sha) if e.get("evidence_id") == evidence_id), {})
+                binding_path = proof.get("provider_path", "")
+                downstream_schema = (self._tree_file_text(
+                    self.replay_start, binding_path) if binding_path else None)
                 result[peer.sha].append({
+                    "binding_path": binding_path,
+                    "downstream_binding_path_exists": (
+                        downstream_schema is not None),
+                    "downstream_has_compatible": (
+                        prereq.get("evidence_object", "") in
+                        self._yaml_binding_compatible_candidates(
+                            downstream_schema)
+                        if downstream_schema is not None else False),
                     "consumer_sha": consumer.sha,
                     "evidence_id": evidence_id,
                     "evidence_kind": prereq["evidence_kind"],
@@ -3268,6 +3680,24 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 self.advisor_consistency_issues.append(issue)
                 consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
 
+        # Candidate enumeration must not silently disappear behind the
+        # 64-evidence cap, even when all returned model assessments were valid.
+        for consumer_sha, count in sorted(getattr(
+                self, "dt_binding_coverage_overflow", {}).items()):
+            consumer = self.nodes.get(consumer_sha)
+            if consumer is None or consumer.advisor_decision != "TAKE":
+                continue
+            issue = {
+                "kind": "DT_BINDING->COVERAGE_OVERFLOW",
+                "consumer_sha": consumer_sha,
+                "consumer_subject": consumer.subject,
+                "reason": (f"{count} candidate bindings exceed 64 evidence "
+                           "records; manual review required"),
+            }
+            self.advisor_consistency_issues.append(issue)
+            consumer.advisor_consistency_warnings.append(
+                {"role": "consumer", **issue})
+
         # DT source includes are stricter than binding-schema suggestions:
         # these are verified file dependencies needed for DT compilation.
         for provider in list(self.nodes.values()):
@@ -3315,6 +3745,201 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 continue
             self.advisor_consistency_issues.append(issue)
             consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
+
+    def _advisor_fallback_candidates(self) -> list[tuple[str, list[str]]]:
+        """Prioritize graph blockers, then all outstanding REVIEW decisions.
+
+        A full dual-model run covers every outstanding REVIEW unless the user
+        explicitly limits escalations. This is NOT a forced TAKE conversion.
+        """
+        reasons: dict[str, set[str]] = collections.defaultdict(set)
+        blockers: collections.Counter[str] = collections.Counter()
+        for issue in self.advisor_consistency_issues:
+            kind = issue.get("kind", "")
+            provider = issue.get("prerequisite_sha")
+            consumer = issue.get("consumer_sha")
+            if provider in self.nodes:
+                reasons[provider].add("dependency:" + kind)
+                blockers[provider] += 1
+            if kind == "DT_BINDING->DISAGREEMENT" and consumer in self.nodes:
+                reasons[consumer].add("binding-disagreement")
+        for sha, node in self.nodes.items():
+            if not self.is_actionable_node(node) or node.match.status != "missing":
+                continue
+            if node.advisor_decision == "REVIEW":
+                reasons[sha].add("review")
+            if node.advisor_error_kind:
+                reasons[sha].add("advisor-error:" + node.advisor_error_kind)
+        chosen = [(sha, sorted(why)) for sha, why in reasons.items()
+                  if sha in self.nodes and self.is_actionable_node(self.nodes[sha])
+                  and self.nodes[sha].match.status == "missing"]
+        return sorted(chosen, key=lambda item: (
+            -blockers[item[0]],
+            0 if self.nodes[item[0]].advisor_decision == "REVIEW" else 1,
+            item[0],
+        ))
+
+    @staticmethod
+    def _advisor_snapshot(node: CommitNode) -> dict:
+        """Capture the primary decision before evaluating a different model."""
+        fields = (
+            "advisor_decision", "advisor_rationale", "advisor_prerequisites",
+            "advisor_binding_assessments", "advisor_rejected_prerequisites",
+            "advisor_inbound_assessments", "advisor_risks", "advisor_error",
+            "advisor_error_kind", "advisor_attempts", "advisor_budget",
+            "advisor_decision_model",
+        )
+        return {name: json.loads(json.dumps(getattr(node, name, None)))
+                for name in fields}
+
+    def _advisor_restore_snapshot(self, node: CommitNode, original: dict) -> None:
+        """Restore a Qwen result if Gemma could not return valid evidence.
+
+        Counters track unresolved final failures, not failed secondary attempts.
+        The secondary failure is separately reported as fallback metadata.
+        """
+        current = node.advisor_error_kind
+        old = original.get("advisor_error_kind")
+        if current and current != old:
+            self.advisor_failures = max(0, self.advisor_failures - 1)
+            self.advisor_failure_kinds[current] -= 1
+            if self.advisor_failure_kinds[current] <= 0:
+                self.advisor_failure_kinds.pop(current, None)
+        if old and old != current:
+            self.advisor_failures += 1
+            self.advisor_failure_kinds[old] += 1
+        for name, value in original.items():
+            setattr(node, name, value)
+        self._record_advisor_prerequisite_recommendations(node.sha)
+
+    def _advisor_fallback_one(
+        self, client: OllamaAdvisor, prompt: str, sha: str,
+        reasons: list[str],
+        binding_conflict_context: list[dict] | None = None,
+    ) -> None:
+        """Validate an independent second opinion, retaining the audit trail."""
+        node = self.nodes[sha]
+        previous = self._advisor_snapshot(node)
+        if node.advisor_primary_result is None:
+            node.advisor_primary_result = previous
+        node.advisor_escalation_reasons = reasons
+        self.advisor_fallback_evaluated += 1
+        self.info(f"  fallback {self.advisor_fallback_evaluated}: "
+                  f"{sha[:12]} {node.subject} ({', '.join(reasons)})")
+        self._advisor_evaluate_one(
+            client, prompt, sha, reconsideration=True,
+            binding_conflict_context=binding_conflict_context)
+        secondary = self._advisor_snapshot(node)
+        node.advisor_fallback_result = secondary
+        if node.advisor_error_kind:
+            self.advisor_fallback_failures += 1
+            self._advisor_restore_snapshot(node, previous)
+            return
+        # Do not let a fallback SKIP quietly discard a previously known TAKE
+        # or unvalidated REVIEW. Retain REVIEW for further human assessment.
+        if secondary["advisor_decision"] == "SKIP":
+            self._advisor_restore_snapshot(node, previous)
+            return
+        self.advisor_fallback_accepted += 1
+        if previous.get("advisor_decision") != secondary["advisor_decision"]:
+            self.advisor_fallback_changed += 1
+        if (previous.get("advisor_decision") != "TAKE"
+                and secondary["advisor_decision"] == "TAKE"):
+            self.advisor_fallback_take += 1
+        if getattr(self, "performance", None):
+            self.performance.event("advisor_fallback_decision", sha=sha[:12],
+                primary=previous.get("advisor_decision"),
+                fallback=secondary.get("advisor_decision"))
+
+    def _advisor_fallback_pass(self, primary_client: OllamaAdvisor) -> None:
+        """Finish Qwen work, unload it, then batch Gemma escalations.
+
+        All secondary calls use the same source validators, with independent
+        model-specific cache keys and a separate context/request budget.
+        """
+        model = getattr(self, "advisor_fallback_model", None)
+        if not model:
+            return
+        candidates = self._advisor_fallback_candidates()
+        limit = getattr(self.args, "advisor_fallback_limit", 0)
+        if limit:
+            self.advisor_fallback_unprocessed = max(0, len(candidates) - limit)
+            candidates = candidates[:limit]
+        self.info(f"Dual-model escalation: {len(candidates)} candidates for "
+                  f"{model} (unprocessed={self.advisor_fallback_unprocessed})")
+        if not candidates:
+            return
+        try:
+            primary_client.unload()
+        except (OSError, urllib.error.URLError, AdvisorError) as exc:
+            self.info(f"  Ollama primary unload warning: {exc}; "
+                      "server may unload automatically")
+        fallback_client = OllamaAdvisor(
+            model=model, base_url=self.args.advisor_base_url,
+            timeout=getattr(self.args, "advisor_fallback_timeout", 900.0),
+            temperature=self.args.advisor_temperature,
+            keep_alive=self.args.advisor_keep_alive, debug=self.args.debug,
+        )
+        original_model = self.advisor_model
+        original_limit = self.args.advisor_max_request_chars
+        original_context = self.args.advisor_context_tokens
+        self._advisor_stage = "fallback"
+        self.advisor_model = model
+        self.args.advisor_max_request_chars = getattr(
+            self.args, "advisor_fallback_max_request_chars", 120000)
+        self.args.advisor_context_tokens = getattr(
+            self.args, "advisor_fallback_context_tokens", 131072)
+        try:
+            prompt = self.advisor_system_prompt()
+            for sha, reasons in candidates:
+                self._advisor_fallback_one(fallback_client, prompt, sha, reasons)
+            # A new TAKE may expose a previously unseen provider. Continue
+            # within the Gemma batch rather than swapping models again.
+            fallback_promoted = False
+            for round_no in range(1, 9):
+                promoted = self._advisor_promote_prerequisites()
+                if not promoted:
+                    break
+                fallback_promoted = True
+                self.dependency_closure()
+                self.build_series_index()
+                pending = [sha for sha in self.advisor_order(self.ordered_missing())
+                           if self.nodes[sha].advisor_decision is None]
+                if not pending:
+                    break
+                self.info(f"  fallback prerequisite round {round_no}: "
+                          f"{len(pending)} candidates")
+                for sha in pending:
+                    self._advisor_fallback_one(
+                        fallback_client, prompt, sha, ["promoted-prerequisite"])
+            if fallback_promoted and self.args.simulate:
+                self.reset_replay_annotations()
+                self.replay_final_verification = True
+                _, conflicts = self.replay_once()
+                self.info(f"  fallback final expanded-plan replay: "
+                          f"{len(conflicts)} conflict(s)")
+            self._advisor_resolve_rejected_prerequisites()
+            self._advisor_check_consistency()
+            # Re-evaluate conflicting binding assessments with the secondary
+            # model only. Do not call Qwen once Gemma is resident.
+            conflicts = self._advisor_binding_conflicts()
+            for peer_sha, context in sorted(conflicts.items()):
+                self._advisor_fallback_one(fallback_client, prompt, peer_sha,
+                    ["binding-conflict-correction"],
+                    binding_conflict_context=context)
+            self._advisor_resolve_rejected_prerequisites()
+            self._advisor_check_consistency()
+            if self.advisor_fallback_unprocessed:
+                self.advisor_consistency_issues.append({
+                    "kind": "ADVISOR_FALLBACK->INCOMPLETE",
+                    "reason": (f"{self.advisor_fallback_unprocessed} cases not "
+                               "escalated due to --advisor-fallback-limit"),
+                })
+        finally:
+            self.advisor_model = original_model
+            self.args.advisor_max_request_chars = original_limit
+            self.args.advisor_context_tokens = original_context
+            self._advisor_stage = "primary"
 
     def run_advisor(self) -> None:
         if not self.advisor_model:
@@ -3414,6 +4039,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         self._advisor_reconcile_binding_conflicts(client, prompt)
         self._advisor_resolve_rejected_prerequisites()
         self._advisor_check_consistency()
+        self._advisor_fallback_pass(client)
 
     def aliases_for(self, sha: str) -> set[str]:
         aliases = {sha}
@@ -3589,7 +4215,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         score makes the lead more interesting; it never upgrades context-only
         evidence into a selected dependency.
         """
-        return bool(re.fullmatch(r"(?:conflict-)?hunk-context:\d+", reason))
+        return bool(re.fullmatch(r"(?:conflict-)?hunk-context:\d+", reason)
+                    or reason.startswith("dt-binding-candidate:"))
 
     @classmethod
     def is_actionable_node(cls, node: CommitNode) -> bool:
@@ -4520,6 +5147,15 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             counts = collections.Counter(n.advisor_decision for n in successful)
             failures = sum(1 for n in advised_nodes if n.advisor_error)
             lines.append(f"advisor-model: {self.advisor_model}")
+            if getattr(self, "advisor_fallback_model", None):
+                lines.append(
+                    f"advisor-fallback: {self.advisor_fallback_model}; "
+                    f"{self.advisor_fallback_evaluated} evaluated, "
+                    f"{self.advisor_fallback_accepted} valid, "
+                    f"{self.advisor_fallback_changed} changed decisions, "
+                    f"{self.advisor_fallback_take} new TAKE, "
+                    f"{self.advisor_fallback_failures} failed, "
+                    f"{self.advisor_fallback_unprocessed} unprocessed")
             lines.append(
                 f"advisor:      {len(successful)} recommendation(s) "
                 f"({counts.get('TAKE', 0)} TAKE, {counts.get('SKIP', 0)} SKIP, "
@@ -4536,6 +5172,11 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             )
             if getattr(self, "advisor_error_log_entries", 0) and self.advisor_error_log_path:
                 lines.append(f"advisor-error-log: {self.advisor_error_log_path}")
+            coverage = getattr(self, "dt_binding_candidate_links", {})
+            lines.append(
+                f"binding-coverage: {sum(map(len, coverage.values()))} "
+                f"candidate relationship(s) across {len(coverage)} consumer(s)"
+            )
             consistency = getattr(self, "advisor_consistency_issues", [])
             if consistency:
                 consistency_counts = collections.Counter(x["kind"] for x in consistency)
@@ -4803,7 +5444,14 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             "performance": self.performance.summary() if getattr(self, "performance", None) else None,
             "paths": self.paths,
             "advisor": None if not getattr(self, "advisor_model", None) else {
-                "model": self.advisor_model,
+                "model": getattr(self, "advisor_model", None),
+                "fallback_model": getattr(self, "advisor_fallback_model", None),
+                "fallback_evaluated": getattr(self, "advisor_fallback_evaluated", 0),
+                "fallback_accepted": getattr(self, "advisor_fallback_accepted", 0),
+                "fallback_changed": getattr(self, "advisor_fallback_changed", 0),
+                "fallback_take": getattr(self, "advisor_fallback_take", 0),
+                "fallback_failures": getattr(self, "advisor_fallback_failures", 0),
+                "fallback_unprocessed": getattr(self, "advisor_fallback_unprocessed", 0),
                 "base_url": normalize_http_base_url(self.args.advisor_base_url),
                 "prompt_version": ADVISOR_PROMPT_VERSION,
                 "model_calls": getattr(self, "advisor_calls", 0),
@@ -4811,6 +5459,11 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "policy_rechecks": getattr(self, "advisor_policy_rechecks", 0),
                 "reconsiderations": getattr(self, "advisor_reconsiderations", 0),
                 "binding_disagreement_rechecks": getattr(self, "advisor_binding_rechecks", 0),
+                "binding_coverage_consumer_count": len(getattr(
+                    self, "dt_binding_candidate_links", {})),
+                "binding_coverage_candidate_count": sum(
+                    len(x) for x in getattr(
+                        self, "dt_binding_candidate_links", {}).values()),
                 "failures": getattr(self, "advisor_failures", 0),
                 "failure_kinds": dict(getattr(self, "advisor_failure_kinds", {})),
                 "cache_hits": getattr(self, "advisor_cache_hits", 0),
@@ -4819,6 +5472,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "execution_ready": not bool(getattr(self, "advisor_consistency_issues", [])),
                 "cache_path": str(self.advisor_cache_path) if getattr(self, "advisor_cache_path", None) else None,
                 "error_log_path": str(self.advisor_error_log_path) if getattr(self, "advisor_error_log_path", None) else None,
+                "trace_path": str(self.advisor_trace_path) if getattr(self, "advisor_trace_path", None) else None,
                 "error_log_entries": getattr(self, "advisor_error_log_entries", 0),
             },
             "order": self.ordered_missing(),
@@ -4845,6 +5499,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_rationale": n.advisor_rationale,
                     "advisor_prerequisites": n.advisor_prerequisites,
                     "advisor_binding_assessments": n.advisor_binding_assessments,
+                    "advisor_binding_coverage_candidates": list(getattr(
+                        self, "dt_binding_candidate_links", {}).get(sha, [])),
                     "advisor_rejected_prerequisites": n.advisor_rejected_prerequisites,
                     "advisor_consumed_objects": n.advisor_consumed_objects,
                     "advisor_prerequisite_evidence": n.advisor_consumed_objects,
@@ -4855,6 +5511,10 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_error": n.advisor_error,
                     "advisor_error_kind": n.advisor_error_kind,
                     "advisor_attempts": n.advisor_attempts,
+                    "advisor_decision_model": n.advisor_decision_model,
+                    "advisor_primary_result": n.advisor_primary_result,
+                    "advisor_fallback_result": n.advisor_fallback_result,
+                    "advisor_escalation_reasons": n.advisor_escalation_reasons,
                     "advisor_budget": getattr(n, "advisor_budget", None),
                     "symbol_dependency_proofs": n.symbol_dependency_proofs,
                 }
@@ -4908,7 +5568,7 @@ def package_results(prefix_arg: str) -> tuple[Path, Path]:
         raise ValueError(f"cannot read plan JSON for packaging: {exc}") from exc
     advisor = payload.get("advisor")
     if isinstance(advisor, dict):
-        for field in ("cache_path", "error_log_path"):
+        for field in ("cache_path", "error_log_path", "trace_path"):
             value = advisor.get(field)
             if not isinstance(value, str) or not value:
                 continue
@@ -4995,6 +5655,74 @@ def ensure_package_destinations_available(prefix: Path) -> None:
             raise ValueError(f"automatic package output already exists: {path}")
     if not prefix.parent.is_dir():
         raise ValueError(f"output directory does not exist: {prefix.parent}")
+
+
+def run_exact_trace_replay(args: argparse.Namespace) -> int:
+    """Replay captured advisor payloads byte-for-byte at the prompt/schema level.
+
+    No Git calls and no packet reconstruction. Model execution need not be
+    bit-deterministic, and this does not perform planner graph validation.
+    """
+    source = Path(args.advisor_replay_trace).expanduser()
+    destination = Path(args.benchmark_output).expanduser()
+    if os.path.lexists(destination):
+        print(f"replay output already exists: {destination}", file=sys.stderr)
+        return 1
+    try:
+        records = [json.loads(line) for line in source.read_text().splitlines()
+                   if line.strip()]
+        if not records or any(r.get("trace_format") !=
+                              "exact-advisor-request-v1" for r in records):
+            raise ValueError("empty or unsupported advisor trace")
+        selected = []
+        for record in records:
+            sha = record["sha"]
+            if args.advisor_commit and not any(
+                    sha.startswith(value.lower()) for value in args.advisor_commit):
+                continue
+            for field in ("system_prompt", "packet", "response_schema"):
+                if field not in record:
+                    raise ValueError("trace entry is missing " + field)
+            selected.append(record)
+        if args.advisor_commit:
+            for name in args.advisor_commit:
+                if len({r["sha"] for r in selected
+                        if r["sha"].startswith(name.lower())}) != 1:
+                    raise ValueError("unknown or ambiguous commit " + name)
+        if args.advisor_limit:
+            selected = selected[:args.advisor_limit]
+        if not selected:
+            raise ValueError("no matching advisor requests")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"invalid exact advisor trace: {exc}", file=sys.stderr)
+        return 1
+    client = OllamaAdvisor(args.advisor_model, args.advisor_base_url,
+                           args.advisor_timeout, args.advisor_temperature,
+                           args.advisor_keep_alive, args.debug)
+    errors = 0
+    with destination.open("x", encoding="utf-8", buffering=1) as output:
+        for record in selected:
+            start = time.perf_counter()
+            entry = {"sha": record["sha"], "attempt": record.get("attempt"),
+                     "replay_type": "exact-saved-prompt-packet-schema",
+                     "source_prompt_version": record.get("prompt_version"),
+                     "original_response": record.get("response"),
+                     "model": args.advisor_model}
+            try:
+                result = client.advise(record["system_prompt"],
+                                       record["packet"], record["response_schema"])
+                entry.update(status="ok", response=result,
+                             decision=result.get("decision"),
+                             matches_original=result == record.get("response"),
+                             ollama=getattr(client, "last_telemetry", None))
+            except (AdvisorError, OSError, ValueError) as exc:
+                errors += 1
+                entry.update(status="error", error=str(exc))
+            entry["elapsed_seconds"] = round(time.perf_counter() - start, 3)
+            output.write(json.dumps(entry, sort_keys=True) + "\n")
+    print(f"Exact replay saved: {destination}; requests={len(selected)}, "
+          f"errors={errors}. Does not validate the complete dependency graph.")
+    return 2 if errors else 0
 
 
 def run_advisor_benchmark(args: argparse.Namespace) -> int:
@@ -5210,6 +5938,9 @@ def run_advisor_benchmark(args: argparse.Namespace) -> int:
 
 
 def run_planner(args: argparse.Namespace) -> int:
+    if getattr(args, "advisor_fallback_model", None):
+        verify_advisor_fallback_model(args.advisor_base_url,
+                                      args.advisor_fallback_model)
     # The append-only event file is useful even if power fails before reports.
     source = Path(args.output).expanduser() if args.output else None
     event_path = (source.with_suffix(".perf.jsonl") if source else None)
@@ -5323,6 +6054,27 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="optional Ollama model for AI-assisted TAKE/SKIP/REVIEW recommendations",
     )
     p.add_argument(
+        "--advisor-fallback-model",
+        help="optional second Ollama model; batch recheck all REVIEW and "
+             "unresolved dependency decisions after the primary model",
+    )
+    p.add_argument(
+        "--advisor-fallback-limit", type=int, default=0,
+        help="maximum escalation cases (0=all, default: 0)",
+    )
+    p.add_argument(
+        "--advisor-fallback-timeout", type=float, default=900.0,
+        help="Gemma request timeout, including CPU offload (default: 900s)",
+    )
+    p.add_argument(
+        "--advisor-fallback-max-request-chars", type=int, default=120000,
+        help="complete secondary-model request cap (default: 120000)",
+    )
+    p.add_argument(
+        "--advisor-fallback-context-tokens", type=int, default=131072,
+        help="expected fallback model context size (default: 131072)",
+    )
+    p.add_argument(
         "--advisor-base-url",
         default=os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"),
         help="Ollama base URL (default: OLLAMA_HOST or http://127.0.0.1:11434)",
@@ -5366,6 +6118,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument(
         "--advisor-error-log",
         help="advisor diagnostic JSONL path (default: <output>.advisor-errors.jsonl)",
+    )
+    p.add_argument(
+        "--advisor-trace", metavar="FILE.jsonl",
+        help="capture exact advisor prompts/packets/schemas/raw responses; "
+             "requires a new filename and is packaged with run results",
+    )
+    p.add_argument(
+        "--advisor-replay-trace", metavar="FILE.jsonl",
+        help="replay exact saved Ollama requests without Git collection; "
+             "requires --advisor-model and --benchmark-output",
     )
     p.add_argument(
         "--no-advisor-cache", action="store_true",
@@ -5426,6 +6188,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    if args.advisor_fallback_model and not args.advisor_model:
+        p.error("--advisor-fallback-model requires --advisor-model")
+    if args.advisor_fallback_model == args.advisor_model and args.advisor_model:
+        p.error("fallback model must differ from primary advisor model")
+    if args.advisor_fallback_limit < 0:
+        p.error("--advisor-fallback-limit must be >= 0")
+    if args.advisor_fallback_timeout <= 0:
+        p.error("--advisor-fallback-timeout must be > 0")
+    if args.advisor_fallback_max_request_chars < 0:
+        p.error("--advisor-fallback-max-request-chars must be >= 0")
+    if args.advisor_fallback_context_tokens <= args.advisor_output_reserve:
+        p.error("fallback context must exceed reserved output tokens")
     if args.advisor_max_request_chars < 0:
         p.error("--advisor-max-request-chars must be >= 0")
     if args.advisor_context_tokens < 0 or args.advisor_output_reserve < 0:
@@ -5434,6 +6208,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         p.error("advisor context must exceed the reserved output tokens")
     if args.advisor_limit is not None and args.advisor_limit < 1:
         p.error("--advisor-limit must be >= 1")
+    if args.advisor_replay_trace:
+        if not args.advisor_model or not args.benchmark_output:
+            p.error("exact replay requires --advisor-model and --benchmark-output")
+        if (args.advisor_benchmark_plan or args.benchmark_reference_plan or
+                args.advisor_trace or args.update or args.output or args.json_output or
+                args.package_results):
+            p.error("exact trace replay cannot run with planning or benchmark mode")
+        return args
     if args.advisor_benchmark_plan:
         if not args.advisor_model or not args.benchmark_output:
             p.error("benchmark mode requires --advisor-model and --benchmark-output")
@@ -5441,7 +6223,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             p.error("benchmark mode cannot update remotes or generate normal reports")
         return args
     if args.benchmark_output:
-        p.error("--benchmark-output requires --advisor-benchmark-plan")
+        p.error("--benchmark-output requires --advisor-benchmark-plan or --advisor-replay-trace")
     if args.benchmark_reference_plan:
         p.error("--benchmark-reference-plan requires --advisor-benchmark-plan")
     if args.package_results:
@@ -5461,6 +6243,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.advisor_replay_trace:
+        return run_exact_trace_replay(args)
     if args.advisor_benchmark_plan:
         return run_advisor_benchmark(args)
     if args.package_results:
