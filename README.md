@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.23**.
+Current tool version: **0.4.24**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -23,6 +23,54 @@ The key distinction is that `--base` limits the **focus candidate range**, not
 the dependency universe. A required prerequisite may predate `--base` if there
 is concrete evidence that a selected commit depends on it and that prerequisite
 is not already downstream.
+
+## Fallback startup and deferred recovery (0.4.24)
+
+Run 27 demonstrated the benefit of Qwen followed by Gemma (1016 TAKE,
+10 REVIEW), but the first Gemma requests failed with Ollama HTTP 500/CUDA
+out-of-memory errors on an 8-GB RTX 3070. Those failures left three important
+DTS prerequisite providers unresolved. The fallback now:
+
+- Explicitly preloads the chosen fallback model/context once through
+  Ollama's empty-prompt `/api/generate` endpoint, after unloading Qwen.
+  Warmup errors are recorded but do not prevent ordinary requests.
+- Preserves the original Qwen decision whenever a Gemma request fails.
+- Defers **only transport/timeout/HTTP** failures until the end of the
+  initial fallback batch. If at least one Gemma assessment succeeded, it
+  retries each such provider **once**, with the same evidence and validation.
+  Model semantic/structured-response failures are *not* blindly retried.
+- Records all fallback attempts in `advisor_fallback_history` per commit,
+  plus `fallback_deferred_retries`, `fallback_recovered`,
+  `fallback_warmup_error` and the count of final fallback failures.
+- Supplies exact validator error details, including missing binding evidence
+  IDs, when requesting a binding-assessment correction. It never invents
+  prerequisite edges or silently changes REVIEW into TAKE.
+- Includes Ollama's short HTTP response body in error diagnostics when
+  available, which can distinguish CUDA OOM from other HTTP 500 failures.
+
+On `gondor`, the existing `gemma4-kernel:64k` model has a 65,536-token
+context. The lower context can reduce VRAM pressure, but it is not an OOM
+cure and cannot guarantee inference completion. This release has not been
+validated with a full CS10 run; inspect run 28 before using its plan for
+unattended backports.
+
+### Complete run 28 configuration on shire
+
+Keep the previous Git remotes, base/target, file list and Qwen settings.
+For run 28, the fallback and report arguments should be:
+
+```bash
+--advisor-fallback-model gemma4-kernel:64k \
+--advisor-fallback-timeout 900 \
+--advisor-fallback-max-request-chars 120000 \
+--advisor-fallback-context-tokens 65536 \
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_28.c.advisor-trace.jsonl" \
+--output "$KERNEL_WORKSPACE_DIR/backport_plan_28.c" \
+--json-output "$KERNEL_WORKSPACE_DIR/backport_plan_28.json"
+```
+
+**Important:** Do not reuse the run 27 trace path for run 28. Trace files
+must not preexist, and all run 27 artifacts should remain intact.
 
 ## Selective dual-model advisor (0.4.23)
 

@@ -41,7 +41,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.23"
+VERSION = "0.4.24"
 ADVISOR_PROMPT_VERSION = "19"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
@@ -337,6 +337,7 @@ class CommitNode:
     advisor_decision_model: str | None = None
     advisor_primary_result: dict | None = None
     advisor_fallback_result: dict | None = None
+    advisor_fallback_history: list[dict] = dataclasses.field(default_factory=list)
     advisor_escalation_reasons: list[str] = dataclasses.field(default_factory=list)
     symbol_dependency_proofs: list[dict[str, object]] = dataclasses.field(default_factory=list)
 
@@ -696,6 +697,38 @@ class OllamaAdvisor:
         with urllib.request.urlopen(request, timeout=min(self.timeout, 60)) as response:
             response.read()
 
+    def warmup(self, context_tokens: int) -> None:
+        """Preload model and allocate the intended context before the batch.
+
+        An empty /api/generate prompt loads the runner without producing an
+        inference answer. Errors are reported, never mistaken for a decision.
+        """
+        payload = {
+            "model": self.model, "prompt": "", "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": {"num_ctx": context_tokens},
+        }
+        request = urllib.request.Request(
+            self.base_url + "/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request,
+                                        timeout=self.timeout) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+            raise AdvisorError(
+                f"Fallback warmup HTTP {exc.code}: {detail or exc.reason}",
+                kind="http", retryable=exc.code == 429 or exc.code >= 500,
+            ) from exc
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+            raise AdvisorError(
+                f"Ollama fallback warmup unavailable: {exc}",
+                kind="transport", retryable=True,
+            ) from exc
+
     def advise(self, system_prompt: str, packet: dict, response_schema: dict | None = None) -> dict:
         self.last_telemetry = None
         payload = {
@@ -744,8 +777,9 @@ class OllamaAdvisor:
                         and not isinstance(outer[key], bool)
                     }
         except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace").strip()
             raise AdvisorError(
-                f"Ollama HTTP error {exc.code}: {exc.reason}",
+                f"Ollama HTTP error {exc.code}: {detail or exc.reason}",
                 kind="http",
                 retryable=exc.code == 429 or exc.code >= 500,
             ) from exc
@@ -987,6 +1021,9 @@ class Planner:
         self.advisor_fallback_changed = 0
         self.advisor_fallback_take = 0
         self.advisor_fallback_unprocessed = 0
+        self.advisor_fallback_deferred_retries = 0
+        self.advisor_fallback_recovered = 0
+        self.advisor_fallback_warmup_error = None
         self._advisor_stage = "primary"
         self.advisor_cache_path: Path | None = None
         self.advisor_cache: dict[str, dict] = {}
@@ -3015,9 +3052,12 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                         request_prompt = policy_retry_prompt(prompt)
                     elif last_error.kind in ("binding-unassessed",
                                                    "binding-source-claim"):
+                        # Include the validator's exact evidence IDs for both
+                        # omitted dispositions and unsupported source claims.
+                        # Generic retry wording repeatedly missed the same IDs
+                        # during the run 27 Gemma fallback phase.
                         request_prompt = binding_retry_prompt(
-                            prompt, str(last_error) if
-                            last_error.kind == "binding-source-claim" else "")
+                            prompt, str(last_error))
                     elif last_error.kind == "dt-include-recheck":
                         request_prompt = dt_include_retry_prompt(
                             prompt, self._advisor_hard_dt_include_facts(sha))
@@ -3831,6 +3871,11 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             binding_conflict_context=binding_conflict_context)
         secondary = self._advisor_snapshot(node)
         node.advisor_fallback_result = secondary
+        node.advisor_fallback_history.append({
+            "result": secondary,
+            "reasons": list(reasons),
+            "attempt": len(node.advisor_fallback_history) + 1,
+        })
         if node.advisor_error_kind:
             self.advisor_fallback_failures += 1
             self._advisor_restore_snapshot(node, previous)
@@ -3891,8 +3936,52 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             self.args, "advisor_fallback_context_tokens", 131072)
         try:
             prompt = self.advisor_system_prompt()
+            # Pre-allocate the chosen 64K/128K context before selecting any
+            # decisions. On limited-VRAM hosts the first load may fail while
+            # Ollama releases Qwen; a warmup failure is diagnostic, not a
+            # reason to abandon otherwise recoverable secondary requests.
+            if hasattr(fallback_client, "warmup"):
+                try:
+                    fallback_client.warmup(context_tokens)
+                    self.info("  fallback model warmup succeeded")
+                except (AdvisorError, OSError) as exc:
+                    self.advisor_fallback_warmup_error = str(exc)
+                    self.info(f"  fallback warmup warning: {exc}")
+                    if getattr(self, "performance", None):
+                        self.performance.event(
+                            "advisor_fallback_warmup_failure", error=str(exc))
+            deferred: list[tuple[str, list[str]]] = []
+            # Do not immediately repeat the same cold-start HTTP/OOM failure
+            # after the normal per-request retries have already been spent.
+            # Instead return to failed providers only after subsequent Gemma
+            # requests have shown the server is operational.
             for sha, reasons in candidates:
-                self._advisor_fallback_one(fallback_client, prompt, sha, reasons)
+                self._advisor_fallback_one(
+                    fallback_client, prompt, sha, reasons)
+                result = self.nodes[sha].advisor_fallback_result or {}
+                if result.get("advisor_error_kind") in {
+                        "http", "timeout", "transport"}:
+                    deferred.append((sha, reasons))
+            if deferred and self.advisor_fallback_accepted:
+                self.info(f"  fallback delayed recovery: "
+                          f"{len(deferred)} transient failure(s)")
+                for sha, reasons in deferred:
+                    # A single second evaluation per provider after the batch
+                    # (not unbounded repeated inference or model swapping).
+                    self.advisor_fallback_deferred_retries += 1
+                    self.advisor_fallback_failures -= 1
+                    self._advisor_fallback_one(
+                        fallback_client, prompt, sha,
+                        [*reasons, "deferred-transport-retry"])
+                    recovered = not bool(
+                        self.nodes[sha].advisor_fallback_result.get(
+                            "advisor_error_kind"))
+                    if recovered:
+                        self.advisor_fallback_recovered += 1
+                    if getattr(self, "performance", None):
+                        self.performance.event(
+                            "advisor_fallback_deferred_retry", sha=sha[:12],
+                            recovered=recovered)
             # A new TAKE may expose a previously unseen provider. Continue
             # within the Gemma batch rather than swapping models again.
             fallback_promoted = False
@@ -5155,6 +5244,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     f"{self.advisor_fallback_changed} changed decisions, "
                     f"{self.advisor_fallback_take} new TAKE, "
                     f"{self.advisor_fallback_failures} failed, "
+                    f"{self.advisor_fallback_deferred_retries} delayed retries, "
+                    f"{self.advisor_fallback_recovered} recovered, "
                     f"{self.advisor_fallback_unprocessed} unprocessed")
             lines.append(
                 f"advisor:      {len(successful)} recommendation(s) "
@@ -5451,6 +5542,11 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "fallback_changed": getattr(self, "advisor_fallback_changed", 0),
                 "fallback_take": getattr(self, "advisor_fallback_take", 0),
                 "fallback_failures": getattr(self, "advisor_fallback_failures", 0),
+                "fallback_deferred_retries": getattr(
+                    self, "advisor_fallback_deferred_retries", 0),
+                "fallback_recovered": getattr(self, "advisor_fallback_recovered", 0),
+                "fallback_warmup_error": getattr(
+                    self, "advisor_fallback_warmup_error", None),
                 "fallback_unprocessed": getattr(self, "advisor_fallback_unprocessed", 0),
                 "base_url": normalize_http_base_url(self.args.advisor_base_url),
                 "prompt_version": ADVISOR_PROMPT_VERSION,
@@ -5514,6 +5610,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                     "advisor_decision_model": n.advisor_decision_model,
                     "advisor_primary_result": n.advisor_primary_result,
                     "advisor_fallback_result": n.advisor_fallback_result,
+                    "advisor_fallback_history": n.advisor_fallback_history,
                     "advisor_escalation_reasons": n.advisor_escalation_reasons,
                     "advisor_budget": getattr(n, "advisor_budget", None),
                     "symbol_dependency_proofs": n.symbol_dependency_proofs,

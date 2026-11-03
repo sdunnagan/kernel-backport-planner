@@ -3947,3 +3947,202 @@ class DualAdvisor0423Tests(unittest.TestCase):
         self.assertIsNone(node.advisor_error_kind)
         self.assertEqual(p.advisor_failures, 0)
         self.assertFalse(p.advisor_failure_kinds)
+
+
+class FallbackRecovery0424Tests(unittest.TestCase):
+    """Real run 27 failure pattern: early HTTP 500, later healthy Gemma."""
+
+    def make_planner(self):
+        planner = DualAdvisor0423Tests().make_planner()
+        planner.advisor_fallback_deferred_retries = 0
+        planner.advisor_fallback_recovered = 0
+        planner.advisor_fallback_warmup_error = None
+        planner.args.advisor_fallback_context_tokens = 65536
+        return planner
+
+    def test_warmup_preloads_selected_context_and_no_generation(self):
+        requests = []
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"done": true}'
+
+        def urlopen(req, timeout):
+            requests.append((req.full_url, json.loads(req.data), timeout))
+            return Response()
+
+        client = kbp.OllamaAdvisor("gemma4-kernel:64k",
+                                  "http://gondor:11434", 900, 0, "10m")
+        with mock.patch.object(kbp.urllib.request, "urlopen", urlopen):
+            client.warmup(65536)
+        self.assertEqual(requests, [("http://gondor:11434/api/generate", {
+            "model": "gemma4-kernel:64k", "prompt": "", "stream": False,
+            "keep_alive": "10m", "options": {"num_ctx": 65536},
+        }, 900)])
+
+    def test_http_errors_include_ollama_diagnostic_body(self):
+        from urllib.error import HTTPError
+
+        error = HTTPError("http://gondor:11434/api/generate", 500,
+                          "Internal Server Error", {},
+                          io.BytesIO(b'{"error":"CUDA error: out of memory"}'))
+        client = kbp.OllamaAdvisor("gemma4-kernel:64k",
+                                  "http://gondor:11434", 900, 0, "10m")
+        with mock.patch.object(kbp.urllib.request, "urlopen",
+                               side_effect=error):
+            with self.assertRaises(kbp.AdvisorError) as caught:
+                client.warmup(65536)
+        self.assertIn("CUDA error: out of memory", str(caught.exception))
+
+    def test_deferred_retry_recovers_early_http_failure_after_success(self):
+        p = self.make_planner()
+        calls = []
+
+        class Primary:
+            def unload(self): calls.append("unload")
+
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            calls.append(sha)
+            node = p.nodes[sha]
+            if sha == "a" * 40 and calls.count(sha) == 1:
+                p._advisor_note_failure(node, kbp.AdvisorError(
+                    "Ollama HTTP error 500: CUDA out of memory", kind="http"))
+            else:
+                node.advisor_decision = "TAKE"
+                node.advisor_error = None
+                node.advisor_error_kind = None
+                node.advisor_decision_model = p.advisor_model
+
+        p._advisor_evaluate_one = fake_evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor") as fallback:
+            p._advisor_fallback_pass(Primary())
+            fallback.return_value.warmup.assert_called_once_with(65536)
+        self.assertEqual(calls, ["unload", "a" * 40, "b" * 40,
+                                 "a" * 40])
+        self.assertEqual(p.advisor_fallback_deferred_retries, 1)
+        self.assertEqual(p.advisor_fallback_recovered, 1)
+        self.assertEqual(p.advisor_fallback_failures, 0)
+        self.assertEqual(p.advisor_fallback_take, 2)
+        self.assertEqual(p.advisor_fallback_accepted, 2)
+        self.assertEqual(len(p.nodes["a" * 40].advisor_fallback_history), 2)
+        self.assertEqual(p.nodes["a" * 40].advisor_primary_result[
+            "advisor_decision"], "REVIEW")
+        self.assertEqual(p.advisor_model, "kernel-planner:32k")
+
+    def test_no_repeat_if_all_fallback_requests_fail(self):
+        p = self.make_planner()
+        calls = []
+
+        class Primary:
+            def unload(self): pass
+
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            calls.append(sha)
+            p._advisor_note_failure(p.nodes[sha], kbp.AdvisorError(
+                "Ollama HTTP error 500", kind="http"))
+
+        p._advisor_evaluate_one = fake_evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor"):
+            p._advisor_fallback_pass(Primary())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(p.advisor_fallback_deferred_retries, 0)
+        self.assertEqual(p.advisor_fallback_failures, 2)
+        self.assertTrue(all(n.advisor_decision == "REVIEW"
+                            for n in p.nodes.values()))
+
+    def test_validation_failures_are_not_late_retried(self):
+        p = self.make_planner()
+        calls = []
+
+        class Primary:
+            def unload(self): pass
+
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            calls.append(sha)
+            node = p.nodes[sha]
+            if sha == "a" * 40:
+                p._advisor_note_failure(node, kbp.AdvisorError(
+                    "binding evidence unassessed", kind="binding-unassessed"))
+            else:
+                node.advisor_decision = "TAKE"
+                node.advisor_error_kind = None
+                node.advisor_error = None
+
+        p._advisor_evaluate_one = fake_evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor"):
+            p._advisor_fallback_pass(Primary())
+        self.assertEqual(calls, ["a" * 40, "b" * 40])
+        self.assertEqual(p.advisor_fallback_deferred_retries, 0)
+        self.assertEqual(p.advisor_fallback_failures, 1)
+
+    def test_deferred_failure_remains_failed_and_is_bounded(self):
+        p = self.make_planner()
+        calls = []
+
+        class Primary:
+            def unload(self): pass
+
+        def fake_evaluate(client, prompt, sha, **kwargs):
+            calls.append(sha)
+            node = p.nodes[sha]
+            if sha == "a" * 40:
+                p._advisor_note_failure(node, kbp.AdvisorError(
+                    "CUDA out of memory", kind="http"))
+            else:
+                node.advisor_decision = "TAKE"
+                node.advisor_error_kind = None
+                node.advisor_error = None
+
+        p._advisor_evaluate_one = fake_evaluate
+        with mock.patch.object(kbp, "OllamaAdvisor"):
+            p._advisor_fallback_pass(Primary())
+        self.assertEqual(calls, ["a" * 40, "b" * 40, "a" * 40])
+        self.assertEqual(p.advisor_fallback_deferred_retries, 1)
+        self.assertEqual(p.advisor_fallback_recovered, 0)
+        self.assertEqual(p.advisor_fallback_failures, 1)
+        self.assertEqual(len(p.nodes["a" * 40].advisor_fallback_history), 2)
+
+    def test_binding_retry_names_exact_missing_evidence_ids(self):
+        message = ("binding evidence marked REQUIRED without prerequisite "
+                   "selection: ev-123456")
+        prompt = kbp.binding_retry_prompt("base prompt", message)
+        self.assertIn(message, prompt)
+        self.assertIn("Include REQUIRED", prompt)
+
+    def test_binding_validator_feedback_reaches_retry_request(self):
+        p = object.__new__(kbp.Planner)
+        p.args = types.SimpleNamespace(
+            advisor_retries=1, advisor_retry_delay=0,
+            advisor_context_tokens=0, advisor_output_reserve=1024)
+        sha = "a" * 40
+        p.nodes = {sha: kbp.CommitNode(sha, "board")}
+        p.advisor_calls = 0
+        p.advisor_retries_used = 0
+        p.info = lambda msg: None
+        p.advisor_prerequisite_evidence = lambda _sha: []
+        p.advisor_inbound_take_recommendations = lambda _sha: []
+        p.validate_advisor_result = lambda _sha, result: result
+        p._advisor_hard_dt_include_facts = lambda _sha: []
+        p.performance = None
+        p.advisor_trace_path = None
+        p.advisor_error_log_path = None
+
+        class Client:
+            def __init__(self):
+                self.prompts = []
+            def advise(self, prompt, packet, schema):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    raise kbp.AdvisorError(
+                        "binding evidence marked REQUIRED without "
+                        "prerequisite selection: ev-abc123",
+                        kind="binding-unassessed", retryable=True)
+                return {"decision": "TAKE", "rationale": "valid", "risks": []}
+
+        client = Client()
+        result = p._advisor_call_with_retries(
+            client, "original", sha, {"commit": {"sha": sha}})
+        self.assertEqual(result["decision"], "TAKE")
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("ev-abc123", client.prompts[1])
