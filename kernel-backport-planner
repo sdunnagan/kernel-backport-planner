@@ -41,7 +41,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.24"
+VERSION = "0.4.27"
 ADVISOR_PROMPT_VERSION = "19"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
@@ -3942,7 +3942,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             # reason to abandon otherwise recoverable secondary requests.
             if hasattr(fallback_client, "warmup"):
                 try:
-                    fallback_client.warmup(context_tokens)
+                    fallback_client.warmup(self.args.advisor_context_tokens)
                     self.info("  fallback model warmup succeeded")
                 except (AdvisorError, OSError) as exc:
                     self.advisor_fallback_warmup_error = str(exc)
@@ -5294,7 +5294,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         lines.append(f"status:       {missing} missing, {present} already downstream")
         lines.append("")
 
-        lines.append("BACKPORT PLAN (oldest first)")
+        lines.append("BACKPORT WORKSHEET (oldest first)")
         lines.append("=" * 80)
         for sha in self.ordered_missing():
             n = self.nodes[sha]
@@ -5640,20 +5640,46 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
 
 
 
-def package_results(prefix_arg: str) -> tuple[Path, Path]:
-    """Package completed dual reports and the planner's closed internal log.
+def worksheet_path_for_plan(prefix: Path) -> Path:
+    """Return the editable text worksheet associated with a plan stem.
 
-    Refuse to overwrite existing output directories or archives. Legacy
-    post-run packaging is also supported for already completed tee logs.
+    Standard runs pair backport_plan_<id>.json with
+    backport_worksheet_<id>.txt. Generic same-stem .txt/.json output also
+    works for short experiments and tests.
     """
-    raw = Path(prefix_arg).expanduser().absolute()
-    prefix = raw.with_suffix("") if raw.suffix in {".c", ".json", ".log"} else raw
+    if prefix.name.startswith("backport_plan_"):
+        return prefix.with_name(
+            "backport_worksheet_" + prefix.name[len("backport_plan_"):] + ".txt"
+        )
+    return prefix.with_suffix(".txt")
+
+
+def plan_prefix_from_argument(argument: str) -> Path:
+    """Resolve a plan or worksheet filename to the plan's artifact stem."""
+    raw = Path(argument).expanduser().absolute()
+    if raw.suffix in (".txt", ".json", ".log", ".zip"):
+        raw = raw.with_suffix("")
+    if raw.name.startswith("backport_worksheet_"):
+        raw = raw.with_name(
+            "backport_plan_" + raw.name[len("backport_worksheet_"):]
+        )
+    return raw
+
+
+def package_results(prefix_arg: str) -> tuple[Path, Path]:
+    """Package the completed worksheet, immutable JSON plan, and log.
+
+    Refuse to overwrite existing output directories or archives. The planner
+    never modifies a worksheet after generating and packaging it.
+    """
+    prefix = plan_prefix_from_argument(prefix_arg)
     destination = prefix
     archive = prefix.with_suffix(".zip")
     for path in (destination, archive):
         if os.path.lexists(path):
             raise ValueError(f"package destination already exists: {path}")
-    sources = [prefix.with_suffix(ext) for ext in (".c", ".json", ".log")]
+    sources = [worksheet_path_for_plan(prefix), prefix.with_suffix(".json"),
+               prefix.with_suffix(".log")]
     sources += [path for ext in (".perf.json", ".perf.jsonl")
                 if (path := prefix.with_suffix(ext)).is_file()]
     for source in sources:
@@ -5701,6 +5727,220 @@ def package_results(prefix_arg: str) -> tuple[Path, Path]:
     return destination, archive
 
 
+# Generic artifact filenames inside a numbered, workspace-owned run directory.
+WORKSPACE_PLAN = "backport_plan.json"
+WORKSPACE_WORKSHEET = "backport_worksheet.txt"
+WORKSPACE_LOG = "backport_plan.log"
+WORKSPACE_PERFORMANCE = "performance.json"
+WORKSPACE_PERFORMANCE_EVENTS = "performance.jsonl"
+WORKSPACE_TRACE = "advisor-trace.jsonl"
+WORKSPACE_CACHE = "advisor-cache.json"
+WORKSPACE_ERRORS = "advisor-errors.jsonl"
+
+
+# Match kernel-builder's desktop completion sounds. Missing audio is harmless.
+PLANNER_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
+
+
+def play_planner_completion_sound(success: bool) -> None:
+    """Notify once after a planning attempt, without changing its result."""
+    filename = "complete.oga" if success else "service-logout.oga"
+    directory = os.environ.get("KBP_SOUND_DIR", PLANNER_SOUND_DIR)
+    path = Path(directory).expanduser() / filename
+    try:
+        if not path.is_file():
+            return
+        for name, command in (
+            ("canberra-gtk-play", ["-f", str(path)]),
+            ("pw-play", [str(path)]),
+            ("paplay", [str(path)]),
+        ):
+            player = shutil.which(name)
+            if not player:
+                continue
+            try:
+                result = subprocess.run([player, *command],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        timeout=10, check=False)
+                if result.returncode == 0:
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    except OSError:
+        pass
+
+
+# One-time migration cleanup for copies left by the old flat-file format.
+# Do not inspect arbitrary files, benchmarks, execution journals or ZIP files.
+_LEGACY_DUPLICATE_RE = re.compile(
+    r"^backport_plan_(\d+)\.(?:"
+    r"c(?:\.advisor-(?:cache\.json|errors\.jsonl|trace\.jsonl))?|"
+    r"json|log|perf\.jsonl?|"
+    r"advisor-(?:cache\.json|errors\.jsonl|trace\.jsonl)"
+    r")$|^backport_worksheet_(\d+)\.txt$"
+)
+
+
+def _same_file_bytes(first, second) -> bool:
+    """Compare file-like streams without loading large traces into memory."""
+    while True:
+        a = first.read(1024 * 1024)
+        b = second.read(1024 * 1024)
+        if a != b:
+            return False
+        if not a:
+            return True
+
+
+def cleanup_workspace_duplicates(workspace: Path, *, apply: bool = False) -> tuple[list[Path], list[Path]]:
+    """Find only byte-identical legacy root files backed by dir AND ZIP.
+
+    By default this is a dry-run. Never touch archives, benchmark output,
+    user-edited worksheets, or any file whose saved copy cannot be verified.
+    """
+    workspace = workspace.expanduser().resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"KERNEL_WORKSPACE_DIR is not a directory: {workspace}")
+    eligible: list[Path] = []
+    removed: list[Path] = []
+    for file in sorted(workspace.iterdir()):
+        if not file.is_file() or file.is_symlink():
+            continue
+        match = _LEGACY_DUPLICATE_RE.fullmatch(file.name)
+        if not match:
+            continue
+        number = int(match.group(1) or match.group(2))
+        stem = f"backport_plan_{number:02d}"
+        # Legacy archive directories were produced beside the flat results.
+        directory = workspace / stem
+        archive_path = workspace / (stem + ".zip")
+        if (not directory.is_dir() or directory.is_symlink()
+                or not archive_path.is_file() or archive_path.is_symlink()):
+            continue
+        copy = directory / file.name
+        if not copy.is_file() or copy.is_symlink():
+            continue
+        try:
+            initial = file.stat()
+            if initial.st_size != copy.stat().st_size:
+                continue
+            with file.open("rb") as src, copy.open("rb") as saved:
+                if not _same_file_bytes(src, saved):
+                    continue
+            with zipfile.ZipFile(archive_path) as archive:
+                member = f"{stem}/{file.name}"
+                meta = archive.getinfo(member)
+                if meta.file_size != initial.st_size:
+                    continue
+                with file.open("rb") as src, archive.open(meta) as zipped:
+                    if not _same_file_bytes(src, zipped):
+                        continue
+            eligible.append(file)
+            if apply:
+                current = file.stat()
+                if (current.st_ino != initial.st_ino
+                        or current.st_size != initial.st_size
+                        or current.st_mtime_ns != initial.st_mtime_ns):
+                    continue
+                file.unlink()
+                removed.append(file)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError):
+            # An incomplete/invalid snapshot is not grounds for deletion.
+            continue
+    return eligible, removed
+
+
+def _existing_plan_numbers(workspace: Path, plans_root: Path) -> set[int]:
+    """Include legacy flat outputs so migration starts after the last run."""
+    numbers: set[int] = set()
+    for parent in (workspace, plans_root):
+        if not parent.is_dir():
+            continue
+        for item in parent.iterdir():
+            match = re.match(r"^backport_plan_(\d+)(?:$|\.)", item.name)
+            if match:
+                numbers.add(int(match.group(1)))
+            match = re.match(r"^backport_worksheet_(\d+)\.txt$", item.name)
+            if match:
+                numbers.add(int(match.group(1)))
+    return numbers
+
+
+def reserve_workspace_run(args: argparse.Namespace, workspace: Path) -> Path:
+    """Atomically reserve a fresh numbered results directory.
+
+    An interrupted run retains its directory. Repeated or parallel invocations
+    therefore cannot silently replace a completed worksheet or JSON plan.
+    """
+    workspace = workspace.expanduser().resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"KERNEL_WORKSPACE_DIR is not a directory: {workspace}")
+    plans_root = workspace / "backport-plans"
+    plans_root.mkdir(exist_ok=True)
+    if not plans_root.is_dir() or plans_root.is_symlink():
+        raise ValueError(f"invalid plans directory: {plans_root}")
+    run_number = max(_existing_plan_numbers(workspace, plans_root), default=0) + 1
+    while True:
+        result = plans_root / f"backport_plan_{run_number:02d}"
+        try:
+            result.mkdir()
+            break
+        except FileExistsError:
+            run_number += 1
+
+    args.output = str(result / WORKSPACE_WORKSHEET)
+    args.json_output = str(result / WORKSPACE_PLAN)
+    args.advisor_cache = args.advisor_cache or str(result / WORKSPACE_CACHE)
+    args.advisor_error_log = args.advisor_error_log or str(result / WORKSPACE_ERRORS)
+    if args.advisor_trace == "auto":
+        args.advisor_trace = str(result / WORKSPACE_TRACE)
+    args.performance_event_path = str(result / WORKSPACE_PERFORMANCE_EVENTS)
+    args.performance_summary_path = str(result / WORKSPACE_PERFORMANCE)
+    args.workspace_run_dir = str(result)
+    return result
+
+
+def package_workspace_run(directory_arg: str | Path) -> Path:
+    """Snapshot the workspace run directory without modifying its worksheet."""
+    directory = Path(directory_arg).expanduser().resolve()
+    if (not directory.is_dir()
+            or not re.fullmatch(r"backport_plan_\d+", directory.name)):
+        raise ValueError(f"not a numbered planner results directory: {directory}")
+    required = (WORKSPACE_PLAN, WORKSPACE_WORKSHEET, WORKSPACE_LOG,
+                WORKSPACE_PERFORMANCE, WORKSPACE_PERFORMANCE_EVENTS)
+    for name in required:
+        if not (directory / name).is_file():
+            raise ValueError(
+                f"required completed output is missing: {directory / name}")
+    try:
+        json.loads((directory / WORKSPACE_PLAN).read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read plan JSON for packaging: {exc}") from exc
+    archive = directory.with_suffix(".zip")
+    if os.path.lexists(archive):
+        raise ValueError(f"results archive already exists: {archive}")
+
+    # Only package regular artifacts from this run. Never include a manually
+    # created directory, an external symlink, or the ZIP itself.
+    artifacts = []
+    for file in sorted(directory.iterdir()):
+        if file.is_symlink():
+            raise ValueError(f"refusing symlink in planner results: {file}")
+        if file.is_file():
+            artifacts.append(file)
+    with tempfile.TemporaryDirectory(prefix=".planner-archive-",
+                                     dir=directory.parent) as tmp:
+        staging = Path(tmp) / archive.name
+        with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED) as output:
+            for file in artifacts:
+                output.write(file, arcname=f"{directory.name}/{file.name}")
+        # Exclusive publication: a concurrent process must not overwrite
+        # an existing snapshot of an engineer's working worksheet.
+        os.link(staging, archive)
+    return archive
+
+
 class TeeOutput:
     """Write Python progress to the terminal and the planner-owned log."""
 
@@ -5722,31 +5962,33 @@ class TeeOutput:
 
 
 def auto_package_prefix(args: argparse.Namespace) -> Path | None:
-    """Choose the package name for standard dual-output text/JSON runs.
+    """Choose the package name for a worksheet and matching JSON plan.
 
-    All other previously supported output formats remain unchanged. Using
-    different text/JSON basenames is almost always a typo, and would make
-    the packaged reports ambiguous, so reject that combination early.
+    The standard pair is backport_worksheet_<id>.txt and
+    backport_plan_<id>.json. A generic common-stem .txt/.json pair also works.
     """
-    if (not args.auto_package or not args.output or not args.json_output
+    if (getattr(args, "workspace_run_dir", None) or not args.auto_package
+            or not args.output or not args.json_output
             or args.format != "text"):
         return None
     text_path = Path(args.output).expanduser().absolute()
     json_path = Path(args.json_output).expanduser().absolute()
-    if text_path.suffix != ".c" or json_path.suffix != ".json":
+    if text_path.suffix != ".txt" or json_path.suffix != ".json":
         return None
-    if text_path.with_suffix("") != json_path.with_suffix(""):
+    prefix = json_path.with_suffix("")
+    if text_path != worksheet_path_for_plan(prefix):
         raise ValueError(
-            "automatic packaging requires matching text/JSON basenames; "
+            "automatic packaging requires a matching worksheet and plan "
+            "(backport_worksheet_N.txt + backport_plan_N.json); "
             "use --no-auto-package for independent output paths"
         )
-    return text_path.with_suffix("")
+    return prefix
 
 
 def ensure_package_destinations_available(prefix: Path) -> None:
     """Fail before a costly planner run if its package would be overwritten."""
     for path in (prefix, prefix.with_suffix(".zip"), prefix.with_suffix(".log"),
-                 prefix.with_suffix(".c"), prefix.with_suffix(".json"),
+                 worksheet_path_for_plan(prefix), prefix.with_suffix(".json"),
                  prefix.with_suffix(".perf.json"), prefix.with_suffix(".perf.jsonl")):
         if os.path.lexists(path):
             raise ValueError(f"automatic package output already exists: {path}")
@@ -6039,9 +6281,13 @@ def run_planner(args: argparse.Namespace) -> int:
         verify_advisor_fallback_model(args.advisor_base_url,
                                       args.advisor_fallback_model)
     # The append-only event file is useful even if power fails before reports.
-    source = Path(args.output).expanduser() if args.output else None
-    event_path = (source.with_suffix(".perf.jsonl") if source else None)
-    summary_path = (source.with_suffix(".perf.json") if source else None)
+    source = (auto_package_prefix(args) or Path(args.output).expanduser()) if args.output else None
+    event_path = (Path(args.performance_event_path)
+                  if getattr(args, "performance_event_path", None)
+                  else (source.with_suffix(".perf.jsonl") if source else None))
+    summary_path = (Path(args.performance_summary_path)
+                    if getattr(args, "performance_summary_path", None)
+                    else (source.with_suffix(".perf.json") if source else None))
     performance = PerformanceRecorder(event_path)
     try:
         with performance.phase("initialize"):
@@ -6094,12 +6340,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         description="Build a dependency-aware kernel subsystem backport plan"
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("--package-results", metavar="PREFIX",
-                   help="package previously completed PREFIX.c/.json/.log "
-                        "(legacy post-run mode)")
+    p.add_argument("--cleanup-workspace-duplicates", action="store_true",
+                   help="preview safely removable legacy flat-file copies; "
+                        "requires KERNEL_WORKSPACE_DIR")
+    p.add_argument("--apply-cleanup", action="store_true",
+                   help="delete verified legacy copies (requires "
+                        "--cleanup-workspace-duplicates)")
+    p.add_argument("--package-results", metavar="PREFIX_OR_DIRECTORY",
+                   help="package an existing workspace run directory or legacy "
+                        "backport_worksheet_N.txt/backport_plan_N.json pair")
     p.add_argument("--no-auto-package", dest="auto_package", action="store_false",
-                   help="disable automatic log, results directory, and ZIP for "
-                        "matching --output .c and --json-output .json")
+                   help="disable automatic workspace run creation or automatic "
+                        "packaging for explicitly paired output paths")
     p.set_defaults(auto_package=True)
     p.add_argument("--repo", default=".", help="git repository containing upstream/downstream refs")
     p.add_argument("--base", help="upstream base commit/tag, e.g. v6.19")
@@ -6217,9 +6469,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="advisor diagnostic JSONL path (default: <output>.advisor-errors.jsonl)",
     )
     p.add_argument(
-        "--advisor-trace", metavar="FILE.jsonl",
-        help="capture exact advisor prompts/packets/schemas/raw responses; "
-             "requires a new filename and is packaged with run results",
+        "--advisor-trace", nargs="?", const="auto", metavar="FILE.jsonl",
+        help="capture exact advisor requests; omit the filename to use "
+             "advisor-trace.jsonl in the automatic workspace results directory",
     )
     p.add_argument(
         "--advisor-replay-trace", metavar="FILE.jsonl",
@@ -6277,14 +6529,25 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="max diff characters per required-by consumer in advisor evidence (default: 5000)",
     )
     p.add_argument("--format", choices=("text", "json"), default="text")
-    p.add_argument("--output", help="write primary report to this file instead of stdout")
+    p.add_argument("--worksheet-output", "--output", dest="output",
+                   help="explicit worksheet output path (default: automatically "
+                        "numbered $KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_N/ "
+                        "when workspace is set; otherwise stdout)")
     p.add_argument(
         "--json-output",
-        help="also write a JSON report from the same analysis (independent of --format)",
+        help="write the immutable JSON execution plan from the same analysis",
     )
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    if args.apply_cleanup and not args.cleanup_workspace_duplicates:
+        p.error("--apply-cleanup requires --cleanup-workspace-duplicates")
+    if args.cleanup_workspace_duplicates:
+        if (args.base or args.target or args.output or args.json_output
+                or args.package_results or args.advisor_benchmark_plan
+                or args.advisor_replay_trace or args.update):
+            p.error("workspace cleanup is a standalone maintenance operation")
+        return args
     if args.advisor_fallback_model and not args.advisor_model:
         p.error("--advisor-fallback-model requires --advisor-model")
     if args.advisor_fallback_model == args.advisor_model and args.advisor_model:
@@ -6329,8 +6592,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         return args
     if not args.base or not args.target:
         p.error("--base and --target are required for planning")
+    if args.format == "text" and args.output and Path(args.output).suffix != ".txt":
+        p.error("text worksheet output must have a .txt extension")
     if args.output and args.json_output and Path(args.output).expanduser().resolve() == Path(args.json_output).expanduser().resolve():
         p.error("--json-output and --output must name different files")
+    if args.advisor_trace == "auto" and (args.output or args.json_output):
+        stem = args.json_output or args.output
+        args.advisor_trace = str(Path(stem).expanduser().absolute()) + ".advisor-trace.jsonl"
     try:
         auto_package_prefix(args)
     except ValueError as exc:
@@ -6338,22 +6606,52 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
-    if args.advisor_replay_trace:
-        return run_exact_trace_replay(args)
-    if args.advisor_benchmark_plan:
-        return run_advisor_benchmark(args)
-    if args.package_results:
-        print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+def _run_normal_planning(args: argparse.Namespace) -> int:
+    # Without explicit paths, use the shared workspace like kernel-builder.
+    # Legacy stdout behavior remains available when the variable is absent,
+    # --format=json is selected, or automatic packaging is disabled.
+    workspace = os.environ.get("KERNEL_WORKSPACE_DIR", "").strip()
+    if (workspace and args.auto_package and args.format == "text"
+            and not args.output and not args.json_output):
+        if args.advisor_trace not in (None, "auto"):
+            print("backport-plan: use --advisor-trace without a filename "
+                  "for workspace runs", file=sys.stderr)
+            return 1
         try:
-            directory, archive = package_results(args.package_results)
+            directory = reserve_workspace_run(args, Path(workspace))
+        except (ValueError, OSError) as exc:
+            print(f"backport-plan: cannot reserve workspace run: {exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"Planning results: {directory}", file=sys.stderr)
+        log_path = directory / WORKSPACE_LOG
+        with log_path.open("x", encoding="utf-8") as log:
+            out = TeeOutput(sys.stdout, log)
+            err = TeeOutput(sys.stderr, log)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                started = time.monotonic()
+                print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+                rc = run_planner(args)
+                print(f"Planner elapsed: {time.monotonic() - started:.1f}s",
+                      file=sys.stderr)
+                out.flush()
+                err.flush()
+            log.flush()
+            os.fsync(log.fileno())
+        try:
+            archive = package_workspace_run(directory)
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
-            print(f"backport-plan: cannot package results: {exc}", file=sys.stderr)
+            print(f"backport-plan: workspace packaging failed: {exc}",
+                  file=sys.stderr)
             return 1
         print(f"Results directory: {directory}")
         print(f"Results archive: {archive}")
-        return 0
+        return rc
+
+    if args.advisor_trace == "auto":
+        print("backport-plan: --advisor-trace needs an output path or "
+              "KERNEL_WORKSPACE_DIR", file=sys.stderr)
+        return 1
 
     prefix = auto_package_prefix(args)
     if prefix is None:
@@ -6390,6 +6688,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     print(f"Results directory: {directory}")
     print(f"Results archive: {archive}")
+    return rc
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.cleanup_workspace_duplicates:
+        workspace = os.environ.get("KERNEL_WORKSPACE_DIR", "").strip()
+        if not workspace:
+            print("backport-plan: KERNEL_WORKSPACE_DIR is required for cleanup",
+                  file=sys.stderr)
+            return 1
+        try:
+            candidates, removed = cleanup_workspace_duplicates(
+                Path(workspace), apply=args.apply_cleanup)
+        except (ValueError, OSError) as exc:
+            print(f"backport-plan: cleanup failed: {exc}", file=sys.stderr)
+            return 1
+        if args.apply_cleanup:
+            for file in removed:
+                print(f"Removed verified duplicate: {file}")
+            print(f"Removed {len(removed)} verified duplicate(s); "
+                  f"{len(candidates) - len(removed)} candidate(s) changed")
+        else:
+            for file in candidates:
+                print(f"Would remove: {file}")
+            print(f"Dry run: {len(candidates)} verified duplicate(s); "
+                  "pass --apply-cleanup to remove")
+        return 0
+    if args.advisor_replay_trace:
+        return run_exact_trace_replay(args)
+    if args.advisor_benchmark_plan:
+        return run_advisor_benchmark(args)
+    if args.package_results:
+        print(f"{Path(sys.argv[0]).name} {VERSION}", file=sys.stderr)
+        try:
+            candidate = Path(args.package_results).expanduser()
+            if candidate.is_dir() and (candidate / WORKSPACE_PLAN).is_file():
+                directory = candidate.resolve()
+                archive = package_workspace_run(directory)
+            else:
+                directory, archive = package_results(args.package_results)
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            print(f"backport-plan: cannot package results: {exc}", file=sys.stderr)
+            return 1
+        print(f"Results directory: {directory}")
+        print(f"Results archive: {archive}")
+        return 0
+
+    try:
+        rc = _run_normal_planning(args)
+    except BaseException:
+        play_planner_completion_sound(False)
+        raise
+    play_planner_completion_sound(rc == 0)
     return rc
 
 

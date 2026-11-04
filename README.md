@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.24**.
+Current tool version: **0.4.26**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -23,6 +23,152 @@ The key distinction is that `--base` limits the **focus candidate range**, not
 the dependency universe. A required prerequisite may predate `--base` if there
 is concrete evidence that a selected commit depends on it and that prerequisite
 is not already downstream.
+
+## Workspace cleanup and completion sounds (0.4.27)
+
+**New workspace runs write directly into their numbered result directory.**
+They do not create flat files in the kernel workspace and then copy them.
+Old runs (before 0.4.26) may still have duplicate flat files alongside
+`backport_plan_N/` directories and `backport_plan_N.zip` archives.
+To preview which historical root-level files are safe to remove:
+
+```bash
+kernel-backport-planner --cleanup-workspace-duplicates
+```
+
+To remove *only* verified duplicates after reviewing that list:
+
+```bash
+kernel-backport-planner --cleanup-workspace-duplicates --apply-cleanup
+```
+
+The cleanup uses `KERNEL_WORKSPACE_DIR`, checks both the saved results
+**directory and ZIP**, and compares complete file contents. It never removes
+an archive, journal, benchmark, unrelated file, symlink, or changed worksheet.
+It does not touch prior plans or files lacking a verified matching copy.
+The preview makes no changes. These are maintenance commands, not planning
+runs, and do not require `--base` or `--target`.
+
+Normal planner invocations now play the **same sounds as kernel-builder**
+when the complete planning operation finishes (including ZIP packaging):
+
+- Success: `/usr/share/sounds/freedesktop/stereo/complete.oga`
+- Failure: `/usr/share/sounds/freedesktop/stereo/service-logout.oga`
+
+The planner tries `canberra-gtk-play`, then `pw-play`, then `paplay`, using
+whichever audio player works. Missing files, unavailable audio, and playback
+failures are ignored without changing the planner's exit status. Change the
+sound directory with `KBP_SOUND_DIR`. No sound plays for `--version`,
+benchmark/replay, cleanup, or packaging-only commands. It plays on the
+machine running the planner (`shire`, not `gondor`).
+
+The old `qwen-policy-test-01.jsonl` is a standalone benchmark output,
+**not** an input needed by normal planning. Delete it when it is no longer
+needed as a benchmark record; the automatic duplicate cleanup intentionally
+leaves it alone.
+
+## Automatic workspace results (0.4.26)
+
+The planner uses the same exported `KERNEL_WORKSPACE_DIR` as kernel-builder.
+For **normal planning**, do not pass `--worksheet-output`, `--json-output`,
+or a results-directory path. When `KERNEL_WORKSPACE_DIR` is set, the planner
+reserves the next unused numbered run in its own subdirectory:
+
+```text
+$KERNEL_WORKSPACE_DIR/
+  centos-stream-10/
+  build-centos-stream-10-aarch64/
+  backport-plans/
+    backport_plan_29/
+      backport_plan.json          # immutable machine-readable execution plan
+      backport_worksheet.txt     # editable backport engineering worksheet
+      backport_plan.log          # complete terminal progress log
+      advisor-cache.json         # optional persistent advisor response cache
+      advisor-errors.jsonl       # optional model-error diagnostics
+      advisor-trace.jsonl        # optional exact request trace
+      performance.json           # final timing/telemetry summary
+      performance.jsonl          # live append-only performance events
+    backport_plan_29.zip         # original, immutable ZIP snapshot
+```
+
+The planner chooses the next number automatically. It also notices old
+`backport_plan_N` directories, `.json`, and `.zip` files directly under the
+workspace, so migrating from older flat output does not restart the numbering
+at 01. An interrupted run **retains its reserved directory**, including its
+partial log and performance events; a later invocation gets a new number.
+Existing run directories and archives are never silently overwritten.
+
+### Standard invocation
+
+For example, with `KERNEL_WORKSPACE_DIR=$HOME/projects/rhel-223619`, run
+from the CS10 source tree as before:
+
+```bash
+cd "$KERNEL_WORKSPACE_DIR/centos-stream-10"
+
+"$KERNEL_BACKPORT_PLANNER" \
+    --update \
+    --upstream linux-stable \
+    --downstream cs10 \
+    --base v6.19 \
+    --target v7.0 \
+    --file-list "$HOME/Documents/red_hat_notes/tasks/305_arm_rebase_upstream_v7/file_list.txt" \
+    --advisor-model kernel-planner:32k \
+    --advisor-base-url http://gondor:11434 \
+    --advisor-max-request-chars 48000 \
+    --advisor-context-tokens 32768 \
+    --advisor-output-reserve 1024 \
+    --advisor-trace \
+    --advisor-fallback-model gemma4-kernel:64k \
+    --advisor-fallback-timeout 900 \
+    --advisor-fallback-max-request-chars 120000 \
+    --advisor-fallback-context-tokens 65536
+```
+
+`--advisor-trace` without an argument saves the exact request trace in the
+numbered directory. Omit that flag to disable trace capture. Advisor cache,
+error diagnostics, log and performance files use generic names in that same
+directory. The planner closes the log, writes the final plan and worksheet,
+then publishes a ZIP snapshot beside the run directory. The original ZIP
+remains unchanged when an engineer later edits the worksheet.
+
+After planning, explicitly select the cycle for the backporter:
+
+```bash
+export KERNEL_BACKPORT_PLANNER_DIR="$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_29"
+```
+
+The upcoming backporter worksheet integration can read the standard
+`backport_plan.json` and `backport_worksheet.txt` from that directory. The
+planner itself does **not** consume that variable. Until the backporter
+supports the new convention, use its existing explicit `--plan` option.
+
+### Ownership and compatibility
+
+The JSON plan is a **frozen planning snapshot**. The worksheet is a
+human-readable starting point containing TAKE/REVIEW/SKIP decisions, dependency
+evidence and advisor rationale. The planner writes and archives the worksheet
+**once** and does not read later engineer annotations. The backporter owns
+execution state and its separate journal is authoritative. Manual resolutions
+and engineer notes belong in the live worksheet and Git, never in the JSON
+plan. A new planning cycle gets a new directory and downstream baseline.
+
+Explicit `--worksheet-output` and `--json-output` paths still work for older
+workflows, tests, and independent outputs. When the environment variable is
+unset, the original stdout behavior remains; `--no-auto-package` also opts
+out of automatic workspace run creation. JSON-primary `--format=json` remains
+an explicit-output/stdout workflow. `--advisor-trace FILE.jsonl` remains
+supported when explicit report paths are used.
+
+To regenerate a missing ZIP after a completed workspace run (without
+modifying its worksheet):
+
+```bash
+kernel-backport-planner --package-results \
+    "$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_29"
+```
+
+Packaging refuses to overwrite an existing ZIP or package an incomplete run.
 
 ## Fallback startup and deferred recovery (0.4.24)
 
@@ -50,11 +196,10 @@ DTS prerequisite providers unresolved. The fallback now:
 
 On `gondor`, the existing `gemma4-kernel:64k` model has a 65,536-token
 context. The lower context can reduce VRAM pressure, but it is not an OOM
-cure and cannot guarantee inference completion. This release has not been
-validated with a full CS10 run; inspect run 28 before using its plan for
-unattended backports.
+cure and cannot guarantee inference completion. Run 28 completed with a 64K Gemma context and produced an
+execution-ready plan; Git cherry-pick and build validation remain separate.
 
-### Complete run 28 configuration on shire
+### Historical explicit-path example: run 28
 
 Keep the previous Git remotes, base/target, file list and Qwen settings.
 For run 28, the fallback and report arguments should be:
@@ -64,8 +209,8 @@ For run 28, the fallback and report arguments should be:
 --advisor-fallback-timeout 900 \
 --advisor-fallback-max-request-chars 120000 \
 --advisor-fallback-context-tokens 65536 \
---advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_28.c.advisor-trace.jsonl" \
---output "$KERNEL_WORKSPACE_DIR/backport_plan_28.c" \
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_28.advisor-trace.jsonl" \
+--worksheet-output "$KERNEL_WORKSPACE_DIR/backport_worksheet_28.txt" \
 --json-output "$KERNEL_WORKSPACE_DIR/backport_plan_28.json"
 ```
 
@@ -125,7 +270,7 @@ ollama list
 Do not run Gemma concurrently with Qwen. Set the Ollama service to
 `OLLAMA_MAX_LOADED_MODELS=1` on gondor. Both models can remain stored on disk.
 
-### Complete run example, run 27 on shire
+### Historical explicit-path example: run 27 on shire
 
 Add the following switches to the existing `~/bin/run-planner` invocation;
 keep the current Git remotes, file list and primary Qwen settings:
@@ -140,8 +285,8 @@ keep the current Git remotes, file list and primary Qwen settings:
 --advisor-fallback-timeout 900 \
 --advisor-fallback-max-request-chars 120000 \
 --advisor-fallback-context-tokens 131072 \
---advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_27.c.advisor-trace.jsonl" \
---output "$KERNEL_WORKSPACE_DIR/backport_plan_27.c" \
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_27.advisor-trace.jsonl" \
+--worksheet-output "$KERNEL_WORKSPACE_DIR/backport_worksheet_27.txt" \
 --json-output "$KERNEL_WORKSPACE_DIR/backport_plan_27.json"
 ```
 
@@ -151,9 +296,8 @@ than Qwen-only run 26. The fallback has a longer timeout because Gemma uses
 CPU offloading. The 120000-character budget is a separate safety limit,
 not a claim that character count is a reliable token count.
 
-A full CS10 / Qwen / Gemma integration run has not been performed as part of
-this release's unit tests. Preserve run 26 and inspect both model judgments
-before using run 27 as an automated execution plan.
+Full integration runs 27 and 28 are described above. Unit tests alone
+do not establish that a generated plan can be applied or built.
 
 ## Why this exists
 
@@ -240,8 +384,8 @@ or SKIP is retained for those concerns. A safe but unrecognized paraphrase may
 therefore remain REVIEW rather than being automatically promoted to TAKE.
 
 Version 0.4.13 adds `--json-output` to emit a machine-readable JSON report
-alongside the normal text report from the same planning and advisor run. The
-existing `--format` and `--output` options remain unchanged; the two output
+alongside the Backport Worksheet from the same planning and advisor run. The
+existing `--format` and `--worksheet-output` options remain unchanged; the two output
 paths must be distinct.
 
 Version 0.4.14 closes gaps exposed by plan-driven execution. It resolves DTS/DTSI
@@ -260,7 +404,7 @@ issue count means every active TAKE prerequisite has a viable earlier TAKE or
 an already-present peer, not that the final kernel has been compiled or tested.
 The JSON advisor section includes `execution_ready` and `consistency_issues`;
 when issues remain, the plan is not fully executable without manual review.
-Existing `--output` and `--json-output` behavior is unchanged.
+The generated worksheet and JSON plan describe the same frozen baseline.
 
 Version 0.4.15 fixes same-commit DT source includes: when a DTS and its
 included DTSI are both added by the same upstream patch, the DTSI is not a
@@ -272,17 +416,9 @@ that would contradict actual Git ancestry remains an explicit consistency
 issue. Neither a successful reorder nor `execution_ready` proves cherry-pick
 success or build correctness.
 
-Version 0.4.15 automatically packages standard dual-output runs when
-`--output PREFIX.c` and `--json-output PREFIX.json` have the same basename.
-The planner itself writes `PREFIX.log` while printing progress to the terminal;
-after the log is closed it copies all three completed files and available
-advisor cache/error-log artifacts into `PREFIX/` and creates `PREFIX.zip`.
-Neither a second command nor external `tee` is necessary. Existing package
-paths and `.log` files are never overwritten. A mismatched output basename
-is rejected before analysis, preventing a costly misnamed run. Use
-`--no-auto-package` for nonstandard independent output paths or when managing
-logs and archives externally. Standalone `--package-results PREFIX` remains
-available for packaging older completed runs.
+Automatic packaging creates an immutable archive for every standard paired
+worksheet and JSON plan. The current naming convention is documented under
+**Automatic results packaging** below. No external `tee` is needed.
 
 
 ## Verified binding claims, source includes, and exact advisor replay (0.4.22)
@@ -315,8 +451,8 @@ Exact request tracing is opt-in (traces may contain substantial kernel source
 text). On `shire`, keep the other run options unchanged and use:
 
 ```bash
---advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_26.c.advisor-trace.jsonl" \
---output "$KERNEL_WORKSPACE_DIR/backport_plan_26.c" \
+--advisor-trace "$KERNEL_WORKSPACE_DIR/backport_plan_26.advisor-trace.jsonl" \
+--worksheet-output "$KERNEL_WORKSPACE_DIR/backport_worksheet_26.txt" \
 --json-output "$KERNEL_WORKSPACE_DIR/backport_plan_26.json"
 ```
 
@@ -332,7 +468,7 @@ fresh Git collection or reconstructed packet:
 
 ```bash
 kernel-backport-planner \
-  --advisor-replay-trace backport_plan_26.c.advisor-trace.jsonl \
+  --advisor-replay-trace backport_plan_26.advisor-trace.jsonl \
   --advisor-model kernel-planner:32k \
   --advisor-base-url http://gondor:11434 \
   --advisor-commit b095c27fc874 \
@@ -958,7 +1094,7 @@ kernel-backport-planner \
   --file-list ~/projects/rhel-$JIRA_ID/file_list.txt \
   --advisor-model gemma4-kernel:128k \
   --advisor-base-url http://gondor:11434 \
-  --output ~/projects/rhel-$JIRA_ID/backport_plan.c
+  --worksheet-output ~/projects/rhel-$JIRA_ID/backport_worksheet.txt
 ```
 
 The default Ollama endpoint is `http://127.0.0.1:11434`. Set `OLLAMA_HOST` or
@@ -1144,14 +1280,14 @@ substantive `REVIEW` recommendations separately from advisor failures so a model
 outage cannot masquerade as engineering uncertainty.
 
 Version 0.4.4 also writes one bounded JSONL diagnostic record for each failed
-advisor attempt. With `--output plan.c`, the default path is
-`plan.c.advisor-errors.jsonl`; override it with `--advisor-error-log`. For malformed
+advisor attempt. With `--worksheet-output plan.txt`, the default path is
+`plan.txt.advisor-errors.jsonl`; override it with `--advisor-error-log`. For malformed
 outer/structured responses, up to roughly 4 KiB of the raw model response is kept.
 For validator failures, the parsed model object is recorded instead. This file is
 diagnostic only and does not affect planner decisions.
 
-Advisor results are cached persistently. With `--output plan.c`, the default
-cache is `plan.c.advisor-cache.json`. The cache key includes the model, prompt
+Advisor results are cached persistently. With `--worksheet-output plan.txt`, the default
+cache is `plan.txt.advisor-cache.json`. The cache key includes the model, prompt
 version, baseline/target/downstream SHAs, and the full bounded evidence packet,
 so changed evidence forces a fresh recommendation. Advisor failures are not
 cached. Use `--no-advisor-cache` to disable caching.
@@ -1185,16 +1321,16 @@ time kernel-backport-planner \
     --base v6.19 \
     --target v7.0 \
     --file-list ~/projects/rhel-223619/file_list.txt \
-    --output ~/projects/rhel-223619/backport_plan.c \
-    --json-output ~/projects/rhel-223619/backport_plan.json
+    --worksheet-output ~/projects/rhel-223619/backport_worksheet_29.txt \
+    --json-output ~/projects/rhel-223619/backport_plan_29.json
 ```
 
 `--update` updates the named upstream and downstream remotes before analysis.
 Updates are opt-in. `--skip-update` is retained as a compatibility no-op.
 
-The `.c` extension is not required by the tool. It is convenient when the report
-is being maintained as an engineering work list and annotated with comments such
-as `// Done` or `// Skip`.
+Use the `.txt` worksheet for reading and annotating technical decisions. The
+planner leaves this worksheet unchanged after generation; future execution
+status updates are the backporter's responsibility.
 
 ## Local backports
 
@@ -1213,9 +1349,9 @@ With this option, replay starts from `HEAD` instead of the downstream ref.
 For workflows that deliberately generate a plan from a clean `cs10/main`
 baseline and then reapply a saved patch set afterward, omit `--include-local`.
 
-## Reading the text report
+## Reading the Backport Worksheet
 
-The human-readable report uses 12-character commit IDs. JSON retains full commit
+The Backport Worksheet uses 12-character commit IDs. JSON retains full commit
 IDs.
 
 Direct focus commits are intentionally unlabelled. Strongly supported
@@ -1262,7 +1398,7 @@ blindly cherry-pick the commit.
 
 Context-only provenance is deliberately weaker regardless of its numeric score.
 Such commits are tracked as `dependency-candidate` records but are not part of
-the proposed backport plan. To inspect them in the text report, opt in with:
+the proposed backport plan. To inspect them in the worksheet, opt in with:
 
 ```text
 --show-dependency-candidates
@@ -1278,28 +1414,27 @@ not yet been deprecated.
 
 ## Machine-readable output
 
-For a machine-readable JSON report alongside the default human-readable text
-report, use:
+For a machine-readable JSON plan alongside the editable worksheet, use:
 
 ```bash
 kernel-backport-planner ... \
-    --output plan.c \
+    --worksheet-output plan.txt \
     --json-output plan.json
 ```
 
 Both reports are generated from the same in-memory analysis, with the same
 ordered commits, advisor recommendations, and check results. This does not
-repeat advisor inference. The `--json-output` path must differ from `--output`.
-When `--output` is omitted, the primary report still goes to stdout. The
+repeat advisor inference. The `--json-output` path must differ from `--worksheet-output`.
+When `--worksheet-output` is omitted, the primary report still goes to stdout. The
 advisor cache and diagnostic log keep their existing default paths based on
-`--output`; `--json-output` does not change them.
+`--worksheet-output`; `--json-output` does not change them.
 
 For JSON as the primary (or only) report, the existing form still works:
 
 ```bash
 kernel-backport-planner ... \
     --format json \
-    --output plan.json
+    --worksheet-output plan.json
 ```
 
 The JSON report keeps full 40-character SHAs and includes commit metadata,
@@ -1321,62 +1456,58 @@ common-code relationships from architecture-local lexical matches.
 Context-only candidates remain in JSON with `selected: false`. The legacy
 `reasons` field is retained as a compatibility alias for `evidence`.
 
-## Automatic results packaging (0.4.15)
+## Legacy explicit-path results packaging
 
-With matching `--output PREFIX.c` and `--json-output PREFIX.json`, packaging
-happens automatically in the **same planner invocation**. Do not pipe this
-command into `tee PREFIX.log`; the planner writes that log itself while also
-streaming messages to the terminal. For example:
+With explicit `--worksheet-output backport_worksheet_N.txt` and
+`--json-output backport_plan_N.json` in the **same directory**, the planner
+creates `backport_plan_N.log` while streaming progress to the terminal, then
+packages the completed results automatically. Do not add shell-side `tee`.
 
 ```bash
 ~/projects/kernel-backport-planner/kernel-backport-planner \
     --update --upstream linux-stable --downstream cs10 \
     --base v6.19 --target v7.0 \
     --file-list ~/projects/rhel-223619/file_list.txt \
-    --advisor-model gemma4-kernel:128k \
+    --advisor-model gemma4-kernel:64k \
     --advisor-base-url http://gondor:11434 \
-    --output ~/projects/rhel-223619/backport_plan_19.c \
-    --json-output ~/projects/rhel-223619/backport_plan_19.json
+    --worksheet-output ~/projects/rhel-223619/backport_worksheet_29.txt \
+    --json-output ~/projects/rhel-223619/backport_plan_29.json
 ```
 
-After the planner finishes writing both reports, it closes the `.log` and
-creates the results directory and ZIP:
+Completed files are:
 
 ```text
-~/projects/rhel-223619/backport_plan_19.c
-~/projects/rhel-223619/backport_plan_19.json
-~/projects/rhel-223619/backport_plan_19.log
-~/projects/rhel-223619/backport_plan_19/
-~/projects/rhel-223619/backport_plan_19.zip
+backport_worksheet_29.txt       # editable engineering worksheet
+backport_plan_29.json           # frozen machine-readable plan
+backport_plan_29.log            # planner's own complete log
+backport_plan_29.perf.jsonl     # live instrumentation events
+backport_plan_29.perf.json      # final instrumentation summary
+backport_plan_29/              # packaged copies of completed artifacts
+backport_plan_29.zip           # ZIP containing the packaged directory
 ```
 
-The folder contains copies of the `.c`, `.json`, `.log`, performance
-journal/summary, and optional advisor cache/diagnostics referenced by the report JSON, keeping the original files
-in place. The ZIP contains the folder, not just loose files. Since the log is
-owned and closed by the planner before archiving, the included log is complete
-for the planner process. Elapsed time from an outer shell `time` command is
-printed only *after* the planner exits and is not part of the ZIP log; the
-planner also records its own elapsed time inside its log.
+Optional advisor cache, error, and exact-request trace files referenced by the
+plan JSON are included when available. The worksheet and original JSON remain
+in place after packaging, and the results directory contains snapshots. No
+package, source output, log, or live metric file is overwritten.
 
-The packaging destinations and primary output files must not already exist; checks run before
-expensive Git or advisor work starts. A mismatch such as `backport_plan_17.c`
-with `backport_plan_18.json` is rejected when auto-packaging is enabled.
-A diagnostic plan with replay conflicts (exit status 2) or failed check
-command (exit status 3) still gets packaged once both reports are written;
-the original nonzero exit status is preserved.
+The planner validates that the worksheet and JSON belong to the same run.
+For example, pairing `backport_worksheet_28.txt` with
+`backport_plan_29.json` is rejected before Git collection. For shorter test
+names, `plan.txt` and `plan.json` may also be paired. Use
+`--no-auto-package` for independently named files without archiving.
 
-To disable automatic packaging for independently named reports or custom
-logging, supply `--no-auto-package`. To package an older finished run with
-an existing `.c`, `.json`, and `.log`, the standalone command remains:
+To package completed, unpackaged results later, use:
 
 ```bash
-~/projects/kernel-backport-planner/kernel-backport-planner \
-    --package-results ~/projects/rhel-223619/backport_plan_18
+kernel-backport-planner --package-results /path/to/backport_plan_29
 ```
 
-This legacy command performs no analysis. It will refuse to overwrite a
-previous package. Missing optional advisor diagnostic files are skipped,
-while all three primary files are required.
+This legacy post-run command requires the worksheet, JSON, and closed log.
+Workspace-directory mode can instead be packaged by passing its existing
+numbered directory as shown above. Neither mode reruns analysis or overwrites
+an existing ZIP.
+Nonzero replay or external-check results are packaged, preserving exit status.
 
 ## Performance instrumentation (0.4.16)
 
@@ -1384,8 +1515,7 @@ Version 0.4.16 adds low-overhead, always-on timing and request-volume metrics.
 It does **not** change advisor prompts, answers, dependency decisions, cache
 keys, or the underlying backport algorithm. No model switch is made.
 
-For the normal dual-output command with `--output backport_plan_20.c`, the
-planner automatically creates:
+For a paired worksheet and JSON run, the planner automatically creates:
 
 ```text
 backport_plan_20.perf.jsonl  # append-only events, written during the run
@@ -1425,9 +1555,9 @@ grep '"event": "advisor_request"' backport_plan_20.perf.jsonl | tail -n 5
 ```
 
 A partially completed run may also have useful cached advisor responses in
-`backport_plan_19.c.advisor-cache.json`. If its prompt version, model, and
+`backport_plan_19.advisor-cache.json`. If its prompt version, model, and
 evidence packets are unchanged, copy that cache into the new run's default
-cache filename (for example, `backport_plan_20.c.advisor-cache.json`) before
+cache filename (for example, `backport_plan_20.advisor-cache.json`) before
 starting; the planner validates each individual fingerprint before reuse.
 Do not copy or rename incomplete `.perf.jsonl` files into a new run.
 

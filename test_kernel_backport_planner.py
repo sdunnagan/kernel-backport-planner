@@ -1974,6 +1974,7 @@ class AdvisorTests(unittest.TestCase):
         planner.ordered_missing = lambda: [consumer.sha]
 
         report = planner.report_text()
+        self.assertIn("BACKPORT WORKSHEET (oldest first)", report)
         self.assertIn("advisor-rejected-prerequisite:", report)
         self.assertIn("NOT_REQUIRED", report)
         self.assertIn("Unsupported architecture-local relationship", report)
@@ -2059,11 +2060,11 @@ class DualReportOutputTests(unittest.TestCase):
 
     def test_dual_output_runs_analysis_once_and_shares_check_result(self):
         with tempfile.TemporaryDirectory() as temp:
-            text_path = Path(temp) / "plan.c"
+            text_path = Path(temp) / "plan.txt"
             json_path = Path(temp) / "plan.json"
             planner = self.fake_planner()
             rc, stdout = self.run_mocked(
-                ["--output", str(text_path), "--json-output", str(json_path)], planner
+                ["--worksheet-output", str(text_path), "--json-output", str(json_path)], planner
             )
             self.assertEqual(rc, 0)
             self.assertIn("Results archive:", stdout)
@@ -2093,7 +2094,7 @@ class DualReportOutputTests(unittest.TestCase):
             json_path = Path(temp) / "plan.json"
             planner = self.fake_planner()
             rc, stdout = self.run_mocked(
-                ["--format", "json", "--output", str(json_path)], planner
+                ["--format", "json", "--worksheet-output", str(json_path)], planner
             )
             self.assertEqual(rc, 0)
             self.assertEqual(stdout, "")
@@ -2107,7 +2108,7 @@ class DualReportOutputTests(unittest.TestCase):
             secondary = Path(temp) / "secondary.json"
             planner = self.fake_planner()
             rc, _ = self.run_mocked(
-                ["--format", "json", "--output", str(primary), "--json-output", str(secondary)],
+                ["--format", "json", "--worksheet-output", str(primary), "--json-output", str(secondary)],
                 planner,
             )
             self.assertEqual(rc, 0)
@@ -2117,27 +2118,27 @@ class DualReportOutputTests(unittest.TestCase):
 
     def test_same_output_path_is_rejected_before_analysis(self):
         with tempfile.TemporaryDirectory() as temp:
-            output_path = Path(temp) / "plan.c"
+            output_path = Path(temp) / "plan.txt"
             planner = self.fake_planner()
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 with mock.patch.object(kbp.sys, "stderr", new_callable=io.StringIO):
                     with self.assertRaises(SystemExit) as raised:
                         kbp.main(["--base", "v6.19", "--target", "v7.0",
-                                  "--output", str(output_path),
-                                  "--json-output", str(Path(temp) / "." / "plan.c")])
+                                  "--worksheet-output", str(output_path),
+                                  "--json-output", str(Path(temp) / "." / "plan.txt")])
             self.assertEqual(raised.exception.code, 2)
             planner.collect.assert_not_called()
             self.assertFalse(output_path.exists())
 
     def test_conflicts_still_return_two_after_writing_both_reports(self):
         with tempfile.TemporaryDirectory() as temp:
-            text_path = Path(temp) / "plan.c"
+            text_path = Path(temp) / "plan.txt"
             json_path = Path(temp) / "plan.json"
             planner = self.fake_planner()
             node = kbp.CommitNode("a" * 40, "conflicting backport", replay="conflict")
             planner.nodes = {node.sha: node}
             rc, _ = self.run_mocked(
-                ["--output", str(text_path), "--json-output", str(json_path)], planner
+                ["--worksheet-output", str(text_path), "--json-output", str(json_path)], planner
             )
             self.assertEqual(rc, 2)
             self.assertTrue(text_path.exists())
@@ -2165,19 +2166,19 @@ class AutoPackagingTests(unittest.TestCase):
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 self.assertEqual(kbp.main([
                     "--base", "v6.19", "--target", "v7.0",
-                    "--output", str(prefix) + ".c",
+                    "--worksheet-output", str(kbp.worksheet_path_for_plan(prefix)),
                     "--json-output", str(prefix) + ".json",
                 ]), 0)
             folder = prefix
             archive = prefix.with_suffix(".zip")
             self.assertTrue(archive.is_file())
             self.assertEqual(sorted(f.name for f in folder.iterdir()), sorted([
-                "backport_plan_19.c", "backport_plan_19.json", "backport_plan_19.log",
+                "backport_worksheet_19.txt", "backport_plan_19.json", "backport_plan_19.log",
                 "backport_plan_19.perf.json", "backport_plan_19.perf.jsonl",
             ]))
             with zipfile.ZipFile(archive) as zf:
                 self.assertEqual(sorted(zf.namelist()), sorted([
-                    "backport_plan_19/backport_plan_19.c",
+                    "backport_plan_19/backport_worksheet_19.txt",
                     "backport_plan_19/backport_plan_19.json",
                     "backport_plan_19/backport_plan_19.log",
                     "backport_plan_19/backport_plan_19.perf.json",
@@ -2199,7 +2200,7 @@ class AutoPackagingTests(unittest.TestCase):
                 with mock.patch.object(kbp, "Planner", return_value=planner):
                     rc = kbp.main([
                         "--base", "v6.19", "--target", "v7.0",
-                        "--output", str(prefix) + ".c",
+                        "--worksheet-output", str(kbp.worksheet_path_for_plan(prefix)),
                         "--json-output", str(prefix) + ".json",
                     ])
                 self.assertEqual(rc, expected)
@@ -2213,7 +2214,7 @@ class AutoPackagingTests(unittest.TestCase):
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 rc = kbp.main([
                     "--base", "v6.19", "--target", "v7.0",
-                    "--output", str(prefix) + ".c",
+                    "--worksheet-output", str(kbp.worksheet_path_for_plan(prefix)),
                     "--json-output", str(prefix) + ".json",
                 ])
             self.assertEqual(rc, 1)
@@ -2224,16 +2225,16 @@ class AutoPackagingTests(unittest.TestCase):
     def test_preflight_protects_existing_source_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = Path(tmp) / "plan"
-            prefix.with_suffix(".c").write_text("original report\n")
+            kbp.worksheet_path_for_plan(prefix).write_text("original report\n")
             planner = self.planner()
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 rc = kbp.main([
                     "--base", "v6.19", "--target", "v7.0",
-                    "--output", str(prefix) + ".c",
+                    "--worksheet-output", str(kbp.worksheet_path_for_plan(prefix)),
                     "--json-output", str(prefix) + ".json",
                 ])
             self.assertEqual(rc, 1)
-            self.assertEqual(prefix.with_suffix(".c").read_text(),
+            self.assertEqual(kbp.worksheet_path_for_plan(prefix).read_text(),
                              "original report\n")
             planner.collect.assert_not_called()
             self.assertFalse(prefix.with_suffix(".log").exists())
@@ -2242,20 +2243,20 @@ class AutoPackagingTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             kbp.parse_args([
                 "--base", "v6.19", "--target", "v7.0",
-                "--output", "plan_18.c", "--json-output", "plan_19.json",
+                "--worksheet-output", "plan_18.txt", "--json-output", "plan_19.json",
             ])
         self.assertEqual(raised.exception.code, 2)
 
     def test_disable_auto_packaging_restores_independent_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
-            text = path / "plan_18.c"
+            text = path / "plan_18.txt"
             js = path / "plan_19.json"
             planner = self.planner()
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 rc = kbp.main([
                     "--base", "v6.19", "--target", "v7.0",
-                    "--output", str(text), "--json-output", str(js),
+                    "--worksheet-output", str(text), "--json-output", str(js),
                     "--no-auto-package",
                 ])
             self.assertEqual(rc, 0)
@@ -2591,11 +2592,11 @@ class DependencyClosure0415Tests(unittest.TestCase):
 class Packaging0415Tests(unittest.TestCase):
     def fixtures(self, root):
         prefix = Path(root) / "backport_plan_19"
-        prefix.with_suffix(".c").write_text("text plan\n")
+        kbp.worksheet_path_for_plan(prefix).write_text("text plan\n")
         prefix.with_suffix(".log").write_text("complete tee log\n")
-        cache = Path(root) / "backport_plan_19.c.advisor-cache.json"
+        cache = Path(root) / "backport_plan_19.advisor-cache.json"
         cache.write_text('{"test": true}\n')
-        diag = Path(root) / "backport_plan_19.c.advisor-errors.jsonl"
+        diag = Path(root) / "backport_plan_19.advisor-errors.jsonl"
         diag.write_text('{"kind": "timeout"}\n')
         prefix.with_suffix(".json").write_text(json.dumps({"advisor": {
             "cache_path": str(cache), "error_log_path": str(diag)}}) + "\n")
@@ -2604,7 +2605,7 @@ class Packaging0415Tests(unittest.TestCase):
     def test_package_finished_results_and_reject_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = self.fixtures(tmp)
-            rc = kbp.main(["--package-results", str(prefix) + ".c"])
+            rc = kbp.main(["--package-results", str(kbp.worksheet_path_for_plan(prefix))])
             self.assertEqual(rc, 0)
             folder = prefix
             archive = prefix.with_suffix(".zip")
@@ -2616,7 +2617,7 @@ class Packaging0415Tests(unittest.TestCase):
                 self.assertEqual(zf.read(f"{prefix.name}/{prefix.name}.log"),
                                  b"complete tee log\n")
             self.assertEqual(kbp.main(["--package-results", str(prefix)]), 1)
-            self.assertEqual((folder / (prefix.name + ".c")).read_text(), "text plan\n")
+            self.assertEqual((folder / (kbp.worksheet_path_for_plan(prefix).name)).read_text(), "text plan\n")
 
     def test_missing_log_prevents_incomplete_package(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2738,7 +2739,7 @@ class Performance0416Tests(unittest.TestCase):
             with mock.patch.object(kbp, "Planner", return_value=planner):
                 self.assertEqual(kbp.main([
                     "--base", "v6.19", "--target", "v7.0",
-                    "--output", str(prefix) + ".c",
+                    "--worksheet-output", str(kbp.worksheet_path_for_plan(prefix)),
                     "--json-output", str(prefix) + ".json",
                 ]), 0)
             summary = json.loads(prefix.with_suffix(".perf.json").read_text())
@@ -3725,9 +3726,9 @@ class ExactTracePackaging0422Tests(unittest.TestCase):
     def test_trace_is_included_in_auto_package(self):
         with tempfile.TemporaryDirectory() as td:
             prefix = Path(td) / "backport_plan_26"
-            trace = Path(td) / "backport_plan_26.c.advisor-trace.jsonl"
+            trace = Path(td) / "backport_plan_26.advisor-trace.jsonl"
             trace.write_text('{"sha":"example"}\n')
-            prefix.with_suffix(".c").write_text("plan\n")
+            kbp.worksheet_path_for_plan(prefix).write_text("plan\n")
             prefix.with_suffix(".log").write_text("log\n")
             prefix.with_suffix(".json").write_text(json.dumps({
                 "advisor": {"trace_path": str(trace)}
@@ -4146,3 +4147,425 @@ class FallbackRecovery0424Tests(unittest.TestCase):
         self.assertEqual(result["decision"], "TAKE")
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("ev-abc123", client.prompts[1])
+
+
+class WorksheetNaming0425Tests(unittest.TestCase):
+    """The worksheet is a text file paired with an immutable JSON plan."""
+
+    def test_standard_run_uses_distinct_worksheet_and_plan_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = root / "backport_plan_29"
+            worksheet = root / "backport_worksheet_29.txt"
+            args = kbp.parse_args([
+                "--base", "v6.19", "--target", "v7.0",
+                "--worksheet-output", str(worksheet),
+                "--json-output", str(plan.with_suffix(".json")),
+            ])
+            self.assertEqual(kbp.auto_package_prefix(args), plan)
+            self.assertEqual(kbp.worksheet_path_for_plan(plan), worksheet)
+            self.assertEqual(kbp.plan_prefix_from_argument(str(worksheet)), plan)
+
+    def test_other_run_number_is_rejected_before_git_collection(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as caught:
+                kbp.parse_args([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--worksheet-output", "backport_worksheet_28.txt",
+                    "--json-output", "backport_plan_29.json",
+                ])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_worksheet_must_be_plain_text_extension(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as caught:
+                kbp.parse_args([
+                    "--base", "v6.19", "--target", "v7.0",
+                    "--worksheet-output", "backport_worksheet_29.md",
+                    "--json-output", "backport_plan_29.json",
+                ])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_package_from_worksheet_uses_plan_archive_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = root / "backport_plan_29"
+            worksheet = root / "backport_worksheet_29.txt"
+            worksheet.write_text("editable worksheet\n")
+            plan.with_suffix(".json").write_text('{"advisor": null}\n')
+            plan.with_suffix(".log").write_text("completed run\n")
+            directory, archive = kbp.package_results(str(worksheet))
+            self.assertEqual(directory, plan)
+            self.assertEqual(archive, plan.with_suffix(".zip"))
+            with zipfile.ZipFile(archive) as zf:
+                self.assertIn("backport_plan_29/backport_worksheet_29.txt",
+                              zf.namelist())
+                self.assertIn("backport_plan_29/backport_plan_29.json",
+                              zf.namelist())
+                self.assertEqual(zf.read(
+                    "backport_plan_29/backport_worksheet_29.txt"),
+                    b"editable worksheet\n")
+            worksheet.write_text("engineer annotation\n")
+            self.assertEqual(zf_bytes_from_archive(archive),
+                             b"editable worksheet\n")
+            self.assertEqual(worksheet.read_text(), "engineer annotation\n")
+
+
+def zf_bytes_from_archive(path):
+    with zipfile.ZipFile(path) as archive:
+        return archive.read("backport_plan_29/backport_worksheet_29.txt")
+
+
+class WorkspaceResults0426Tests(unittest.TestCase):
+    """Workspace-owned, numbered, self-contained planning runs (0.4.26)."""
+
+    @staticmethod
+    def fake_planner():
+        planner = mock.Mock()
+        planner.nodes = {}
+        planner.run_check_command.return_value = None
+        planner.report_text.return_value = "// Take abcdef123456\nAdvisor: preserve evidence\n"
+        planner.report_json.return_value = json.dumps({
+            "advisor": None, "order": [], "commits": {},
+            "baseline": "a" * 40,
+        }) + "\n"
+        return planner
+
+    def run_auto(self, workspace, extra=()):
+        with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(workspace)}):
+            with mock.patch.object(kbp, "Planner", return_value=self.fake_planner()):
+                with mock.patch.object(kbp.sys, "stdout", new_callable=io.StringIO):
+                    return kbp.main(["--base", "v6.19", "--target", "v7.0", *extra])
+
+    def test_legacy_flat_runs_count_toward_new_run_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "backport_plan_27.json").touch()
+            (root / "backport_plan_28.zip").touch()
+            self.assertEqual(self.run_auto(root), 0)
+            folder = root / "backport-plans" / "backport_plan_29"
+            archive = root / "backport-plans" / "backport_plan_29.zip"
+            self.assertTrue(folder.is_dir())
+            self.assertTrue(archive.is_file())
+            expected = {
+                "backport_plan.json", "backport_worksheet.txt", "backport_plan.log",
+                "performance.json", "performance.jsonl",
+            }
+            self.assertEqual({p.name for p in folder.iterdir()}, expected)
+            self.assertIn("Advisor: preserve evidence",
+                          (folder / "backport_worksheet.txt").read_text())
+            with zipfile.ZipFile(archive) as zf:
+                self.assertEqual(set(zf.namelist()), {
+                    f"backport_plan_29/{name}" for name in expected
+                })
+                self.assertIn("Planner elapsed:", zf.read(
+                    "backport_plan_29/backport_plan.log").decode())
+
+    def test_next_run_does_not_overwrite_previous_engineer_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_auto(root), 0)
+            first = root / "backport-plans" / "backport_plan_01"
+            worksheet = first / "backport_worksheet.txt"
+            worksheet.write_text("manually resolved conflict in drivers/foo.c\n")
+            self.assertEqual(self.run_auto(root), 0)
+            self.assertTrue((root / "backport-plans" / "backport_plan_02").is_dir())
+            self.assertEqual(worksheet.read_text(),
+                             "manually resolved conflict in drivers/foo.c\n")
+            with zipfile.ZipFile(first.with_suffix(".zip")) as zf:
+                self.assertNotIn("manually resolved conflict", zf.read(
+                    "backport_plan_01/backport_worksheet.txt").decode())
+
+    def test_existing_incomplete_directory_is_never_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            partial = root / "backport-plans" / "backport_plan_03"
+            partial.mkdir(parents=True)
+            (partial / "backport_worksheet.txt").write_text("interrupted\n")
+            self.assertEqual(self.run_auto(root), 0)
+            self.assertTrue((root / "backport-plans" / "backport_plan_04").exists())
+            self.assertEqual((partial / "backport_worksheet.txt").read_text(),
+                             "interrupted\n")
+
+    def test_explicit_paths_remain_legacy_mode_even_with_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text = root / "test.txt"
+            plan = root / "test.json"
+            self.assertEqual(self.run_auto(root, [
+                "--worksheet-output", str(text), "--json-output", str(plan)
+            ]), 0)
+            self.assertTrue(text.is_file())
+            self.assertTrue(plan.is_file())
+            self.assertTrue((root / "test.zip").is_file())
+            self.assertFalse((root / "backport-plans").exists())
+
+    def test_advisor_trace_short_flag_uses_workspace_generic_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                                   "--advisor-trace"])
+            self.assertEqual(args.advisor_trace, "auto")
+            path = kbp.reserve_workspace_run(args, root)
+            self.assertEqual(Path(args.advisor_trace), path / "advisor-trace.jsonl")
+            self.assertEqual(Path(args.advisor_cache), path / "advisor-cache.json")
+            self.assertEqual(Path(args.advisor_error_log), path / "advisor-errors.jsonl")
+            self.assertEqual(Path(args.performance_event_path), path / "performance.jsonl")
+            self.assertEqual(Path(args.performance_summary_path), path / "performance.json")
+            self.assertIsNone(kbp.auto_package_prefix(args))
+
+    def test_explicit_trace_path_rejected_in_automatic_mode_before_allocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                with mock.patch.object(kbp, "Planner") as planner:
+                    self.assertEqual(kbp.main([
+                        "--base", "v6.19", "--target", "v7.0",
+                        "--advisor-trace", str(root / "outside.jsonl"),
+                    ]), 1)
+                planner.assert_not_called()
+            self.assertFalse((root / "backport-plans").exists())
+
+    def test_status_and_benchmark_modes_do_not_allocate_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = kbp.parse_args(["--package-results", "not-present"])
+            self.assertEqual(args.package_results, "not-present")
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                self.assertEqual(kbp.main(["--package-results", "not-present"]), 1)
+            self.assertFalse((root / "backport-plans").exists())
+
+    def test_post_run_repackage_workspace_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_auto(root), 0)
+            folder = root / "backport-plans" / "backport_plan_01"
+            archive = folder.with_suffix(".zip")
+            archive.unlink()
+            self.assertEqual(kbp.main(["--package-results", str(folder)]), 0)
+            self.assertTrue(archive.exists())
+            self.assertEqual(kbp.main(["--package-results", str(folder)]), 1)
+
+    def test_missing_workspace_env_falls_back_to_standard_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": ""}):
+                with mock.patch.object(kbp, "Planner", return_value=self.fake_planner()):
+                    with mock.patch.object(kbp.sys, "stdout", new_callable=io.StringIO) as out:
+                        rc = kbp.main(["--base", "v6.19", "--target", "v7.0"])
+                self.assertEqual(rc, 0)
+                self.assertIn("// Take abcdef123456", out.getvalue())
+            self.assertFalse((Path(tmp) / "backport-plans").exists())
+
+    def test_invalid_workspace_fails_without_running_git_collection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid = Path(tmp) / "missing"
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(invalid)}):
+                with mock.patch.object(kbp, "Planner") as planner:
+                    self.assertEqual(kbp.main(["--base", "v6.19", "--target", "v7.0"]), 1)
+                planner.assert_not_called()
+            self.assertFalse(invalid.exists())
+
+    def test_numbered_dir_packaging_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "backport_plan_01"
+            result.mkdir()
+            for name in (kbp.WORKSPACE_PLAN, kbp.WORKSPACE_WORKSHEET,
+                         kbp.WORKSPACE_LOG, kbp.WORKSPACE_PERFORMANCE,
+                         kbp.WORKSPACE_PERFORMANCE_EVENTS):
+                (result / name).write_text("data\n")
+            (result / kbp.WORKSPACE_PLAN).write_text("{}\n")
+            (result / "outside").symlink_to("/etc/passwd")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                kbp.package_workspace_run(result)
+            self.assertFalse(result.with_suffix(".zip").exists())
+
+    def test_no_auto_package_opt_out_leaves_workspace_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                with mock.patch.object(kbp, "Planner", return_value=self.fake_planner()):
+                    with mock.patch.object(kbp.sys, "stdout", new_callable=io.StringIO) as out:
+                        rc = kbp.main(["--base", "v6.19", "--target", "v7.0",
+                                       "--no-auto-package"])
+            self.assertEqual(rc, 0)
+            self.assertIn("// Take abcdef123456", out.getvalue())
+            self.assertFalse((root / "backport-plans").exists())
+
+    def test_invalid_plan_json_is_not_archived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "backport_plan_01"
+            folder.mkdir()
+            for name in (kbp.WORKSPACE_PLAN, kbp.WORKSPACE_WORKSHEET,
+                         kbp.WORKSPACE_LOG, kbp.WORKSPACE_PERFORMANCE,
+                         kbp.WORKSPACE_PERFORMANCE_EVENTS):
+                (folder / name).write_text("not a valid plan\n")
+            with self.assertRaisesRegex(ValueError, "cannot read plan JSON"):
+                kbp.package_workspace_run(folder)
+            self.assertFalse(folder.with_suffix(".zip").exists())
+
+    def test_workspace_capture_and_cache_are_archived_under_generic_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            planner = self.fake_planner()
+
+            def construct(args):
+                self.assertEqual(Path(args.advisor_trace).name,
+                                 "advisor-trace.jsonl")
+                Path(args.advisor_trace).write_text('{"event":"request"}\n')
+                Path(args.advisor_cache).write_text('{}\n')
+                Path(args.advisor_error_log).write_text('')
+                return planner
+
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                with mock.patch.object(kbp, "Planner", side_effect=construct):
+                    self.assertEqual(kbp.main([
+                        "--base", "v6.19", "--target", "v7.0",
+                        "--advisor-trace",
+                    ]), 0)
+            zippath = root / "backport-plans" / "backport_plan_01.zip"
+            with zipfile.ZipFile(zippath) as zf:
+                names = set(zf.namelist())
+                for name in ("advisor-trace.jsonl", "advisor-cache.json",
+                             "advisor-errors.jsonl"):
+                    self.assertIn("backport_plan_01/" + name, names)
+
+    def test_interrupted_run_keeps_partial_artifacts_and_new_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                with mock.patch.object(kbp, "Planner", side_effect=RuntimeError("interrupted")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                        kbp.main(["--base", "v6.19", "--target", "v7.0"])
+                failed = root / "backport-plans" / "backport_plan_01"
+                self.assertTrue((failed / "backport_plan.log").is_file())
+                self.assertTrue((failed / "performance.jsonl").is_file())
+                self.assertFalse(failed.with_suffix(".zip").exists())
+                with mock.patch.object(kbp, "Planner", return_value=self.fake_planner()):
+                    self.assertEqual(kbp.main(["--base", "v6.19",
+                                               "--target", "v7.0"]), 0)
+                self.assertTrue((root / "backport-plans" /
+                                 "backport_plan_02.zip").exists())
+
+
+class WorkspaceCleanup0427Tests(unittest.TestCase):
+    """Only old, archived, byte-identical copies may be removed."""
+
+    @staticmethod
+    def old_run(root, number, name, data):
+        stem = f"backport_plan_{number:02d}"
+        folder = root / stem
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_bytes(data)
+        (root / name).write_bytes(data)
+        with zipfile.ZipFile(root / f"{stem}.zip", "w") as zf:
+            zf.writestr(f"{stem}/{name}", data)
+        return root / name
+
+    def test_preview_keeps_files_and_apply_removes_only_verified_copies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            copied = self.old_run(root, 28, "backport_plan_28.json", b"plan\n")
+            edited = self.old_run(root, 27, "backport_plan_27.c", b"original\n")
+            edited.write_text("engineer's worksheet notes\n")
+            unrelated = root / "qwen-policy-test-01.jsonl"
+            unrelated.write_text('benchmark data\n')
+            # Original ZIP archive and results directory remain untouched.
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": str(root)}):
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(kbp.main(["--cleanup-workspace-duplicates"]), 0)
+                self.assertIn("Would remove:", output.getvalue())
+                self.assertTrue(copied.is_file())
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(kbp.main([
+                        "--cleanup-workspace-duplicates", "--apply-cleanup"
+                    ]), 0)
+                self.assertIn("Removed verified duplicate", output.getvalue())
+            self.assertFalse(copied.exists())
+            self.assertTrue(edited.is_file())
+            self.assertTrue(unrelated.is_file())
+            self.assertTrue((root / "backport_plan_28.zip").is_file())
+            self.assertEqual((root / "backport_plan_28" /
+                              "backport_plan_28.json").read_bytes(), b"plan\n")
+
+    def test_missing_archive_or_mismatch_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            no_zip = root / "backport_plan_25.log"
+            folder = root / "backport_plan_25"
+            folder.mkdir()
+            (folder / no_zip.name).write_text("matching\n")
+            no_zip.write_text("matching\n")
+            mismatched = self.old_run(root, 26, "backport_plan_26.perf.jsonl", b"old\n")
+            # The destination changed after the archive was created.
+            (root / "backport_plan_26" / mismatched.name).write_bytes(b"new\n")
+            # Do not traverse symlinks even when the target would match.
+            symlink = root / "backport_plan_26.json"
+            symlink.symlink_to(no_zip)
+            eligible, removed = kbp.cleanup_workspace_duplicates(root, apply=True)
+            self.assertEqual(eligible, [])
+            self.assertEqual(removed, [])
+            self.assertTrue(no_zip.is_file())
+            self.assertTrue(mismatched.is_file())
+            self.assertTrue(symlink.is_symlink())
+
+    def test_apply_cleanup_requires_explicit_preview_mode(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as exc:
+                kbp.parse_args(["--apply-cleanup"])
+        self.assertEqual(exc.exception.code, 2)
+
+
+class PlannerCompletionSound0427Tests(unittest.TestCase):
+    """Builder-compatible sounds must never influence planner exit status."""
+
+    def test_success_and_failure_files_and_player_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "complete.oga").write_bytes(b"sound")
+            (root / "service-logout.oga").write_bytes(b"sound")
+            results = [mock.Mock(returncode=1), mock.Mock(returncode=0)]
+            with mock.patch.dict(kbp.os.environ, {"KBP_SOUND_DIR": str(root)}):
+                with mock.patch.object(kbp.shutil, "which", side_effect=lambda n: "/bin/" + n):
+                    with mock.patch.object(kbp.subprocess, "run", side_effect=results) as player:
+                        kbp.play_planner_completion_sound(True)
+                        self.assertEqual(player.call_count, 2)
+                        self.assertEqual(player.call_args_list[0].args[0][-1],
+                                         str(root / "complete.oga"))
+                        self.assertEqual(player.call_args_list[1].args[0][-1],
+                                         str(root / "complete.oga"))
+                    with mock.patch.object(kbp.subprocess, "run", return_value=mock.Mock(returncode=0)) as player:
+                        kbp.play_planner_completion_sound(False)
+                        self.assertEqual(player.call_args.args[0][-1],
+                                         str(root / "service-logout.oga"))
+
+    def test_missing_audio_is_silent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.dict(kbp.os.environ, {"KBP_SOUND_DIR": temp}):
+                with mock.patch.object(kbp.subprocess, "run") as player:
+                    kbp.play_planner_completion_sound(True)
+                    player.assert_not_called()
+
+    def test_one_sound_for_normal_run_and_nonzero_or_exception(self):
+        argv = ["--base", "v6.19", "--target", "v7.0"]
+        with mock.patch.object(kbp, "_run_normal_planning", return_value=0):
+            with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
+                self.assertEqual(kbp.main(argv), 0)
+                sound.assert_called_once_with(True)
+        with mock.patch.object(kbp, "_run_normal_planning", return_value=2):
+            with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
+                self.assertEqual(kbp.main(argv), 2)
+                sound.assert_called_once_with(False)
+        with mock.patch.object(kbp, "_run_normal_planning", side_effect=RuntimeError("failed")):
+            with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    kbp.main(argv)
+                sound.assert_called_once_with(False)
+
+    def test_maintenance_mode_does_not_play(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.dict(kbp.os.environ, {"KERNEL_WORKSPACE_DIR": temp}):
+                with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
+                    self.assertEqual(kbp.main(["--cleanup-workspace-duplicates"]), 0)
+                    sound.assert_not_called()
