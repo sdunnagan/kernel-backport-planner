@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.26**.
+Current tool version: **0.4.27**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -132,16 +132,9 @@ directory. The planner closes the log, writes the final plan and worksheet,
 then publishes a ZIP snapshot beside the run directory. The original ZIP
 remains unchanged when an engineer later edits the worksheet.
 
-After planning, explicitly select the cycle for the backporter:
-
-```bash
-export KERNEL_BACKPORT_PLANNER_DIR="$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_29"
-```
-
-The upcoming backporter worksheet integration can read the standard
-`backport_plan.json` and `backport_worksheet.txt` from that directory. The
-planner itself does **not** consume that variable. Until the backporter
-supports the new convention, use its existing explicit `--plan` option.
+For the standard workflow, `kernel-backporter` 0.2.7 discovers completed
+planning cycles through `KERNEL_WORKSPACE_DIR`, under `backport-plans/`.
+No separate planner-directory environment variable is required.
 
 ### Ownership and compatibility
 
