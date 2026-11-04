@@ -5,13 +5,20 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.27**.
+Current tool version: **0.4.28**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
 using upstream provenance, `Fixes:` relationships, symbol definitions, replay
 conflicts, and other context before producing an auditable oldest-first backport
 plan.
+
+In version 0.4.28, advisor annotations in the human-editable text worksheet
+(`advisor-rationale`, prerequisite and binding assessments, recommendations,
+consistency warnings, risks, and errors) wrap at 80 columns. Continuation
+lines are indented, and long SHA/path tokens remain unbroken. The structured
+JSON plan and advisor decisions are unchanged. Existing worksheets are not
+rewritten by upgrading the planner.
 
 The planner is path/subsystem-neutral. Focus paths come from `--path` and
 `--file-list`; ARM64 examples in this README reflect the project that originally

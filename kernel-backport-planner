@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -41,7 +42,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.27"
+VERSION = "0.4.28"
 ADVISOR_PROMPT_VERSION = "19"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
@@ -1117,6 +1118,23 @@ class Planner:
     @staticmethod
     def _one_line(text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _worksheet_advisor_lines(cls, label: str, value: str) -> list[str]:
+        """Wrap advisor annotations for a readable, editable 80-column worksheet.
+
+        Keep long technical tokens intact; only whitespace is reflowed. The
+        continuation indent cannot resemble a new commit or annotation label.
+        """
+        prefix = f"      {label}: "
+        text = cls._one_line(value)
+        if not text:
+            return [prefix.rstrip()]
+        return textwrap.wrap(
+            text, width=80, initial_indent=prefix,
+            subsequent_indent="          ",
+            break_long_words=False, break_on_hyphens=False,
+        )
 
     def patch_excerpt(self, sha: str, limit: int) -> str:
         cache = getattr(self, "_advisor_patch_text_cache", None)
@@ -5364,9 +5382,9 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             if n.advisor_decision:
                 lines.append(f"      advisor: {n.advisor_decision}")
                 if n.advisor_rationale:
-                    lines.append(
-                        f"      advisor-rationale: {self._one_line(n.advisor_rationale)}"
-                    )
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-rationale", n.advisor_rationale
+                    ))
                 for item in n.advisor_prerequisites:
                     peer_sha = item["sha"]
                     evidence = ""
@@ -5378,34 +5396,37 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                             ) if x
                         )
                         evidence = f' [evidence {item["evidence_id"]}' + (f" {detail}" if detail else "") + "]"
-                    lines.append(
-                        f'      advisor-prerequisite: {peer_sha[:12]} '
-                        f'("{self.subject(peer_sha)}"){evidence} - {self._one_line(item["reason"])}'
-                    )
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-prerequisite",
+                        f'{peer_sha[:12]} ("{self.subject(peer_sha)}")'
+                        f'{evidence} - {item["reason"]}',
+                    ))
                 for item in n.advisor_binding_assessments:
-                    lines.append(
-                        f'      advisor-binding-assessment: {item["evidence_id"]} '
-                        f'{item["disposition"]} - {self._one_line(item["reason"])}'
-                    )
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-binding-assessment",
+                        f'{item["evidence_id"]} {item["disposition"]} - {item["reason"]}',
+                    ))
                 for item in n.advisor_rejected_prerequisites:
                     peer_sha = item["sha"]
-                    lines.append(
-                        f'      advisor-rejected-prerequisite: {peer_sha[:12]} '
-                        f'("{self.subject(peer_sha)}") evidence={item.get("evidence_id", "?")} '
-                        f'NOT_REQUIRED - {self._one_line(item.get("assessment_reason", ""))}'
-                    )
-                for item in n.advisor_recommended_by:
-                    lines.append(
-                        f'      advisor-recommended-by: {item["consumer_sha"][:12]} '
-                        f'("{item["consumer_subject"]}") [{item.get("consumer_decision", "?")}] '
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-rejected-prerequisite",
+                        f'{peer_sha[:12]} ("{self.subject(peer_sha)}") '
                         f'evidence={item.get("evidence_id", "?")} '
-                        f'{item.get("evidence_kind", "?")}:{item.get("evidence_object", "?")}'
-                    )
+                        f'NOT_REQUIRED - {item.get("assessment_reason", "")}',
+                    ))
+                for item in n.advisor_recommended_by:
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-recommended-by",
+                        f'{item["consumer_sha"][:12]} ("{item["consumer_subject"]}") '
+                        f'[{item.get("consumer_decision", "?")}] '
+                        f'evidence={item.get("evidence_id", "?")} '
+                        f'{item.get("evidence_kind", "?")}:{item.get("evidence_object", "?")}',
+                    ))
                 for item in n.advisor_inbound_assessments:
-                    lines.append(
-                        f'      advisor-inbound-assessment: {item["evidence_id"]} '
-                        f'{item["disposition"]} - {self._one_line(item["reason"])}'
-                    )
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-inbound-assessment",
+                        f'{item["evidence_id"]} {item["disposition"]} - {item["reason"]}',
+                    ))
                 for item in n.advisor_consistency_warnings:
                     if item.get("kind") == "TAKE->MISSING_DT_INCLUDE":
                         text = f'missing DT source include {item["include_path"]}: {item["reason"]}'
@@ -5419,14 +5440,18 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                             f'recommended by TAKE consumer {item["consumer_sha"][:12]} '
                             f'but relationship is {item["kind"]}'
                         )
-                    lines.append(f"      advisor-consistency-warning: {text}")
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-consistency-warning", text
+                    ))
                 for risk in n.advisor_risks:
-                    lines.append(f"      advisor-risk: {self._one_line(risk)}")
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-risk", risk
+                    ))
                 if n.advisor_error:
-                    lines.append(
-                        f"      advisor-error: {n.advisor_error_kind or 'unknown'}: "
-                        f"{self._one_line(n.advisor_error)}"
-                    )
+                    lines.extend(self._worksheet_advisor_lines(
+                        "advisor-error",
+                        f"{n.advisor_error_kind or 'unknown'}: {n.advisor_error}",
+                    ))
 
         if self.args.show_dependency_candidates:
             candidates = sorted(

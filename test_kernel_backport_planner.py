@@ -218,6 +218,89 @@ class AdvisorTests(unittest.TestCase):
         self.assertIn('advisor: TAKE', report)
         self.assertIn('advisor-rationale:', report)
 
+    def test_worksheet_wraps_advisor_commentary_without_changing_content(self):
+        planner = self.minimal_planner()
+        node = kbp.CommitNode("a" * 40, "arm64: updated device tree", direct=True)
+        node.advisor_decision = "TAKE"
+        rationale = (
+            "The commit changes several ARM64 device tree nodes while preserving "
+            "downstream kernel interfaces. " * 3
+        )
+        node.advisor_rationale = "  " + rationale.replace(" while ", "\nwhile ")
+        reason = "The DTS consumer needs this provider to avoid an unresolved reference. " * 3
+        peer = "b" * 40
+        node.advisor_prerequisites = [{
+            "sha": peer, "evidence_id": "ev-123", "evidence_kind": "dts-label",
+            "evidence_object": "uart18", "reason": reason,
+        }]
+        node.advisor_binding_assessments = [{
+            "evidence_id": "ev-234", "disposition": "REQUIRED", "reason": reason,
+        }]
+        node.advisor_rejected_prerequisites = [{
+            "sha": peer, "evidence_id": "ev-345", "assessment_reason": reason,
+        }]
+        node.advisor_recommended_by = [{
+            "consumer_sha": "c" * 40,
+            "consumer_subject": "arm64: dts: qcom: Add another long board description",
+            "consumer_decision": "TAKE", "evidence_id": "ev-456",
+            "evidence_kind": "dts-label", "evidence_object": "uart18",
+        }]
+        node.advisor_inbound_assessments = [{
+            "evidence_id": "ev-567", "disposition": "REQUIRED", "reason": reason,
+        }]
+        node.advisor_consistency_warnings = [{
+            "kind": "TAKE->MISSING_DT_INCLUDE", "include_path": "arch/arm64/board.dtsi",
+            "reason": reason,
+        }]
+        node.advisor_risks = [reason]
+        node.advisor_error = "Advisor returned a detailed diagnostic. " * 4
+        node.advisor_error_kind = "invalid-response"
+        planner.nodes = {node.sha: node}
+        planner.ordered_missing = lambda: [node.sha]
+        planner.subject = lambda _sha: "arm64: dts: qcom: Add long provider board title"
+
+        report = kbp.Planner.report_text(planner)
+        lines = report.splitlines()
+        labels = [
+            "advisor-rationale", "advisor-prerequisite", "advisor-binding-assessment",
+            "advisor-rejected-prerequisite", "advisor-recommended-by",
+            "advisor-inbound-assessment", "advisor-consistency-warning",
+            "advisor-risk", "advisor-error",
+        ]
+        for label in labels:
+            with self.subTest(label=label):
+                prefix = f"      {label}: "
+                indexes = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+                self.assertEqual(len(indexes), 1)
+                index = indexes[0]
+                self.assertLessEqual(len(lines[index]), 80)
+                continuation = []
+                for line in lines[index + 1:]:
+                    if not line.startswith("          "):
+                        break
+                    continuation.append(line)
+                self.assertTrue(continuation, f"{label} did not wrap")
+                self.assertTrue(all(len(line) <= 80 for line in continuation))
+                self.assertTrue(all(not line.strip().startswith("advisor-")
+                                    for line in continuation))
+        index = next(i for i, line in enumerate(lines)
+                     if line.startswith("      advisor-rationale: "))
+        content = [lines[index].split(": ", 1)[1]]
+        for line in lines[index + 1:]:
+            if not line.startswith("          "):
+                break
+            content.append(line.strip())
+        self.assertEqual(" ".join(content), kbp.Planner._one_line(node.advisor_rationale))
+
+    def test_worksheet_advisor_wrapping_preserves_short_and_long_tokens(self):
+        short = kbp.Planner._worksheet_advisor_lines("advisor-rationale", "Short reason.")
+        self.assertEqual(short, ["      advisor-rationale: Short reason."])
+        token = "long/" + "x" * 110
+        long_lines = kbp.Planner._worksheet_advisor_lines("advisor-risk", token)
+        self.assertIn(token, " ".join(long_lines))
+        self.assertEqual(kbp.Planner._worksheet_advisor_lines("advisor-risk", ""),
+                         ["      advisor-risk:"])
+
     def test_advisor_prerequisite_must_be_bound_to_deterministic_evidence(self):
         planner = self.minimal_planner()
         selected = kbp.CommitNode("a" * 40, "selected", direct=True)
@@ -1977,7 +2060,8 @@ class AdvisorTests(unittest.TestCase):
         self.assertIn("BACKPORT WORKSHEET (oldest first)", report)
         self.assertIn("advisor-rejected-prerequisite:", report)
         self.assertIn("NOT_REQUIRED", report)
-        self.assertIn("Unsupported architecture-local relationship", report)
+        # Human-readable advisor annotations may wrap between words.
+        self.assertIn("Unsupported architecture-local relationship", " ".join(report.split()))
 
     def test_advisor_retries_transient_error_then_succeeds(self):
         planner = self.minimal_planner()
