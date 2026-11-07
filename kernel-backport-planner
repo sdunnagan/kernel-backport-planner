@@ -23,6 +23,7 @@ import argparse
 import collections
 import contextlib
 import dataclasses
+import fnmatch
 import hashlib
 import json
 import os
@@ -42,8 +43,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.28"
-ADVISOR_PROMPT_VERSION = "19"
+VERSION = "0.4.30"
+ADVISOR_PROMPT_VERSION = "20"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -964,6 +965,132 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
     return output, meta
 
 
+# Product platform scope is deliberately user owned. The planner has no private
+# product/board certification database, and missing platform evidence is not
+# proof that a shared kernel change is unnecessary.
+@dataclasses.dataclass(frozen=True)
+class PlatformEntry:
+    name: str
+    architecture: str
+    paths: tuple[str, ...] = ()
+    dt_compatible: tuple[str, ...] = ()
+    acpi_hid: tuple[str, ...] = ()
+    pci_id: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "architecture": self.architecture,
+            "paths": list(self.paths),
+            "identifiers": {
+                "dt_compatible": list(self.dt_compatible),
+                "acpi_hid": list(self.acpi_hid),
+                "pci_id": list(self.pci_id),
+            },
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PlatformProfile:
+    name: str
+    sha256: str
+    source: str
+    platforms: tuple[PlatformEntry, ...]
+    unmatched_board: str = "SKIP"
+
+
+def load_platform_profile(path: str | Path) -> PlatformProfile:
+    """Load a strict, user-owned YAML/JSON profile; never fetch product data.
+
+    JSON works with the Python standard library. YAML is optional and uses
+    PyYAML.safe_load, not a custom/insecure YAML interpreter.
+    """
+    source = Path(path).expanduser().resolve()
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read platform profile {source}: {exc}") from exc
+    if source.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ValueError("YAML platform profiles require PyYAML; "
+                             "install python3-pyyaml or use a .json file") from exc
+        try:
+            obj = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"invalid YAML platform profile: {exc}") from exc
+    elif source.suffix.lower() == ".json":
+        try:
+            obj = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid JSON platform profile: {exc}") from exc
+    else:
+        raise ValueError("platform profile filename must end in .yaml, .yml, or .json")
+    if not isinstance(obj, dict):
+        raise ValueError("platform profile must be an object")
+    extra = set(obj) - {"version", "name", "platforms", "unmatched_board"}
+    if extra or type(obj.get("version")) is not int or obj["version"] != 1:
+        raise ValueError("platform profile requires version: 1 and known top-level keys; "
+                         f"unknown: {sorted(extra)}")
+    name = obj.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name) > 128:
+        raise ValueError("platform profile name must be a non-empty string")
+    unmatched = obj.get("unmatched_board", "SKIP")
+    if unmatched not in ("SKIP", "REVIEW"):
+        raise ValueError("unmatched_board must be SKIP or REVIEW")
+    items = obj.get("platforms")
+    if not isinstance(items, list) or not items:
+        raise ValueError("platforms must be a non-empty list")
+    platforms = []
+    names = set()
+    for index, item in enumerate(items, 1):
+        label = f"platforms[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be an object")
+        bad = set(item) - {"name", "architecture", "paths", "identifiers"}
+        if bad:
+            raise ValueError(f"{label} unknown keys: {sorted(bad)}")
+        platform_name, arch = item.get("name"), item.get("architecture")
+        if not isinstance(platform_name, str) or not platform_name.strip() or len(platform_name) > 128:
+            raise ValueError(f"{label}.name must be a non-empty string")
+        if platform_name in names:
+            raise ValueError(f"duplicate platform name: {platform_name}")
+        names.add(platform_name)
+        if not isinstance(arch, str) or arch not in KNOWN_KERNEL_ARCHITECTURES:
+            raise ValueError(f"{label}.architecture must be a kernel arch directory")
+        identifiers = item.get("identifiers", {})
+        if not isinstance(identifiers, dict):
+            raise ValueError(f"{label}.identifiers must be an object")
+        unknown_ids = set(identifiers) - {"dt_compatible", "acpi_hid", "pci_id"}
+        if unknown_ids:
+            raise ValueError(f"{label} unknown identifiers: {sorted(unknown_ids)}")
+        def strings(value, field):
+            if not isinstance(value, list) or not all(
+                isinstance(v, str) and 0 < len(v.strip()) <= 256 and v == v.strip()
+                for v in value
+            ):
+                raise ValueError(f"{label}.{field} must be a list of nonempty strings")
+            if len(set(value)) != len(value):
+                raise ValueError(f"{label}.{field} contains duplicate entries")
+            return tuple(value)
+        paths = strings(item.get("paths", []), "paths")
+        for pattern in paths:
+            if pattern.startswith("/") or ".." in pattern.split("/") or "\\" in pattern:
+                raise ValueError(f"unsafe repository-relative path pattern: {pattern}")
+        dt = strings(identifiers.get("dt_compatible", []), "identifiers.dt_compatible")
+        acpi = strings(identifiers.get("acpi_hid", []), "identifiers.acpi_hid")
+        pci = strings(identifiers.get("pci_id", []), "identifiers.pci_id")
+        for identifier in pci:
+            if not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", identifier):
+                raise ValueError(f"{label}.identifiers.pci_id expected vvvv:dddd: {identifier}")
+        if not (paths or dt or acpi or pci):
+            raise ValueError(f"{label} needs paths or hardware identifiers")
+        platforms.append(PlatformEntry(platform_name, arch, paths, dt, acpi, pci))
+    return PlatformProfile(name.strip(), hashlib.sha256(raw).hexdigest(),
+                           str(source), tuple(platforms), unmatched)
+
+
 class Planner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -992,6 +1119,10 @@ class Planner:
         self.replay_rounds_run = 0
         self.replay_final_verification = False
         self.paths = self._load_paths(args)
+        self.platform_profile = (load_platform_profile(args.platforms)
+                                 if getattr(args, "platforms", None) else None)
+        self._platform_match_cache: dict[str, list[dict[str, str]]] = {}
+        self._platform_patch_line_cache: dict[str, str] = {}
         self.nodes: dict[str, CommitNode] = {}
         self.downstream_index = DownstreamIndex()
         self._patch_id_cache: dict[str, str | None] = {}
@@ -1187,6 +1318,167 @@ class Planner:
             ),
         }
 
+    def platform_relevance(self, sha: str) -> dict | None:
+        """Classify matching evidence, not certification or dependency proof.
+
+        An unmatched board *leaf* is distinguishable from shared code. Matching
+        a symbol in added text or a user path glob is positive evidence only;
+        deterministic required_by edges are provenance, not a verified need.
+        """
+        profile = getattr(self, "platform_profile", None)
+        if profile is None:
+            return None
+        node = self.nodes[sha]
+        files = node.files or self.changed_files(sha)
+        matches = self._platform_matches(sha, files)
+        roots = self._platform_candidate_roots(sha) if not matches else []
+        board_only = bool(files) and all(
+            re.fullmatch(r"arch/[^/]+/boot/dts/.+\.dts(?:o)?", path)
+            for path in files
+        )
+        if matches:
+            status = "DIRECT"
+        elif roots:
+            status = "DEPENDENCY_CANDIDATE"
+        elif board_only:
+            status = "OUT_OF_SCOPE_BOARD"
+        else:
+            status = "SHARED_OR_UNKNOWN"
+        return {
+            "status": status,
+            "matches": matches,
+            "candidate_roots": roots,
+            "board_leaf_only": board_only,
+            "note": (
+                "Matching a configured path or added identifier is positive scope "
+                "evidence, not certification or proof that a fix is required. "
+                "Candidate roots are connected by deterministic discovery "
+                "provenance only, not verified semantic prerequisites. "
+                "Shared code and ambiguous platform relationships must not be "
+                "excluded solely because they do not name a listed board."
+            ),
+        }
+
+    def _platform_matches(self, sha: str, files: Sequence[str]) -> list[dict[str, str]]:
+        if sha in self._platform_match_cache:
+            return self._platform_match_cache[sha]
+        profile = self.platform_profile
+        assert profile is not None
+        archs = set(self._architecture_dirs(files))
+        # Shared code has no arch ownership, so permit matching identifiers
+        # there; a source path owned by a different arch is not a match.
+        eligible = [p for p in profile.platforms if not archs or p.architecture in archs]
+        result: list[dict[str, str]] = []
+        for platform in eligible:
+            for path in files:
+                for pattern in platform.paths:
+                    if fnmatch.fnmatchcase(path, pattern):
+                        result.append({"platform": platform.name, "evidence":
+                                       f"path:{path} (pattern {pattern})"})
+        if eligible and any(p.dt_compatible or p.acpi_hid or p.pci_id for p in eligible):
+            # Examine *added* patch lines, not removed identifiers or the
+            # commit message. This also avoids matching a name in a diff header.
+            added = self._platform_added_lines(sha)
+            literals = set(re.findall(r'"([^"\n]+)"', added))
+            for platform in eligible:
+                for ident in platform.dt_compatible:
+                    if ident in literals:
+                        result.append({"platform": platform.name,
+                                       "evidence": f"added-dt-compatible:{ident}"})
+                    elif any(self._platform_source_has_compatible(sha, path, ident)
+                             for path in files if path.endswith((".dts", ".dtso"))):
+                        # A patch to an existing supported board usually does
+                        # not *add* its compatible declaration. Checking the
+                        # complete file at this commit avoids unsafe SKIPs.
+                        result.append({"platform": platform.name,
+                                       "evidence": f"source-dt-compatible:{ident}"})
+                for ident in platform.acpi_hid:
+                    if ident in literals:
+                        result.append({"platform": platform.name,
+                                       "evidence": f"added-acpi-hid:{ident}"})
+                for ident in platform.pci_id:
+                    vendor, device = ident.lower().split(":")
+                    # Require a concrete PCI_DEVICE/VDEVICE-style initializer,
+                    # not two unrelated hexadecimal values in the diff.
+                    if re.search(
+                        r"\bPCI_(?:V?DEVICE|DEVICE_DATA)\s*\(\s*0x" + vendor +
+                        r"\s*,\s*0x" + device + r"\b", added, re.I):
+                        result.append({"platform": platform.name,
+                                       "evidence": f"added-pci-id:{ident}"})
+        self._platform_match_cache[sha] = result
+        return result
+
+    def _platform_source_has_compatible(self, sha: str, path: str, ident: str) -> bool:
+        # Treat only actual DT compatible properties as evidence, not the
+        # appearance of a string in a comment, example, or another identifier.
+        tree_text = self._tree_file_text(sha, path)
+        if tree_text is None:
+            return False
+        source = re.sub(r"/\*.*?\*/|//[^\n]*", "", tree_text, flags=re.S)
+        for declaration in re.findall(r"\bcompatible\s*=\s*(.*?);", source, re.S):
+            if ident in re.findall(r'"([^"\n]+)"', declaration):
+                return True
+        return False
+
+    def _platform_added_lines(self, sha: str) -> str:
+        if sha not in self._platform_patch_line_cache:
+            patch = self.git.run([
+                "show", "--format=", "--no-ext-diff", "--unified=0", sha
+            ])
+            self._platform_patch_line_cache[sha] = "\n".join(
+                line[1:] for line in patch.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            )
+        return self._platform_patch_line_cache[sha]
+
+    def _platform_candidate_roots(self, sha: str) -> list[dict[str, str]]:
+        # Walk consumer edges only as candidate/provenance, never assert that
+        # every edge is a real prerequisite. Limit size for malicious graphs.
+        pending = [sha]
+        visited = {sha}
+        roots: list[dict[str, str]] = []
+        while pending and len(visited) <= 10000 and len(roots) < 16:
+            current = pending.pop(0)
+            for consumer_sha in sorted(self.nodes[current].required_by):
+                if consumer_sha in visited or consumer_sha not in self.nodes:
+                    continue
+                visited.add(consumer_sha)
+                consumer = self.nodes[consumer_sha]
+                if consumer.match.status == "present":
+                    continue
+                if consumer.advisor_decision == "SKIP":
+                    continue
+                matches = self._platform_matches(
+                    consumer_sha, consumer.files or self.changed_files(consumer_sha))
+                if matches:
+                    roots.append({"sha": consumer_sha, "platform": matches[0]["platform"],
+                                  "confidence": "provenance_only"})
+                else:
+                    pending.append(consumer_sha)
+        return roots
+
+    def _platform_packet_context(self, sha: str, files: Sequence[str]) -> dict | None:
+        profile = getattr(self, "platform_profile", None)
+        if profile is None:
+            return None
+        archs = set(self._architecture_dirs(files))
+        relevant = [p.as_dict() for p in profile.platforms
+                    if not archs or p.architecture in archs]
+        # A large catalog must not flood each Ollama request. The *full* file
+        # is always used by the deterministic matcher; the advisor gets a
+        # bounded illustration plus the match/classification evidence.
+        displayed = relevant[:32]
+        return {
+            "source": "user-supplied profile (not independently verified certification)",
+            "name": profile.name,
+            "sha256": profile.sha256,
+            "platform_count": len(profile.platforms),
+            "unmatched_board": profile.unmatched_board,
+            "applicable_platform_count": len(relevant),
+            "applicable_platforms": displayed,
+            "applicable_platforms_truncated": len(relevant) > len(displayed),
+        }
+
     @staticmethod
     def _path_architecture_dirs(path: str) -> set[str]:
         """Return architecture ownership encoded by a source path.
@@ -1227,6 +1519,9 @@ class Planner:
         supported = set(
             self.advisor_product_context().get("supported_kernel_arch_dirs") or []
         )
+        profile = getattr(self, "platform_profile", None)
+        if profile:
+            supported.update(entry.architecture for entry in profile.platforms)
         return not supported or not owners.isdisjoint(supported)
 
     def _advisor_evidence_paths_compatible(
@@ -1249,6 +1544,9 @@ class Planner:
         arch_dirs = sorted({arch for owners in ownership_by_file for arch in owners})
         product = self.advisor_product_context()
         supported = set(product.get("supported_kernel_arch_dirs") or [])
+        profile = getattr(self, "platform_profile", None)
+        if profile:
+            supported.update(entry.architecture for entry in profile.platforms)
         focus = [p.rstrip("/") for p in self.paths]
         touches_focus = any(
             path == prefix or path.startswith(prefix + "/")
@@ -2385,7 +2683,17 @@ class Planner:
             default_bias = "REQUIRE_SEMANTIC_PROOF_FOR_DT_BINDING_SYMBOL"
         elif n.direct and scope["touches_focus_paths"]:
             default_bias = "TAKE_UNLESS_CONCRETE_EXCLUSION"
-        return {
+        relevance = self.platform_relevance(sha)
+        if relevance is not None:
+            if relevance["status"] == "DIRECT":
+                default_bias = "PLATFORM_MATCH"
+            elif relevance["status"] == "DEPENDENCY_CANDIDATE":
+                default_bias = "VERIFY_PLATFORM_PREREQUISITE"
+            elif relevance["status"] == "OUT_OF_SCOPE_BOARD":
+                default_bias = "UNMATCHED_BOARD_LEAF"
+            else:
+                default_bias = "SHARED_OR_UNKNOWN_RELEVANCE"
+        packet = {
             "planning_context": {
                 "base": self.base,
                 "target": self.target,
@@ -2466,6 +2774,18 @@ class Planner:
                 "actual_inbound_take_prerequisite_count": len(inbound_take),
             },
         }
+        if getattr(self, "platform_profile", None):
+            packet["planning_context"]["platform_profile"] = (
+                self._platform_packet_context(sha, files))
+            packet["planning_context"]["policy"] = (
+                "Use user-selected platform scope as the source of truth for product "
+                "relevance. Retain needed shared-code fixes and evidence-bound "
+                "prerequisites; do not equate architecture support with board support. "
+                "Treat unmatched board-leaf changes as out of scope unless a selected "
+                "platform requires them. Do not treat provenance edges as proof."
+            )
+            packet["commit"]["platform_relevance"] = relevance
+        return packet
 
     def advisor_policy_override(self, sha: str, packet: dict) -> dict | None:
         """Return a deterministic advisor result for unambiguous exclusions.
@@ -2481,6 +2801,23 @@ class Planner:
         commit = packet["commit"]
         if commit.get("actual_inbound_take_prerequisite_count", 0):
             return None
+        relevance = commit.get("platform_relevance") or {}
+        profile = getattr(self, "platform_profile", None)
+        if (profile is not None and relevance.get("status") == "OUT_OF_SCOPE_BOARD"
+                and profile.unmatched_board == "SKIP"):
+            return {
+                "decision": "SKIP",
+                "rationale": (
+                    "User-supplied platform profile: this commit changes only "
+                    "board-leaf DTS/DTSO files, matches no configured platform "
+                    "path or added hardware identifier, and has no recorded "
+                    "consumer path to a configured platform. The profile's "
+                    "unmatched_board policy is SKIP."
+                ),
+                "prerequisite_peers": [],
+                "inbound_prerequisite_assessments": [],
+                "risks": [],
+            }
         scope = commit.get("scope") or {}
         if scope.get("unsupported_architecture_only"):
             archs = ", ".join(scope.get("architecture_dirs") or []) or "unknown"
@@ -2520,7 +2857,7 @@ class Planner:
         return None
 
     def advisor_system_prompt(self) -> str:
-        return """You are the advisory layer of kernel-backport-planner, reviewing Linux
+        prompt = """You are the advisory layer of kernel-backport-planner, reviewing Linux
 kernel commits for an enterprise downstream backport plan. The deterministic planner has
 already gathered candidates and provenance. Your job is to recommend TAKE, SKIP, or REVIEW;
 you do not execute Git operations and you must not invent evidence.
@@ -2674,6 +3011,71 @@ Inbound prerequisite consistency:
 - If the inbound recommendation cannot be confidently reconciled, use REVIEW rather than SKIP.
 
 The response must match the supplied JSON schema. Keep rationale concise and technical.
+"""
+        if not getattr(self, "platform_profile", None):
+            return prompt
+        # The broad convergence-maintenance block says to TAKE irrespective
+        # of board support. Do not send contradictory policies to an Ollama
+        # model in platform-scope mode: replace that block, preserving the
+        # evidence, binding and inbound-reconciliation rules that follow it.
+        prompt = prompt.replace(
+            "Ordinary lack of product relevance or affirmative hardware support "
+            "is NOT material uncertainty here.",
+            "An unresolved relationship to user-selected platforms that would "
+            "alter commit selection is a valid technical reason for REVIEW."
+        )
+        start = prompt.index("Maintenance policy:")
+        end = prompt.index("Same-series prerequisite policy:", start)
+        prompt = (prompt[:start] + """Maintenance policy (user-selected platform scope):
+- The platform profile, not the architecture allowlist, specifies relevant
+  product platforms. A supported kernel architecture does not imply that every
+  board using it is relevant. Product support is user input, not an official
+  certification claim from this tool.
+- Prioritize well-founded changes affecting configured platforms, their actual
+  required prerequisites, and useful common/subsystem fixes. Do not select
+  unselected board-only enablement solely to minimize upstream divergence.
+- A required dependency can be common infrastructure outside the configured
+  board paths. Retain it when source and explicit prerequisite evidence show
+  the relationship. Deterministic consumer provenance alone is not proof.
+- Skip unsupported-architecture-only changes without evidence-bound relevance
+  to a TAKE consumer. Distinguish architecture-owned and common kernel code.
+- If a selected TAKE consumer requires an additional DTS source file that is
+  absent downstream, its producer cannot be dismissed due to platform naming.
+- Same-series adjacency, similar symbol names, and hunk proximity by themselves
+  do not prove that a dependency is needed.
+- A replay conflict is an integration-cost signal, not an automatic SKIP.
+  Preserve substantive TAKE decisions and describe ordinary conflicts as risks.
+- For unknown mixed/shared-code relevance, use concrete technical evidence;
+  select REVIEW when the uncertainty would materially alter the backport set.
+
+""" + prompt[end:])
+        return prompt + """
+
+USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
+- planning_context.platform_profile is the authoritative *user-selected scope*,
+  not a claim of official certification. The deterministic matcher checks the
+  whole profile; the applicable_platforms preview may be truncated. Never infer support from architecture
+  alone; treat platform names, paths, and hardware identifiers as user input.
+- commit.platform_relevance shows path/added-identifier matches and candidate
+  consumer roots based on the complete profile. Match evidence is not proof
+  that a code change is needed by the hardware. A deterministic required_by
+  relationship is provenance, NOT a verified prerequisite.
+- For PLATFORM_MATCH, favor TAKE when technically justified. Evaluate the
+  actual changed code rather than treating every matching file as necessary.
+- For UNMATCHED_BOARD_LEAF, skip changes confined to unselected board DTS/DTSO
+  leaf files when no concrete required TAKE-consumer prerequisite exists. Do
+  not treat generic upstream alignment as justification for taking these.
+- For VERIFY_PLATFORM_PREREQUISITE, inspect the actual code/prerequisite
+  evidence. TAKE a shared/provider commit when necessary for a selected
+  platform change. Do NOT take it based only on a provenance edge.
+- For SHARED_OR_UNKNOWN_RELEVANCE, preserve genuine generic subsystem fixes
+  and infrastructure. Lack of a named-board match alone is not SKIP evidence.
+  If platform relevance matters but cannot be determined from the packet,
+  choose REVIEW and name the missing technical relationship.
+- Never SKIP an evidence-bound REQUIRED prerequisite for an already-TAKE
+  consumer. Reconcile conflicting recommendations using the existing rules.
+- In this mode, an unresolved platform-scope question is a legitimate REVIEW;
+  the ordinary upstream-convergence policy retry does not apply.
 """
 
     @staticmethod
@@ -3083,7 +3485,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 validated = self.validate_advisor_result(sha, raw)
                 # Guard against a recurring policy misread by small models.
                 # Neither convert REVIEW to TAKE nor suppress concrete risks.
-                if policy_only_review_objection(validated):
+                if (not getattr(self, "platform_profile", None)
+                        and policy_only_review_objection(validated)):
                     raise AdvisorError(
                         "REVIEW cites absent official platform/product benefit "
                         "without a specific technical uncertainty; recheck "
@@ -5248,6 +5651,17 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             f"plan:         {len(actionable)} "
             f"({direct} direct, {deps} dependency)"
         )
+        profile = getattr(self, "platform_profile", None)
+        if profile:
+            lines.append(f"platform-profile: {profile.name} "
+                         f"({len(profile.platforms)} platforms; sha256 {profile.sha256[:12]})")
+            counts = collections.Counter(
+                self.platform_relevance(n.sha)["status"] for n in actionable
+                if n.match.status == "missing")
+            lines.append("platform-scope: " + ", ".join(
+                f"{key}={counts.get(key, 0)}" for key in
+                ("DIRECT", "DEPENDENCY_CANDIDATE", "OUT_OF_SCOPE_BOARD",
+                 "SHARED_OR_UNKNOWN")))
         if getattr(self, "advisor_model", None):
             advised_nodes = [n for n in actionable if n.advisor_decision]
             successful = [n for n in advised_nodes if not n.advisor_error]
@@ -5310,6 +5724,8 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         if self.args.show_dependency_candidates:
             lines.append(f"dependency-candidates: {tentative} informational")
         lines.append(f"status:       {missing} missing, {present} already downstream")
+        # Keep advisor recommendations distinct from engineer overrides
+        # and backporter-owned execution state.
         lines.append("")
 
         lines.append("BACKPORT WORKSHEET (oldest first)")
@@ -5322,10 +5738,7 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             label = ""
             if kind == "dependency":
                 label = " [DEPENDENCY]"
-            advisor_comment = ""
-            if n.advisor_decision:
-                advisor_comment = " // " + n.advisor_decision.title()
-            lines.append(f'{sha[:12]}{label} ("{n.subject}"){advisor_comment}')
+            lines.append(f'{sha[:12]}{label} ("{n.subject}")')
 
             # Focus-path selection is the default and is therefore left
             # unmarked; only exceptional dependency commits are labeled.
@@ -5379,6 +5792,16 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
             if n.subject_hints:
                 lines.append("      same-subject downstream hint (NOT proof): " +
                              ", ".join(x[:12] for x in n.subject_hints[:5]))
+            if profile:
+                relevance = self.platform_relevance(sha)
+                lines.append("      platform-relevance: " + relevance["status"])
+                for match in relevance["matches"]:
+                    lines.extend(self._worksheet_advisor_lines(
+                        "platform-match", match["platform"] + " " + match["evidence"]))
+                for root in relevance["candidate_roots"]:
+                    lines.extend(self._worksheet_advisor_lines(
+                        "platform-candidate-root", root["sha"][:12] + " " +
+                        root["platform"] + " (provenance only)"))
             if n.advisor_decision:
                 lines.append(f"      advisor: {n.advisor_decision}")
                 if n.advisor_rationale:
@@ -5661,6 +6084,17 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
                 "returncode": check_result[0], "output": check_result[1]
             },
         }
+        profile = getattr(self, "platform_profile", None)
+        if profile:
+            payload["platform_profile"] = {
+                "name": profile.name,
+                "sha256": profile.sha256,
+                "source": profile.source,
+                "platform_count": len(profile.platforms),
+                "unmatched_board": profile.unmatched_board,
+            }
+            for sha, item in payload["commits"].items():
+                item["platform_relevance"] = self.platform_relevance(sha)
         return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
@@ -6466,6 +6900,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="initial seconds between advisor retries; exponential backoff, capped at 10s (default: 1)",
     )
     p.add_argument(
+        "--platforms", metavar="FILE.yaml|FILE.json",
+        help="optional user-owned platform scope (YAML with PyYAML, or stdlib JSON); "
+             "requires --advisor-model; no built-in board support list",
+    )
+    p.add_argument(
         "--advisor-product", choices=("auto", "rhel10", "generic"), default="auto",
         help="product policy context for advisor (default: auto; cs10 selects rhel10)",
     )
@@ -6573,6 +7012,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                 or args.advisor_replay_trace or args.update):
             p.error("workspace cleanup is a standalone maintenance operation")
         return args
+    if args.platforms and not args.advisor_model:
+        p.error("--platforms requires --advisor-model")
+    if args.platforms and (args.advisor_benchmark_plan or args.advisor_replay_trace
+                           or args.package_results or args.cleanup_workspace_duplicates):
+        p.error("--platforms is supported only in normal planning mode")
+    if args.platforms:
+        try:
+            load_platform_profile(args.platforms)
+        except ValueError as exc:
+            p.error(str(exc))
     if args.advisor_fallback_model and not args.advisor_model:
         p.error("--advisor-fallback-model requires --advisor-model")
     if args.advisor_fallback_model == args.advisor_model and args.advisor_model:

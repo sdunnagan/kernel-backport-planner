@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "example-user-managed-platforms",
+  "unmatched_board": "SKIP",
+  "platforms": [
+    {
+      "name": "Example ARM development board",
+      "architecture": "arm64",
+      "paths": [
+        "arch/arm64/boot/dts/example/example-board*.dts"
+      ],
+      "identifiers": {
+        "dt_compatible": [
+          "example,selected-board"
+        ]
+      }
+    },
+    {
+      "name": "Example x86 system",
+      "architecture": "x86",
+      "paths": [
+        "drivers/platform/x86/example_*.c"
+      ],
+      "identifiers": {
+        "acpi_hid": [
+          "EXMP0001"
+        ],
+        "pci_id": [
+          "1234:abcd"
+        ]
+      }
+    }
+  ]
+}

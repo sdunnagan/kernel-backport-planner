@@ -214,9 +214,63 @@ class AdvisorTests(unittest.TestCase):
         planner.ordered_missing = lambda: [node.sha]
 
         report = kbp.Planner.report_text(planner)
-        self.assertIn('// Take', report)
+        self.assertNotIn('worksheet-format:', report)
+        self.assertIn('aaaaaaaaaaaa ("arm64: useful change")\n', report)
+        self.assertNotIn('// Take', report)
         self.assertIn('advisor: TAKE', report)
         self.assertIn('advisor-rationale:', report)
+
+    def test_worksheet_schema_separates_recommendations_from_status(self):
+        planner = self.minimal_planner()
+        nodes = []
+        for char, decision in (("a", "TAKE"), ("b", "SKIP"), ("c", "REVIEW")):
+            node = kbp.CommitNode(char * 40, f"arm64: {decision} candidate", direct=True)
+            node.advisor_decision = decision
+            node.advisor_rationale = f"Evidence for {decision}."
+            nodes.append(node)
+        planner.nodes = {node.sha: node for node in nodes}
+        planner.ordered_missing = lambda: [node.sha for node in nodes]
+
+        text = planner.report_text()
+        self.assertNotIn("worksheet-format:", text)
+        for node in nodes:
+            header = f'{node.sha[:12]} ("{node.subject}")'
+            self.assertIn(header + "\n", text)
+            self.assertIn(f"      advisor: {node.advisor_decision}\n", text)
+            self.assertIn(f"      advisor-rationale: {node.advisor_rationale}\n", text)
+            self.assertNotIn(header + " //", text)
+        self.assertNotIn("backporter-status:", text)
+        self.assertNotIn("downstream-commit:", text)
+        self.assertNotIn("engineer-decision:", text)
+        self.assertNotIn("engineer-rationale:", text)
+
+    def test_worksheet_generation_leaves_json_plan_unchanged(self):
+        planner = self.minimal_planner()
+        planner.advisor_model = None
+        node = kbp.CommitNode("a" * 40, "board update", direct=True)
+        node.advisor_decision = "TAKE"
+        node.advisor_rationale = "Upstream alignment."
+        planner.nodes = {node.sha: node}
+        planner.ordered_missing = lambda: [node.sha]
+
+        plan_before = planner.report_json()
+        worksheet = planner.report_text()
+        plan_after = planner.report_json()
+        self.assertEqual(plan_before, plan_after)
+        self.assertNotIn("worksheet-format:", worksheet)
+        self.assertEqual(
+            json.loads(plan_after)["commits"][node.sha]["advisor_decision"],
+            "TAKE",
+        )
+
+    def test_worksheet_schema_has_no_legacy_cli_option(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0"])
+        self.assertFalse(hasattr(args, "worksheet_format"))
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as caught:
+                kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                                "--worksheet-format", "legacy"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_worksheet_wraps_advisor_commentary_without_changing_content(self):
         planner = self.minimal_planner()
@@ -3074,7 +3128,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "19")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "20")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -4308,7 +4362,10 @@ class WorkspaceResults0426Tests(unittest.TestCase):
         planner = mock.Mock()
         planner.nodes = {}
         planner.run_check_command.return_value = None
-        planner.report_text.return_value = "// Take abcdef123456\nAdvisor: preserve evidence\n"
+        planner.report_text.return_value = (
+            'abcdef123456 ("arm64: sample")\n'
+            '      advisor: TAKE\n      advisor-rationale: preserve evidence\n'
+        )
         planner.report_json.return_value = json.dumps({
             "advisor": None, "order": [], "commits": {},
             "baseline": "a" * 40,
@@ -4336,7 +4393,7 @@ class WorkspaceResults0426Tests(unittest.TestCase):
                 "performance.json", "performance.jsonl",
             }
             self.assertEqual({p.name for p in folder.iterdir()}, expected)
-            self.assertIn("Advisor: preserve evidence",
+            self.assertIn("advisor-rationale: preserve evidence",
                           (folder / "backport_worksheet.txt").read_text())
             with zipfile.ZipFile(archive) as zf:
                 self.assertEqual(set(zf.namelist()), {
@@ -4437,7 +4494,7 @@ class WorkspaceResults0426Tests(unittest.TestCase):
                     with mock.patch.object(kbp.sys, "stdout", new_callable=io.StringIO) as out:
                         rc = kbp.main(["--base", "v6.19", "--target", "v7.0"])
                 self.assertEqual(rc, 0)
-                self.assertIn("// Take abcdef123456", out.getvalue())
+                self.assertIn('abcdef123456 ("arm64: sample")', out.getvalue())
             self.assertFalse((Path(tmp) / "backport-plans").exists())
 
     def test_invalid_workspace_fails_without_running_git_collection(self):
@@ -4473,7 +4530,7 @@ class WorkspaceResults0426Tests(unittest.TestCase):
                         rc = kbp.main(["--base", "v6.19", "--target", "v7.0",
                                        "--no-auto-package"])
             self.assertEqual(rc, 0)
-            self.assertIn("// Take abcdef123456", out.getvalue())
+            self.assertIn('abcdef123456 ("arm64: sample")', out.getvalue())
             self.assertFalse((root / "backport-plans").exists())
 
     def test_invalid_plan_json_is_not_archived(self):
@@ -4653,3 +4710,199 @@ class PlannerCompletionSound0427Tests(unittest.TestCase):
                 with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
                     self.assertEqual(kbp.main(["--cleanup-workspace-duplicates"]), 0)
                     sound.assert_not_called()
+
+class UserPlatformProfile0429Tests(unittest.TestCase):
+    """A user-maintained scope must not turn path provenance into proof."""
+
+    @staticmethod
+    def profile_data():
+        return {
+            "version": 1, "name": "example public/product scope",
+            "unmatched_board": "SKIP",
+            "platforms": [
+                {"name": "Selected ARM board", "architecture": "arm64",
+                 "paths": ["arch/arm64/boot/dts/vendor/selected-board*.dts"],
+                 "identifiers": {"dt_compatible": ["vendor,selected-board"]}},
+                {"name": "Selected x86 system", "architecture": "x86",
+                 "paths": ["drivers/platform/x86/selected-*.c"],
+                 "identifiers": {"acpi_hid": ["VEND0001"],
+                                 "pci_id": ["1234:abcd"]}},
+            ],
+        }
+
+    def load(self, data=None, ext=".json"):
+        data = self.profile_data() if data is None else data
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ("platforms" + ext)
+            if ext == ".json":
+                path.write_text(json.dumps(data))
+            else:
+                try:
+                    import yaml
+                except ImportError:
+                    self.skipTest("PyYAML is not installed")
+                path.write_text(yaml.safe_dump(data))
+            return kbp.load_platform_profile(path)
+
+    def planner(self, patch=""):
+        import types
+        p = object.__new__(kbp.Planner)
+        p.platform_profile = self.load()
+        p._platform_match_cache = {}
+        p._platform_patch_line_cache = {}
+        p.git = types.SimpleNamespace(run=lambda args: patch)
+        p.nodes = {}
+        p.changed_files = lambda sha: p.nodes[sha].files
+        p._tree_file_text = lambda sha, path: None
+        return p
+
+    def test_json_profile_validates_and_hashes(self):
+        profile = self.load()
+        self.assertEqual(len(profile.platforms), 2)
+        self.assertEqual(profile.unmatched_board, "SKIP")
+        self.assertEqual(len(profile.sha256), 64)
+        self.assertEqual(profile.platforms[1].pci_id, ("1234:abcd",))
+
+    def test_yaml_profile_matches_json_schema(self):
+        self.assertEqual(self.load(ext=".yaml").platforms,
+                         self.load(ext=".json").platforms)
+
+    def test_invalid_profiles_fail_closed(self):
+        cases = [
+            {**self.profile_data(), "version": 2},
+            {**self.profile_data(), "version": True},
+            {**self.profile_data(), "platforms": []},
+            {**self.profile_data(), "unmatched_board": "TAKE"},
+            {**self.profile_data(), "platforms": [
+                {"name": "Test", "architecture": "arm64", "paths": ["../secret"]}]},
+            {**self.profile_data(), "platforms": [
+                {"name": "Test", "architecture": "arm64", "identifiers":
+                 {"pci_id": ["not-a-device"]}}]},
+            {**self.profile_data(), "platforms": [
+                {"name": "Test", "architecture": "mystery", "paths": ["foo.c"]}]},
+            {**self.profile_data(), "platforms": [
+                {"name": "Test", "architecture": "arm64", "paths": ["a.c"]},
+                {"name": "Test", "architecture": "arm64", "paths": ["b.c"]}]},
+            {**self.profile_data(), "extra_setting": "silently ignore me"},
+        ]
+        for data in cases:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                self.load(data)
+
+    def test_path_match_works_in_selected_arch(self):
+        p = self.planner()
+        sha = "a" * 40
+        p.nodes[sha] = kbp.CommitNode(sha, "selected board", direct=True,
+                                     files=["arch/arm64/boot/dts/vendor/selected-board-a.dts"])
+        result = p.platform_relevance(sha)
+        self.assertEqual(result["status"], "DIRECT")
+        self.assertEqual(result["matches"][0]["platform"], "Selected ARM board")
+
+    def test_added_compatible_match_but_removed_compatible_not_match(self):
+        sha = "b" * 40
+        path = "arch/arm64/boot/dts/vendor/other-board.dts"
+        p = self.planner('''diff --git a/file b/file
+--- a/file
++++ b/file
+@@ -1,1 +1,1 @@
+- compatible = "vendor,selected-board";
++ compatible = "vendor,other-board";
+''')
+        p.nodes[sha] = kbp.CommitNode(sha, "remove compat", files=[path])
+        self.assertEqual(p.platform_relevance(sha)["status"], "OUT_OF_SCOPE_BOARD")
+        p._platform_match_cache.clear()
+        p._platform_patch_line_cache.clear()
+        p.git.run = lambda _: '+++ b/file\n+compatible = "vendor,selected-board";'
+        self.assertEqual(p.platform_relevance(sha)["status"], "DIRECT")
+
+    def test_existing_board_compatible_is_detected_without_added_line(self):
+        sha = "0" * 40
+        path = "arch/arm64/boot/dts/vendor/legacy-board.dts"
+        p = self.planner('+ status = "okay";')
+        p.nodes[sha] = kbp.CommitNode(sha, "fix selected board", files=[path])
+        p._tree_file_text = lambda s, f: '''
+            / {
+                compatible = "vendor,selected-board", "vendor,legacy-soc";
+                status = "okay";
+            };
+        '''
+        result = p.platform_relevance(sha)
+        self.assertEqual(result["status"], "DIRECT")
+        self.assertEqual(result["matches"][0]["evidence"],
+                         "source-dt-compatible:vendor,selected-board")
+
+    def test_acpi_and_pci_are_not_arm_specific(self):
+        sha = "c" * 40
+        p = self.planner('+ { "VEND0001", 0 },\n+{ PCI_DEVICE(0x1234, 0xabcd) },')
+        p.nodes[sha] = kbp.CommitNode(
+            sha, "x86 identifiers", files=["drivers/platform/x86/unrelated.c"])
+        matches = p.platform_relevance(sha)["matches"]
+        self.assertEqual({m["evidence"] for m in matches},
+                         {"added-acpi-hid:VEND0001", "added-pci-id:1234:abcd"})
+
+    def test_board_leaf_out_of_scope_but_shared_dtsi_unknown(self):
+        p = self.planner()
+        board = "d" * 40
+        shared = "e" * 40
+        p.nodes[board] = kbp.CommitNode(
+            board, "unselected board", files=["arch/arm64/boot/dts/vendor/other-board.dts"])
+        p.nodes[shared] = kbp.CommitNode(
+            shared, "shared soc", files=["arch/arm64/boot/dts/vendor/soc.dtsi"])
+        self.assertEqual(p.platform_relevance(board)["status"], "OUT_OF_SCOPE_BOARD")
+        self.assertEqual(p.platform_relevance(shared)["status"], "SHARED_OR_UNKNOWN")
+
+    def test_provenance_consumer_is_candidate_not_verified(self):
+        p = self.planner()
+        dep, consumer = "f" * 40, "a" * 40
+        p.nodes[dep] = kbp.CommitNode(dep, "generic prereq", files=["drivers/pci/host.c"])
+        p.nodes[consumer] = kbp.CommitNode(
+            consumer, "selected board", files=["arch/arm64/boot/dts/vendor/selected-board-a.dts"])
+        p.nodes[dep].add_reason("conflict-hunk-preimage:1", consumer)
+        result = p.platform_relevance(dep)
+        self.assertEqual(result["status"], "DEPENDENCY_CANDIDATE")
+        self.assertEqual(result["candidate_roots"][0]["confidence"], "provenance_only")
+        p.nodes[consumer].advisor_decision = "SKIP"
+        self.assertEqual(p.platform_relevance(dep)["status"], "SHARED_OR_UNKNOWN")
+
+    def test_deterministic_skip_only_unmatched_board_without_inbound(self):
+        p = self.planner()
+        packet = {"commit": {"platform_relevance": {"status": "OUT_OF_SCOPE_BOARD"},
+                             "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
+        result = p.advisor_policy_override("a" * 40, packet)
+        self.assertEqual(result["decision"], "SKIP")
+        packet["commit"]["actual_inbound_take_prerequisite_count"] = 1
+        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+        p.platform_profile = kbp.PlatformProfile("test", "a" * 64, "test", (), "REVIEW")
+        packet["commit"]["actual_inbound_take_prerequisite_count"] = 0
+        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+
+    def test_mixed_or_architecture_only_commit_does_not_auto_skip(self):
+        p = self.planner()
+        for status in ("DIRECT", "DEPENDENCY_CANDIDATE", "SHARED_OR_UNKNOWN"):
+            with self.subTest(status=status):
+                packet = {"commit": {"platform_relevance": {"status": status},
+                                     "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
+                self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+
+    def test_model_prompt_changes_only_with_profile(self):
+        p = self.planner()
+        self.assertIn("USER-OWNED PLATFORM SCOPE MODE", p.advisor_system_prompt())
+        self.assertIn("VERIF", p.advisor_system_prompt())
+        p.platform_profile = None
+        self.assertNotIn("USER-OWNED PLATFORM SCOPE MODE", p.advisor_system_prompt())
+        self.assertIn("Upstream convergence", p.advisor_system_prompt())
+
+    def test_large_profile_packet_preview_is_bounded(self):
+        p = self.planner()
+        example = p.platform_profile.platforms[0]
+        p.platform_profile = kbp.PlatformProfile("many", "0" * 64, "file", (example,) * 40)
+        info = p._platform_packet_context("a" * 40,
+                                          ["arch/arm64/boot/dts/vendor/a.dts"])
+        self.assertEqual(info["applicable_platform_count"], 40)
+        self.assertEqual(len(info["applicable_platforms"]), 32)
+        self.assertTrue(info["applicable_platforms_truncated"])
+
+    def test_cli_requires_model_when_platform_file_supplied(self):
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                kbp.parse_args(["--platforms", "/tmp/example.json"])

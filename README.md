@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.28**.
+Current tool version: **0.4.30**.
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -30,6 +30,152 @@ The key distinction is that `--base` limits the **focus candidate range**, not
 the dependency universe. A required prerequisite may predate `--base` if there
 is concrete evidence that a selected commit depends on it and that prerequisite
 is not already downstream.
+
+## Worksheet status fields (0.4.30)
+
+Version 0.4.30 uses explicit worksheet fields. The planner's
+oldest-first commit headers no longer append `// Take`, `// Skip`, or
+`// Review`. Those comments duplicated the already present `advisor:` field
+and, after execution, conflated advisor recommendations with Git progress.
+Each entry retains its original advisor annotations, platform relevance,
+and provenance. The JSON plan, advisor policy, dependency graph, and Ollama prompt
+version are **not changed** by this worksheet presentation update.
+
+A fresh worksheet entry looks like:
+
+```text
+abc123def456 [DEPENDENCY] ("arm64: dts: example: Update board")
+      evidence: dt-include:arch/arm64/boot/dts/example/board.dtsi
+      advisor: TAKE
+      advisor-rationale: A prerequisite of a relevant platform change.
+```
+
+On that worksheet an engineer can **add**, for example:
+
+```text
+      engineer-decision: SKIP
+      engineer-rationale: Board is outside this MR's product scope.
+```
+
+The matching backporter supplies **journal-owned**
+`backporter-status:` and `downstream-commit:` annotations. The planner does
+**not** populate execution status, because it neither cherry-picks commits
+nor owns the execution journal. Engineering decisions do not retroactively
+change completed Git commits; the backporter must enforce that rule.
+
+The executing backporter must support the named-field worksheet and
+journal-owned status fields. Do not swap a live backporter session's worksheet or JSON plan
+for newly generated files; upgrade the planner and executor as a coordinated
+change.
+
+## Optional user-owned platform scope (0.4.29)
+
+Version 0.4.29 adds **`--platforms FILE.yaml`** (or `.json`) to guide the
+Qwen/Gemma advisor using a user-maintained list of platforms that are relevant
+to the intended downstream product. **There is no bundled Red Hat board list**
+and no attempt to claim what Red Hat officially certifies. The person supplying
+the file owns the support/scope decision. Keep any sensitive local profiles
+outside the public Git repository. **Note:** advisor request traces, plan
+JSON, worksheets, and run archives may include platform names, paths, identifiers,
+and selected profile excerpts. Treat those outputs according to the same data
+classification as the input file; local-only input does not make published
+advisor traces or archives safe to share.
+
+This option **requires `--advisor-model`** and is disabled by default. Without
+`--platforms`, the existing upstream-convergence policy and structured JSON
+plan schema remain in effect. All worksheets use the same named-field layout.
+
+Create a local file (see `platforms.example.yaml` for fictitious examples):
+
+```yaml
+version: 1
+name: local-product-scope
+unmatched_board: SKIP
+platforms:
+  - name: Example ARM development board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/example/example-board*.dts'
+    identifiers:
+      dt_compatible:
+        - 'example,selected-board'
+
+  - name: Example x86 system
+    architecture: x86
+    paths:
+      - 'drivers/platform/x86/example_*.c'
+    identifiers:
+      acpi_hid:
+        - 'EXMP0001'
+      pci_id:
+        - '1234:abcd'
+```
+
+The entries above are placeholders, **not certified hardware**. Supply real
+names, repository-relative glob paths, and/or identifiers from your own
+authorized product scope. `architecture` uses Linux `arch/` directory names
+(`arm64`, `x86`, `powerpc`, `s390`, etc.). A named entry must include at least
+one matching path or hardware identifier: free-form names alone cannot support
+safe automatic exclusion.
+
+Pass the file alongside your normal planning arguments:
+
+```bash
+"$KERNEL_BACKPORT_PLANNER" \
+    --base v6.19 --target v7.0 --downstream cs10 \
+    --file-list "$HOME/my-arm-focus-paths.txt" \
+    --advisor-model kernel-planner:32k \
+    --advisor-fallback-model gemma4-kernel:64k \
+    --platforms "$HOME/private/product-platforms.yaml"
+```
+
+Use all your usual repository, context budget and Ollama flags as needed.
+JSON profiles work with Python's standard library. YAML requires the optional
+PyYAML package (`python3-pyyaml` on many distributions). Malformed, incomplete,
+unknown-key or unreadable profiles are rejected before a normal planning run.
+The advisor cache key includes the profile evidence, and the JSON plan includes
+the profile SHA256 for traceability. Changing a profile requires a new run;
+existing plan snapshots and backporter journals are never rewritten.
+
+**Decision rules** (applied to any architecture, not only ARM):
+
+- **DIRECT:** A changed path matches a configured glob, an added DT compatible,
+  ACPI HID, or a recognized PCI initializer, or an existing modified DTS/DTSO
+  declares a selected DT compatible. This is *positive scope evidence*, not
+  proof the commit is beneficial or that the hardware is certified.
+- **DEPENDENCY_CANDIDATE:** Discovery provenance reaches a matching platform
+  commit. The advisor must examine whether this is a *real* prerequisite;
+  matching symbols, common files or a `required_by` edge alone do not prove it.
+- **OUT_OF_SCOPE_BOARD:** All changed files are unselected board-leaf
+  `.dts`/`.dtso` sources, with no known candidate link to a selected platform.
+  With `unmatched_board: SKIP` (the default), this is a deterministic advisor
+  SKIP **unless an evidence-bound inbound TAKE prerequisite exists**. Set
+  `unmatched_board: REVIEW` for a more conservative workflow.
+- **SHARED_OR_UNKNOWN:** Shared drivers, kernel infrastructure, `.dtsi` files,
+  mixed-source commits, and unclear platform ownership are not automatically
+  skipped. Their technical relevance and actual prerequisites remain for the
+  advisor and engineer to evaluate.
+
+The source matcher checks the **full** user profile, including when the bounded
+advisor packet previews only the first 32 applicable entries. A profile is not
+a complete mapping of hardware to kernel source: ACPI and PCI matches currently
+recognize only explicit identifiers in added code, so use `paths` where needed
+for modifications to existing driver code. Matching the selected DTS's existing
+`compatible` property avoids incorrectly skipping a change that does not
+introduce a new compatible string.
+
+The worksheet includes `platform-relevance`, `platform-match` and
+`platform-candidate-root` annotations; the JSON plan records the same evidence.
+The summary reports direct matches, dependency candidates, out-of-scope leaves,
+and shared/unknown commits. Dependency links remain **provenance only** until
+supported by specific source-level evidence and advisor reconciliation. The
+engineer can still use `engineer-decision` overrides in kernel-backporter.
+
+**Important:** Platform filtering affects a **new planning cycle**, not a live
+backporter 0.2.8 journal. If you are already partway through a backport, keep
+using the existing plan and engineer overrides instead of swapping its JSON
+plan beneath the execution journal. A new profile-driven run also takes time;
+profile filtering changes selection policy, not initial candidate discovery.
 
 ## Workspace cleanup and completion sounds (0.4.27)
 
@@ -1246,7 +1392,7 @@ Text output keeps deterministic evidence and adds the recommendation, for
 example:
 
 ```text
-2e65616ef07f [DEPENDENCY] ("arm64: dts: qcom: x1e80100: Update C4/C5 residency/exit numbers") // Take
+2e65616ef07f [DEPENDENCY] ("arm64: dts: qcom: x1e80100: Update C4/C5 residency/exit numbers")
       evidence: Fixes-target
       required-by: 3ecea84d2b90
       replay: clean
@@ -1723,8 +1869,11 @@ For a broad upstream rebase, the intended workflow is:
 4. treat `[DEPENDENCY]`, replay conflicts, `Fixes:`, series peers, and merge
    risks as engineering evidence with different strengths; inspect context-only
    dependency candidates only when debugging provenance or discovery behavior;
-5. annotate the working report with decisions such as `// Done` and `// Skip`;
-6. apply/backport commits deliberately;
+5. optionally add `engineer-decision: TAKE` or `engineer-decision: SKIP`
+   and an `engineer-rationale:` to the worksheet; do not manually edit
+   backporter-owned execution status;
+6. apply/backport commits deliberately with an executor that supports
+   named worksheet status fields;
 7. build and test the resulting kernel separately as appropriate.
 
 That keeps the tool in its proper role: finding the context humans are likely to
