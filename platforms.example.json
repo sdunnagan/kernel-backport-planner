@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "example-user-managed-platforms",
-  "unmatched_board": "SKIP",
+  "unmatched_board": "TAKE",
   "platforms": [
     {
       "name": "Example ARM development board",
@@ -29,6 +29,15 @@
           "1234:abcd"
         ]
       }
+    }
+  ],
+  "excluded_platforms": [
+    {
+      "name": "Example excluded ARM board",
+      "architecture": "arm64",
+      "paths": [
+        "arch/arm64/boot/dts/example/other-board*.dts"
+      ]
     }
   ]
 }

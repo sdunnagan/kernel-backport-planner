@@ -2,7 +2,7 @@
 # Do not interpret this file as Red Hat certification data.
 version: 1
 name: example-user-managed-platforms
-unmatched_board: SKIP  # or REVIEW
+unmatched_board: TAKE  # TAKE (default), REVIEW or aggressive SKIP
 platforms:
   - name: Example ARM development board
     architecture: arm64
@@ -21,3 +21,10 @@ platforms:
         - 'EXMP0001'
       pci_id:
         - '1234:abcd'
+
+# Optional explicit negative scope. Do not infer that an unlisted board is unsupported.
+excluded_platforms:
+  - name: Example excluded ARM board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/example/other-board*.dts'

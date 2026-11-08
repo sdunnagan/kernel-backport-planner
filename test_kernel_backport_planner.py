@@ -3128,7 +3128,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "20")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "21")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -3889,7 +3889,7 @@ class DualAdvisor0423Tests(unittest.TestCase):
         for node in planner.nodes.values():
             node.match = kbp.Match(status="missing")
             node.advisor_decision = "REVIEW"
-            node.advisor_rationale = "Qwen uncertainty"
+            node.advisor_rationale = "Unresolved API compatibility with downstream"
             node.advisor_decision_model = "kernel-planner:32k"
         planner.advisor_model = "kernel-planner:32k"
         planner.advisor_primary_model = planner.advisor_model
@@ -3981,7 +3981,7 @@ class DualAdvisor0423Tests(unittest.TestCase):
         p._advisor_evaluate_one = fake_evaluate
         p._advisor_fallback_one(None, "policy", "a" * 40, ["review"])
         self.assertEqual(first.advisor_error_kind, "policy-review")
-        self.assertEqual(first.advisor_rationale, "Qwen uncertainty")
+        self.assertEqual(first.advisor_rationale, "Unresolved API compatibility with downstream")
         self.assertEqual(first.advisor_decision_model, "kernel-planner:32k")
         self.assertEqual(first.advisor_fallback_result["advisor_error_kind"],
                          "timeout")
@@ -4772,7 +4772,7 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
             {**self.profile_data(), "version": 2},
             {**self.profile_data(), "version": True},
             {**self.profile_data(), "platforms": []},
-            {**self.profile_data(), "unmatched_board": "TAKE"},
+            {**self.profile_data(), "unmatched_board": "MAYBE"},
             {**self.profile_data(), "platforms": [
                 {"name": "Test", "architecture": "arm64", "paths": ["../secret"]}]},
             {**self.profile_data(), "platforms": [
@@ -4809,7 +4809,7 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
 + compatible = "vendor,other-board";
 ''')
         p.nodes[sha] = kbp.CommitNode(sha, "remove compat", files=[path])
-        self.assertEqual(p.platform_relevance(sha)["status"], "OUT_OF_SCOPE_BOARD")
+        self.assertEqual(p.platform_relevance(sha)["status"], "UNMATCHED_BOARD")
         p._platform_match_cache.clear()
         p._platform_patch_line_cache.clear()
         p.git.run = lambda _: '+++ b/file\n+compatible = "vendor,selected-board";'
@@ -4848,7 +4848,7 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
             board, "unselected board", files=["arch/arm64/boot/dts/vendor/other-board.dts"])
         p.nodes[shared] = kbp.CommitNode(
             shared, "shared soc", files=["arch/arm64/boot/dts/vendor/soc.dtsi"])
-        self.assertEqual(p.platform_relevance(board)["status"], "OUT_OF_SCOPE_BOARD")
+        self.assertEqual(p.platform_relevance(board)["status"], "UNMATCHED_BOARD")
         self.assertEqual(p.platform_relevance(shared)["status"], "SHARED_OR_UNKNOWN")
 
     def test_provenance_consumer_is_candidate_not_verified(self):
@@ -4866,7 +4866,7 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
 
     def test_deterministic_skip_only_unmatched_board_without_inbound(self):
         p = self.planner()
-        packet = {"commit": {"platform_relevance": {"status": "OUT_OF_SCOPE_BOARD"},
+        packet = {"commit": {"platform_relevance": {"status": "UNMATCHED_BOARD"},
                              "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
         result = p.advisor_policy_override("a" * 40, packet)
         self.assertEqual(result["decision"], "SKIP")
@@ -4906,3 +4906,155 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with mock.patch("sys.stderr", new_callable=io.StringIO):
                 kbp.parse_args(["--platforms", "/tmp/example.json"])
+
+
+class ScopeAndFallback0431Tests(unittest.TestCase):
+    """No inference of lack of product support from an incomplete allowlist."""
+
+    def profile(self, **changes):
+        data = UserPlatformProfile0429Tests.profile_data()
+        data.update(changes)
+        return UserPlatformProfile0429Tests().load(data)
+
+    def planner(self, *, excluded=(), unmatched="TAKE", path=None):
+        test = UserPlatformProfile0429Tests()
+        data = test.profile_data()
+        data["unmatched_board"] = unmatched
+        data["excluded_platforms"] = list(excluded)
+        p = test.planner()
+        p.platform_profile = test.load(data)
+        p._platform_match_cache = {}
+        p._platform_excluded_match_cache = {}
+        if path is not None:
+            p.nodes["a" * 40] = kbp.CommitNode("a" * 40, "board change", files=[path])
+        return p
+
+    @staticmethod
+    def excluded_board(pattern="arch/arm64/boot/dts/vendor/other-*.dts"):
+        return {"name": "Excluded arm board", "architecture": "arm64",
+                "paths": [pattern]}
+
+    def test_unmatched_defaults_to_take_not_a_disallowlist(self):
+        p = self.profile(unmatched_board="TAKE")
+        self.assertEqual(p.unmatched_board, "TAKE")
+        raw = UserPlatformProfile0429Tests.profile_data()
+        raw.pop("unmatched_board")
+        self.assertEqual(UserPlatformProfile0429Tests().load(raw).unmatched_board,
+                         "TAKE")
+
+    def test_explicit_exclusion_is_negative_board_leaf_evidence(self):
+        p = self.planner(excluded=[self.excluded_board()],
+                         path="arch/arm64/boot/dts/vendor/other-model.dts")
+        relevance = p.platform_relevance("a" * 40)
+        self.assertEqual(relevance["status"], "EXCLUDED_BOARD")
+        self.assertEqual(relevance["excluded_matches"][0]["platform"],
+                         "Excluded arm board")
+        packet = {"commit": {"platform_relevance": relevance,
+                             "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
+        self.assertEqual(p.advisor_policy_override("a" * 40, packet)["decision"],
+                         "SKIP")
+        packet["commit"]["actual_inbound_take_prerequisite_count"] = 1
+        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+
+    def test_identifier_in_added_comment_cannot_exclude_board(self):
+        p = self.planner(excluded=[{
+            "name": "Excluded by DT compatible", "architecture": "arm64",
+            "identifiers": {"dt_compatible": ["vendor,excluded-board"]}}],
+            path="arch/arm64/boot/dts/vendor/other-board.dts")
+        p.git.run = lambda args: '+ /* "vendor,excluded-board" */'
+        self.assertEqual(p.platform_relevance("a" * 40)["status"],
+                         "UNMATCHED_BOARD")
+        p._platform_excluded_match_cache.clear()
+        p._tree_file_text = lambda sha, path: (
+            '/ { compatible = "vendor,excluded-board"; };')
+        self.assertEqual(p.platform_relevance("a" * 40)["status"],
+                         "EXCLUDED_BOARD")
+
+    def test_unmatched_review_is_not_forced_review(self):
+        p = self.planner(unmatched="REVIEW",
+                         path="arch/arm64/boot/dts/vendor/other-model.dts")
+        relevance = p.platform_relevance("a" * 40)
+        self.assertEqual(relevance["status"], "UNMATCHED_BOARD")
+        self.assertIsNone(p.advisor_policy_override("a" * 40, {
+            "commit": {"platform_relevance": relevance,
+                       "scope": {}, "actual_inbound_take_prerequisite_count": 0}}))
+        self.assertIn("missing from the allowlist is not proof",
+                      p.advisor_system_prompt().lower())
+
+    def test_old_aggressive_unmatched_skip_is_still_opt_in(self):
+        p = self.planner(unmatched="SKIP",
+                         path="arch/arm64/boot/dts/vendor/other-model.dts")
+        packet = {"commit": {"platform_relevance": p.platform_relevance("a" * 40),
+                             "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
+        self.assertEqual(p.advisor_policy_override("a" * 40, packet)["decision"],
+                         "SKIP")
+
+    def test_exclusion_does_not_skip_shared_code_or_mixed_changes(self):
+        p = self.planner(excluded=[self.excluded_board()])
+        sha = "a" * 40
+        p.nodes[sha] = kbp.CommitNode(sha, "mixed board", files=[
+            "arch/arm64/boot/dts/vendor/other-model.dts",
+            "arch/arm64/boot/dts/vendor/unlisted.dts"])
+        self.assertEqual(p.platform_relevance(sha)["status"], "UNMATCHED_BOARD")
+        p.nodes[sha].files = ["arch/arm64/boot/dts/vendor/other-model.dtsi"]
+        p._platform_match_cache.clear()
+        p._platform_excluded_match_cache.clear()
+        self.assertEqual(p.platform_relevance(sha)["status"], "SHARED_OR_UNKNOWN")
+
+    def test_selected_and_excluded_scope_conflict_is_never_silently_taken(self):
+        p = self.planner(excluded=[self.excluded_board(
+            "arch/arm64/boot/dts/vendor/selected-board*.dts")],
+            path="arch/arm64/boot/dts/vendor/selected-board-a.dts")
+        relevance = p.platform_relevance("a" * 40)
+        self.assertEqual(relevance["status"], "SCOPE_CONFLICT")
+        packet = {"commit": {"platform_relevance": relevance,
+                             "scope": {}, "actual_inbound_take_prerequisite_count": 0}}
+        result = p.advisor_policy_override("a" * 40, packet)
+        self.assertEqual(result["decision"], "REVIEW")
+        self.assertIn("conflicting", result["rationale"].lower())
+
+    def test_exclusion_profile_is_strict_and_hash_changes(self):
+        original = self.profile()
+        changed = self.profile(excluded_platforms=[self.excluded_board()])
+        self.assertEqual(len(changed.excluded_platforms), 1)
+        self.assertNotEqual(original.sha256, changed.sha256)
+        bad = UserPlatformProfile0429Tests.profile_data()
+        bad["excluded_platforms"] = [{"name": "Unsafe", "architecture": "arm64",
+                                      "paths": ["../secrets"]}]
+        with self.assertRaisesRegex(ValueError, "unsafe repository-relative"):
+            UserPlatformProfile0429Tests().load(bad)
+        bad["excluded_platforms"] = [{"name": "Selected ARM board",
+                                      "architecture": "arm64", "paths": ["board.dts"]}]
+        with self.assertRaisesRegex(ValueError, "duplicate platform name"):
+            UserPlatformProfile0429Tests().load(bad)
+        bad["excluded_platforms"] = {"name": "not a list"}
+        with self.assertRaisesRegex(ValueError, "excluded_platforms must be a list"):
+            UserPlatformProfile0429Tests().load(bad)
+
+    def test_technical_review_escalates_but_platform_only_does_not(self):
+        p = DualAdvisor0423Tests().make_planner()
+        p.advisor_consistency_issues = []
+        a, b = "a" * 40, "b" * 40
+        p.nodes[a].advisor_rationale = (
+            "Unknown whether the board has RHEL certification or product support")
+        p.nodes[b].advisor_rationale = "Unresolved API compatibility with downstream"
+        cases = p._advisor_fallback_candidates()
+        self.assertEqual([sha for sha, reasons in cases], [b])
+        self.assertIn("technical-review", cases[0][1])
+
+    def test_dependency_issue_and_validator_failure_still_escalate(self):
+        p = DualAdvisor0423Tests().make_planner()
+        p.nodes["a" * 40].advisor_rationale = "Hardware certification unknown"
+        p.nodes["b" * 40].advisor_rationale = "Hardware certification unknown"
+        p.nodes["b" * 40].advisor_error_kind = "evidence-budget"
+        cases = p._advisor_fallback_candidates()
+        self.assertEqual([sha for sha, _ in cases], ["a" * 40, "b" * 40])
+        self.assertIn("advisor-error:evidence-budget", cases[1][1])
+
+    def test_profile_prompt_bias_and_policy_recheck(self):
+        p = self.planner()
+        prompt = p.advisor_system_prompt()
+        self.assertIn("explicit negative", prompt)
+        self.assertIn("unknown board", prompt.lower())
+        self.assertIn("PLATFORM POLICY RECHECK",
+                      kbp.platform_policy_retry_prompt("original"))

@@ -5,7 +5,64 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.30**.
+Current tool version: **0.4.31**.
+
+## Platform scope and selective fallback (0.4.31)
+
+The optional `--platforms` profile is a user-owned *scope hint*, not a
+comprehensive certification database. **Unlisted is not unsupported.** The
+planner favors `TAKE` for technically sound changes to unknown boards or
+shared code. It requests `REVIEW` only for a concrete technical problem,
+prerequisite uncertainty, or conflicting user scope rules. Advisor choices
+remain candidates for engineer approval, not mandatory cherry-picks.
+
+New optional `excluded_platforms` entries have the same syntax as `platforms`.
+They express *explicit negative scope* using public or otherwise authorized
+user knowledge. A deterministic exclusion requires a commit confined to
+board-leaf `.dts`/`.dtso` files **all** identified by exclusion evidence, no
+positive profile match, and no candidate or evidence-bound TAKE prerequisite
+that would require retaining it. Changes to shared `.dtsi`, drivers, and
+mixed-board commits are not excluded merely because an excluded platform
+appears in the patch. Overlapping selected and excluded board matches are
+reported as `SCOPE_CONFLICT` for engineer review.
+
+```yaml
+version: 1
+name: local-product-scope
+unmatched_board: TAKE  # default; REVIEW does not force a review
+platforms:
+  - name: Example selected ARM board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/example/selected*.dts'
+excluded_platforms:
+  - name: Example excluded ARM board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/example/excluded*.dts'
+```
+
+`unmatched_board: SKIP` remains an **explicit aggressive opt-in**: it skips
+unmatched board-leaf changes without positive linkage to selected platforms.
+`TAKE` (the default) and `REVIEW` leave these decisions to the advisor, with a
+TAKE preference absent concrete technical objections. This preserves existing
+`unmatched_board: REVIEW` input files without forcing a new planning cycle
+merely to alter their syntax. All source identifiers shown here are fictional.
+
+The new `EXCLUDED_BOARD`, `UNMATCHED_BOARD`, and `SCOPE_CONFLICT`
+classifications are visible in the worksheet and JSON plan alongside `DIRECT`,
+`DEPENDENCY_CANDIDATE`, and `SHARED_OR_UNKNOWN`.
+
+If configured, the secondary model now evaluates only outstanding REVIEWs
+with a specific technical question, advisor validation/errors, and unresolved
+dependency or binding-consistency issues. A bare uncertainty about RHEL board
+certification does not trigger Gemma. The fallback remains opt-in and still
+**cannot silently promote a REVIEW to SKIP**. The planner does not turn
+REVIEWs into TAKEs without model evidence or an existing deterministic rule.
+The advisor prompt cache identity advances to version 21 to prevent reuse of
+older, stricter platform-policy decisions. Fewer Gemma calls are expected,
+but the actual reduction depends on your workload and primary model output.
+
 
 The planner starts with non-merge upstream commits that touch the requested
 focus paths between `--base` and `--target`. It then expands that initial set
@@ -90,7 +147,7 @@ Create a local file (see `platforms.example.yaml` for fictitious examples):
 ```yaml
 version: 1
 name: local-product-scope
-unmatched_board: SKIP
+unmatched_board: TAKE
 platforms:
   - name: Example ARM development board
     architecture: arm64
@@ -146,15 +203,23 @@ existing plan snapshots and backporter journals are never rewritten.
 - **DEPENDENCY_CANDIDATE:** Discovery provenance reaches a matching platform
   commit. The advisor must examine whether this is a *real* prerequisite;
   matching symbols, common files or a `required_by` edge alone do not prove it.
-- **OUT_OF_SCOPE_BOARD:** All changed files are unselected board-leaf
-  `.dts`/`.dtso` sources, with no known candidate link to a selected platform.
-  With `unmatched_board: SKIP` (the default), this is a deterministic advisor
-  SKIP **unless an evidence-bound inbound TAKE prerequisite exists**. Set
-  `unmatched_board: REVIEW` for a more conservative workflow.
+- **EXCLUDED_BOARD:** Explicitly excluded board-leaf `.dts`/`.dtso` changes
+  with no competing selected-platform evidence or required TAKE prerequisite.
+  Normally a deterministic SKIP; an inbound TAKE prerequisite requires advisor
+  reconciliation first.
+- **SCOPE_CONFLICT:** The same board is selected and excluded. Engineer review
+  is required to correct the user profile; no selection is silently inferred.
+- **UNMATCHED_BOARD:** Board-leaf sources not identified by either list. This
+  is not proof of unsupported hardware. The default `unmatched_board: TAKE`
+  favors inclusion when technically sound. The aggressive `SKIP` option
+  excludes such unmatched leaf changes absent an inbound TAKE prerequisite.
 - **SHARED_OR_UNKNOWN:** Shared drivers, kernel infrastructure, `.dtsi` files,
   mixed-source commits, and unclear platform ownership are not automatically
   skipped. Their technical relevance and actual prerequisites remain for the
   advisor and engineer to evaluate.
+
+The matcher also inspects `excluded_platforms` and requires all changed
+board-leaf files to be accounted for before a deterministic exclusion.
 
 The source matcher checks the **full** user profile, including when the bounded
 advisor packet previews only the first 32 applicable entries. A profile is not
@@ -164,8 +229,8 @@ for modifications to existing driver code. Matching the selected DTS's existing
 `compatible` property avoids incorrectly skipping a change that does not
 introduce a new compatible string.
 
-The worksheet includes `platform-relevance`, `platform-match` and
-`platform-candidate-root` annotations; the JSON plan records the same evidence.
+The worksheet includes `platform-relevance`, `platform-match`,
+`platform-exclusion`, and `platform-candidate-root` annotations; the JSON plan records the same evidence.
 The summary reports direct matches, dependency candidates, out-of-scope leaves,
 and shared/unknown commits. Dependency links remain **provenance only** until
 supported by specific source-level evidence and advisor reconciliation. The
@@ -391,8 +456,8 @@ Ollama server**. It never needs to keep both models resident simultaneously.
   prevent `execution_ready=true`.
 
 The `--advisor-fallback-model` switch is **opt-in**. Omitting it preserves
-single-model behavior. `--advisor-fallback-limit 0` evaluates all eligible
-cases (default); a positive cap leaves an explicit `INCOMPLETE` consistency
+single-model behavior. `--advisor-fallback-limit 0` evaluates all technical/error/dependency
+cases eligible for escalation (default), rather than every REVIEW; a positive cap leaves an explicit `INCOMPLETE` consistency
 warning if cases were skipped. The planner checks `/api/tags` before costly
 Git analysis to confirm that the fallback model is installed on Ollama.
 
@@ -437,7 +502,7 @@ keep the current Git remotes, file list and primary Qwen settings:
 ```
 
 `--advisor-fallback-limit 0` is the default and places no cap on the number
-of secondary evaluations; the run may therefore take substantially longer
+of *eligible technical* secondary evaluations; the run may therefore take substantially longer
 than Qwen-only run 26. The fallback has a longer timeout because Gemma uses
 CPU offloading. The 120000-character budget is a separate safety limit,
 not a claim that character count is a reliable token count.

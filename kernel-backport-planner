@@ -43,8 +43,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.30"
-ADVISOR_PROMPT_VERSION = "20"
+VERSION = "0.4.31"
+ADVISOR_PROMPT_VERSION = "21"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -551,6 +551,41 @@ def policy_only_review_objection(result: dict) -> bool:
             and not bool(_CONCRETE_TECHNICAL_OBJECTION.search(material)))
 
 
+_UNRESOLVED_TECHNICAL_QUESTION = re.compile(
+    r"(?:unresolved|uncertain|unknown|unclear|cannot\s+(?:verify|determine)|"
+    r"needs?\s+(?:verification|review|inspection)|missing\s+evidence).{0,100}?"
+    r"(?:dependency|prerequisite|include|header|symbol|binding|API|ABI|"
+    r"build|compile|runtime|regression|semantic|integration|driver|"
+    r"firmware|memory\s+ordering|linker|device\s+tree)", re.I | re.S
+)
+
+
+def advisor_technical_review(node: CommitNode) -> bool:
+    """Escalate a REVIEW only when it names an actionable technical question.
+
+    Ambiguity about certification or missing board matches belongs to the
+    engineer's product-scope review, not an expensive second model call.
+    Dependency/consistency blockers are independently collected by the caller.
+    """
+    material = " ".join([node.advisor_rationale, *node.advisor_risks])
+    if policy_only_review_objection({"decision": "REVIEW",
+                                      "rationale": node.advisor_rationale,
+                                      "risks": node.advisor_risks}):
+        return False
+    return bool(_CONCRETE_TECHNICAL_OBJECTION.search(material)
+                or _UNRESOLVED_TECHNICAL_QUESTION.search(material))
+
+
+def platform_policy_retry_prompt(prompt: str) -> str:
+    return (prompt + "\n\nPLATFORM POLICY RECHECK: The supplied profile is "
+            "incomplete. A board absent from it is not proven unsupported. "
+            "Do not choose REVIEW solely because official support or product "
+            "benefit is unverified. Favor TAKE for a technically sound upstream "
+            "change; use SKIP for proven exclusions and REVIEW only for a "
+            "specific unresolved technical or prerequisite question. Never "
+            "invent product support or dependency evidence.")
+
+
 def policy_retry_prompt(prompt: str) -> str:
     """Give one bounded policy correction without touching candidate evidence."""
     return (prompt + "\n\nPOLICY RECHECK: Your previous REVIEW was based on "
@@ -996,7 +1031,8 @@ class PlatformProfile:
     sha256: str
     source: str
     platforms: tuple[PlatformEntry, ...]
-    unmatched_board: str = "SKIP"
+    unmatched_board: str = "TAKE"
+    excluded_platforms: tuple[PlatformEntry, ...] = ()
 
 
 def load_platform_profile(path: str | Path) -> PlatformProfile:
@@ -1029,66 +1065,73 @@ def load_platform_profile(path: str | Path) -> PlatformProfile:
         raise ValueError("platform profile filename must end in .yaml, .yml, or .json")
     if not isinstance(obj, dict):
         raise ValueError("platform profile must be an object")
-    extra = set(obj) - {"version", "name", "platforms", "unmatched_board"}
+    extra = set(obj) - {"version", "name", "platforms", "excluded_platforms", "unmatched_board"}
     if extra or type(obj.get("version")) is not int or obj["version"] != 1:
         raise ValueError("platform profile requires version: 1 and known top-level keys; "
                          f"unknown: {sorted(extra)}")
     name = obj.get("name")
     if not isinstance(name, str) or not name.strip() or len(name) > 128:
         raise ValueError("platform profile name must be a non-empty string")
-    unmatched = obj.get("unmatched_board", "SKIP")
-    if unmatched not in ("SKIP", "REVIEW"):
-        raise ValueError("unmatched_board must be SKIP or REVIEW")
+    unmatched = obj.get("unmatched_board", "TAKE")
+    if unmatched not in ("TAKE", "SKIP", "REVIEW"):
+        raise ValueError("unmatched_board must be TAKE, SKIP or REVIEW")
     items = obj.get("platforms")
     if not isinstance(items, list) or not items:
         raise ValueError("platforms must be a non-empty list")
-    platforms = []
     names = set()
-    for index, item in enumerate(items, 1):
-        label = f"platforms[{index}]"
-        if not isinstance(item, dict):
-            raise ValueError(f"{label} must be an object")
-        bad = set(item) - {"name", "architecture", "paths", "identifiers"}
-        if bad:
-            raise ValueError(f"{label} unknown keys: {sorted(bad)}")
-        platform_name, arch = item.get("name"), item.get("architecture")
-        if not isinstance(platform_name, str) or not platform_name.strip() or len(platform_name) > 128:
-            raise ValueError(f"{label}.name must be a non-empty string")
-        if platform_name in names:
-            raise ValueError(f"duplicate platform name: {platform_name}")
-        names.add(platform_name)
-        if not isinstance(arch, str) or arch not in KNOWN_KERNEL_ARCHITECTURES:
-            raise ValueError(f"{label}.architecture must be a kernel arch directory")
-        identifiers = item.get("identifiers", {})
-        if not isinstance(identifiers, dict):
-            raise ValueError(f"{label}.identifiers must be an object")
-        unknown_ids = set(identifiers) - {"dt_compatible", "acpi_hid", "pci_id"}
-        if unknown_ids:
-            raise ValueError(f"{label} unknown identifiers: {sorted(unknown_ids)}")
-        def strings(value, field):
-            if not isinstance(value, list) or not all(
-                isinstance(v, str) and 0 < len(v.strip()) <= 256 and v == v.strip()
-                for v in value
-            ):
-                raise ValueError(f"{label}.{field} must be a list of nonempty strings")
-            if len(set(value)) != len(value):
-                raise ValueError(f"{label}.{field} contains duplicate entries")
-            return tuple(value)
-        paths = strings(item.get("paths", []), "paths")
-        for pattern in paths:
-            if pattern.startswith("/") or ".." in pattern.split("/") or "\\" in pattern:
-                raise ValueError(f"unsafe repository-relative path pattern: {pattern}")
-        dt = strings(identifiers.get("dt_compatible", []), "identifiers.dt_compatible")
-        acpi = strings(identifiers.get("acpi_hid", []), "identifiers.acpi_hid")
-        pci = strings(identifiers.get("pci_id", []), "identifiers.pci_id")
-        for identifier in pci:
-            if not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", identifier):
-                raise ValueError(f"{label}.identifiers.pci_id expected vvvv:dddd: {identifier}")
-        if not (paths or dt or acpi or pci):
-            raise ValueError(f"{label} needs paths or hardware identifiers")
-        platforms.append(PlatformEntry(platform_name, arch, paths, dt, acpi, pci))
+    def parse_entries(entries: list, key: str) -> tuple[PlatformEntry, ...]:
+        parsed = []
+        for index, item in enumerate(entries, 1):
+            label = f"{key}[{index}]"
+            if not isinstance(item, dict):
+                raise ValueError(f"{label} must be an object")
+            bad = set(item) - {"name", "architecture", "paths", "identifiers"}
+            if bad:
+                raise ValueError(f"{label} unknown keys: {sorted(bad)}")
+            platform_name, arch = item.get("name"), item.get("architecture")
+            if not isinstance(platform_name, str) or not platform_name.strip() or len(platform_name) > 128:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            if platform_name in names:
+                raise ValueError(f"duplicate platform name: {platform_name}")
+            names.add(platform_name)
+            if not isinstance(arch, str) or arch not in KNOWN_KERNEL_ARCHITECTURES:
+                raise ValueError(f"{label}.architecture must be a kernel arch directory")
+            identifiers = item.get("identifiers", {})
+            if not isinstance(identifiers, dict):
+                raise ValueError(f"{label}.identifiers must be an object")
+            unknown_ids = set(identifiers) - {"dt_compatible", "acpi_hid", "pci_id"}
+            if unknown_ids:
+                raise ValueError(f"{label} unknown identifiers: {sorted(unknown_ids)}")
+            def strings(value, field):
+                if not isinstance(value, list) or not all(
+                    isinstance(v, str) and 0 < len(v.strip()) <= 256 and v == v.strip()
+                    for v in value
+                ):
+                    raise ValueError(f"{label}.{field} must be a list of nonempty strings")
+                if len(set(value)) != len(value):
+                    raise ValueError(f"{label}.{field} contains duplicate entries")
+                return tuple(value)
+            paths = strings(item.get("paths", []), "paths")
+            for pattern in paths:
+                if pattern.startswith("/") or ".." in pattern.split("/") or "\\" in pattern:
+                    raise ValueError(f"unsafe repository-relative path pattern: {pattern}")
+            dt = strings(identifiers.get("dt_compatible", []), "identifiers.dt_compatible")
+            acpi = strings(identifiers.get("acpi_hid", []), "identifiers.acpi_hid")
+            pci = strings(identifiers.get("pci_id", []), "identifiers.pci_id")
+            for identifier in pci:
+                if not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", identifier):
+                    raise ValueError(f"{label}.identifiers.pci_id expected vvvv:dddd: {identifier}")
+            if not (paths or dt or acpi or pci):
+                raise ValueError(f"{label} needs paths or hardware identifiers")
+            parsed.append(PlatformEntry(platform_name, arch, paths, dt, acpi, pci))
+        return tuple(parsed)
+    platforms = parse_entries(items, "platforms")
+    excluded_items = obj.get("excluded_platforms", [])
+    if not isinstance(excluded_items, list):
+        raise ValueError("excluded_platforms must be a list")
+    excluded = parse_entries(excluded_items, "excluded_platforms")
     return PlatformProfile(name.strip(), hashlib.sha256(raw).hexdigest(),
-                           str(source), tuple(platforms), unmatched)
+                           str(source), platforms, unmatched, excluded)
 
 
 class Planner:
@@ -1122,6 +1165,7 @@ class Planner:
         self.platform_profile = (load_platform_profile(args.platforms)
                                  if getattr(args, "platforms", None) else None)
         self._platform_match_cache: dict[str, list[dict[str, str]]] = {}
+        self._platform_excluded_match_cache: dict[str, list[dict[str, str]]] = {}
         self._platform_patch_line_cache: dict[str, str] = {}
         self.nodes: dict[str, CommitNode] = {}
         self.downstream_index = DownstreamIndex()
@@ -1331,31 +1375,43 @@ class Planner:
         node = self.nodes[sha]
         files = node.files or self.changed_files(sha)
         matches = self._platform_matches(sha, files)
+        excluded = self._platform_excluded_matches(sha, files)
         roots = self._platform_candidate_roots(sha) if not matches else []
         board_only = bool(files) and all(
             re.fullmatch(r"arch/[^/]+/boot/dts/.+\.dts(?:o)?", path)
             for path in files
         )
-        if matches:
+        excluded_board = (board_only and bool(excluded) and
+                          self._excluded_board_covers_all(sha, files, excluded))
+        # A user can supply overlapping positive and negative globs. Do not
+        # silently choose one side when the scopes contradict each other.
+        if matches and excluded_board:
+            status = "SCOPE_CONFLICT"
+        elif matches:
             status = "DIRECT"
         elif roots:
             status = "DEPENDENCY_CANDIDATE"
+        elif excluded_board:
+            status = "EXCLUDED_BOARD"
         elif board_only:
-            status = "OUT_OF_SCOPE_BOARD"
+            status = "UNMATCHED_BOARD"
         else:
             status = "SHARED_OR_UNKNOWN"
         return {
             "status": status,
             "matches": matches,
+            "excluded_matches": excluded,
             "candidate_roots": roots,
             "board_leaf_only": board_only,
+            "scope_conflict": status == "SCOPE_CONFLICT",
             "note": (
-                "Matching a configured path or added identifier is positive scope "
-                "evidence, not certification or proof that a fix is required. "
-                "Candidate roots are connected by deterministic discovery "
-                "provenance only, not verified semantic prerequisites. "
-                "Shared code and ambiguous platform relationships must not be "
-                "excluded solely because they do not name a listed board."
+                "Positive and negative matches are user-specified scope evidence, "
+                "not proof of support or of technical necessity. Explicit exclusions "
+                "apply only to fully identified board-leaf commits, not shared code. "
+                "Consumer roots are provenance, not verified prerequisites; "
+                "evidence-bound TAKE dependencies override exclusions. "
+                "Unknown board or shared-code scope is not a reason for REVIEW "
+                "or SKIP without a concrete technical issue."
             ),
         }
 
@@ -1364,10 +1420,50 @@ class Planner:
             return self._platform_match_cache[sha]
         profile = self.platform_profile
         assert profile is not None
+        result = self._platform_matches_for_entries(sha, files, profile.platforms)
+        self._platform_match_cache[sha] = result
+        return result
+
+    def _platform_excluded_matches(self, sha: str, files: Sequence[str]) -> list[dict[str, str]]:
+        cache = getattr(self, "_platform_excluded_match_cache", None)
+        if cache is None:
+            cache = self._platform_excluded_match_cache = {}
+        if sha not in cache:
+            profile = self.platform_profile
+            assert profile is not None
+            cache[sha] = self._platform_matches_for_entries(
+                sha, files, profile.excluded_platforms)
+        return cache[sha]
+
+    def _excluded_board_covers_all(self, sha: str, files: Sequence[str],
+                                   matches: list[dict[str, str]]) -> bool:
+        """Only exclude a board-leaf change when *every* changed file is
+        identified by an explicit exclusion; never exclude mixed board sets.
+        """
+        assert self.platform_profile is not None
+        excluded = {entry.name: entry for entry in
+                    self.platform_profile.excluded_platforms}
+        for path in files:
+            if any(item["evidence"].startswith(f"path:{path} (pattern ")
+                   for item in matches):
+                continue
+            if any(self._platform_source_has_compatible(sha, path, ident)
+                   for entry in excluded.values()
+                   for ident in entry.dt_compatible):
+                continue
+            # A literal added in patch text alone can be a comment or example.
+            # Negative policy needs a path match or a real DT compatible
+            # property from the complete source, not that weak string match.
+            return False
+        return True
+
+    def _platform_matches_for_entries(
+        self, sha: str, files: Sequence[str], entries: Sequence[PlatformEntry]
+    ) -> list[dict[str, str]]:
         archs = set(self._architecture_dirs(files))
         # Shared code has no arch ownership, so permit matching identifiers
         # there; a source path owned by a different arch is not a match.
-        eligible = [p for p in profile.platforms if not archs or p.architecture in archs]
+        eligible = [p for p in entries if not archs or p.architecture in archs]
         result: list[dict[str, str]] = []
         for platform in eligible:
             for path in files:
@@ -1405,7 +1501,6 @@ class Planner:
                         r"\s*,\s*0x" + device + r"\b", added, re.I):
                         result.append({"platform": platform.name,
                                        "evidence": f"added-pci-id:{ident}"})
-        self._platform_match_cache[sha] = result
         return result
 
     def _platform_source_has_compatible(self, sha: str, path: str, ident: str) -> bool:
@@ -1473,6 +1568,9 @@ class Planner:
             "name": profile.name,
             "sha256": profile.sha256,
             "platform_count": len(profile.platforms),
+            "excluded_platform_count": len(profile.excluded_platforms),
+            "excluded_platforms": [p.as_dict() for p in profile.excluded_platforms[:16]],
+            "excluded_platforms_truncated": len(profile.excluded_platforms) > 16,
             "unmatched_board": profile.unmatched_board,
             "applicable_platform_count": len(relevant),
             "applicable_platforms": displayed,
@@ -2689,7 +2787,11 @@ class Planner:
                 default_bias = "PLATFORM_MATCH"
             elif relevance["status"] == "DEPENDENCY_CANDIDATE":
                 default_bias = "VERIFY_PLATFORM_PREREQUISITE"
-            elif relevance["status"] == "OUT_OF_SCOPE_BOARD":
+            elif relevance["status"] == "EXCLUDED_BOARD":
+                default_bias = "EXPLICITLY_EXCLUDED_BOARD"
+            elif relevance["status"] == "SCOPE_CONFLICT":
+                default_bias = "CONFLICTING_PLATFORM_SCOPE"
+            elif relevance["status"] == "UNMATCHED_BOARD":
                 default_bias = "UNMATCHED_BOARD_LEAF"
             else:
                 default_bias = "SHARED_OR_UNKNOWN_RELEVANCE"
@@ -2781,8 +2883,11 @@ class Planner:
                 "Use user-selected platform scope as the source of truth for product "
                 "relevance. Retain needed shared-code fixes and evidence-bound "
                 "prerequisites; do not equate architecture support with board support. "
-                "Treat unmatched board-leaf changes as out of scope unless a selected "
-                "platform requires them. Do not treat provenance edges as proof."
+                "Only explicit exclusions prove a board is outside user scope; "
+                "unlisted boards and shared code are not excluded by absent matches. "
+                "Favor TAKE for technically sound upstream changes; use REVIEW only "
+                "for specific unresolved technical or dependency questions. "
+                "Do not treat provenance edges as proof."
             )
             packet["commit"]["platform_relevance"] = relevance
         return packet
@@ -2799,20 +2904,34 @@ class Planner:
         reconciliation instead of overriding it.
         """
         commit = packet["commit"]
+        relevance = commit.get("platform_relevance") or {}
+        if relevance.get("status") == "SCOPE_CONFLICT":
+            return {
+                "decision": "REVIEW",
+                "rationale": (
+                    "User platform profile selects and excludes the same board "
+                    "source. Resolve conflicting profile entries before deciding "
+                    "which changes are in scope."
+                ),
+                "prerequisite_peers": [],
+                "inbound_prerequisite_assessments": [],
+                "risks": [],
+            }
         if commit.get("actual_inbound_take_prerequisite_count", 0):
             return None
-        relevance = commit.get("platform_relevance") or {}
         profile = getattr(self, "platform_profile", None)
-        if (profile is not None and relevance.get("status") == "OUT_OF_SCOPE_BOARD"
-                and profile.unmatched_board == "SKIP"):
+        if (profile is not None and
+                (relevance.get("status") == "EXCLUDED_BOARD" or
+                 (relevance.get("status") == "UNMATCHED_BOARD" and
+                  profile.unmatched_board == "SKIP"))):
             return {
                 "decision": "SKIP",
                 "rationale": (
-                    "User-supplied platform profile: this commit changes only "
-                    "board-leaf DTS/DTSO files, matches no configured platform "
-                    "path or added hardware identifier, and has no recorded "
-                    "consumer path to a configured platform. The profile's "
-                    "unmatched_board policy is SKIP."
+                    "User-supplied platform policy: this commit changes only "
+                    "board-leaf DTS/DTSO files without a configured positive "
+                    "platform match or required TAKE prerequisite. It is "
+                    "explicitly excluded by the profile, or the engineer set "
+                    "unmatched_board: SKIP (aggressive unlisted-board policy)."
                 ),
                 "prerequisite_peers": [],
                 "inbound_prerequisite_assessments": [],
@@ -3021,8 +3140,9 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
         prompt = prompt.replace(
             "Ordinary lack of product relevance or affirmative hardware support "
             "is NOT material uncertainty here.",
-            "An unresolved relationship to user-selected platforms that would "
-            "alter commit selection is a valid technical reason for REVIEW."
+            "Absence of evidence linking a board to selected platforms does "
+            "not justify REVIEW or SKIP by itself. REVIEW requires a specific "
+            "technical or prerequisite uncertainty, not missing certification."
         )
         start = prompt.index("Maintenance policy:")
         end = prompt.index("Same-series prerequisite policy:", start)
@@ -3031,9 +3151,13 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
   product platforms. A supported kernel architecture does not imply that every
   board using it is relevant. Product support is user input, not an official
   certification claim from this tool.
-- Prioritize well-founded changes affecting configured platforms, their actual
-  required prerequisites, and useful common/subsystem fixes. Do not select
-  unselected board-only enablement solely to minimize upstream divergence.
+- Prioritize changes affecting configured platforms, their actual required
+  prerequisites, and useful common/subsystem fixes. For unlisted boards,
+  maintain the ordinary upstream-convergence TAKE bias when technically sound;
+  absence from an incomplete list is neither exclusion nor REVIEW evidence.
+- The optional excluded_platforms list is explicit negative *user scope*.
+  Reject exclusively excluded board-leaf commits absent a verified TAKE need.
+  Conflicting positive and negative scope evidence requires engineer review.
 - A required dependency can be common infrastructure outside the configured
   board paths. Retain it when source and explicit prerequisite evidence show
   the relationship. Deterministic consumer provenance alone is not proof.
@@ -3045,8 +3169,9 @@ The response must match the supplied JSON schema. Keep rationale concise and tec
   do not prove that a dependency is needed.
 - A replay conflict is an integration-cost signal, not an automatic SKIP.
   Preserve substantive TAKE decisions and describe ordinary conflicts as risks.
-- For unknown mixed/shared-code relevance, use concrete technical evidence;
-  select REVIEW when the uncertainty would materially alter the backport set.
+- REVIEW only for a concrete unresolved technical or dependency question.
+  Missing affirmative product support, unknown board ownership, and generic
+  feature relevance do not qualify; favor TAKE when technically sound.
 
 """ + prompt[end:])
         return prompt + """
@@ -3062,20 +3187,24 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
   relationship is provenance, NOT a verified prerequisite.
 - For PLATFORM_MATCH, favor TAKE when technically justified. Evaluate the
   actual changed code rather than treating every matching file as necessary.
-- For UNMATCHED_BOARD_LEAF, skip changes confined to unselected board DTS/DTSO
-  leaf files when no concrete required TAKE-consumer prerequisite exists. Do
-  not treat generic upstream alignment as justification for taking these.
+- For EXPLICITLY_EXCLUDED_BOARD, SKIP only fully identified excluded board
+  leaf changes when no evidence-bound TAKE prerequisite requires them.
+- For CONFLICTING_PLATFORM_SCOPE, REVIEW until the user corrects overlapping
+  positive and negative scope rules. Do not infer official product support.
+- For UNMATCHED_BOARD_LEAF, missing from the allowlist is not proof of
+  unsupported hardware. Favor TAKE for technically sound changes unless the
+  user explicitly configures the aggressive unmatched_board: SKIP policy.
 - For VERIFY_PLATFORM_PREREQUISITE, inspect the actual code/prerequisite
   evidence. TAKE a shared/provider commit when necessary for a selected
   platform change. Do NOT take it based only on a provenance edge.
-- For SHARED_OR_UNKNOWN_RELEVANCE, preserve genuine generic subsystem fixes
-  and infrastructure. Lack of a named-board match alone is not SKIP evidence.
-  If platform relevance matters but cannot be determined from the packet,
-  choose REVIEW and name the missing technical relationship.
+- For SHARED_OR_UNKNOWN_RELEVANCE, favor TAKE for technically sound generic
+  subsystem fixes and infrastructure. Missing board-specific evidence alone
+  is neither SKIP nor REVIEW evidence. Use REVIEW for a specific unresolved
+  technical hazard or prerequisite question, naming exactly what is missing.
 - Never SKIP an evidence-bound REQUIRED prerequisite for an already-TAKE
   consumer. Reconcile conflicting recommendations using the existing rules.
-- In this mode, an unresolved platform-scope question is a legitimate REVIEW;
-  the ordinary upstream-convergence policy retry does not apply.
+- A pure platform-scope question is NOT a technical REVIEW reason. Apply
+  the same bounded policy recheck used for the upstream-convergence policy.
 """
 
     @staticmethod
@@ -3469,7 +3598,9 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 request_prompt = prompt
                 if last_error is not None:
                     if last_error.kind == "policy-review":
-                        request_prompt = policy_retry_prompt(prompt)
+                        request_prompt = (platform_policy_retry_prompt(prompt)
+                            if getattr(self, "platform_profile", None) else
+                            policy_retry_prompt(prompt))
                     elif last_error.kind in ("binding-unassessed",
                                                    "binding-source-claim"):
                         # Include the validator's exact evidence IDs for both
@@ -3485,12 +3616,10 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 validated = self.validate_advisor_result(sha, raw)
                 # Guard against a recurring policy misread by small models.
                 # Neither convert REVIEW to TAKE nor suppress concrete risks.
-                if (not getattr(self, "platform_profile", None)
-                        and policy_only_review_objection(validated)):
+                if policy_only_review_objection(validated):
                     raise AdvisorError(
-                        "REVIEW cites absent official platform/product benefit "
-                        "without a specific technical uncertainty; recheck "
-                        "upstream-convergence policy",
+                        "REVIEW cites missing product/platform support without "
+                        "a specific technical uncertainty; recheck policy",
                         kind="policy-review", retryable=True)
                 hard_dt = self._advisor_hard_dt_include_facts(sha)
                 if (hard_dt and validated["decision"] != "TAKE"
@@ -4208,10 +4337,8 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             consumer.advisor_consistency_warnings.append({"role": "consumer", **issue})
 
     def _advisor_fallback_candidates(self) -> list[tuple[str, list[str]]]:
-        """Prioritize graph blockers, then all outstanding REVIEW decisions.
-
-        A full dual-model run covers every outstanding REVIEW unless the user
-        explicitly limits escalations. This is NOT a forced TAKE conversion.
+        """Escalate concrete technical uncertainty, validator failures and
+        verified dependency blockers, not mere lack of platform support data.
         """
         reasons: dict[str, set[str]] = collections.defaultdict(set)
         blockers: collections.Counter[str] = collections.Counter()
@@ -4227,8 +4354,8 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         for sha, node in self.nodes.items():
             if not self.is_actionable_node(node) or node.match.status != "missing":
                 continue
-            if node.advisor_decision == "REVIEW":
-                reasons[sha].add("review")
+            if node.advisor_decision == "REVIEW" and advisor_technical_review(node):
+                reasons[sha].add("technical-review")
             if node.advisor_error_kind:
                 reasons[sha].add("advisor-error:" + node.advisor_error_kind)
         chosen = [(sha, sorted(why)) for sha, why in reasons.items()
@@ -5654,14 +5781,16 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         profile = getattr(self, "platform_profile", None)
         if profile:
             lines.append(f"platform-profile: {profile.name} "
-                         f"({len(profile.platforms)} platforms; sha256 {profile.sha256[:12]})")
+                         f"({len(profile.platforms)} selected, "
+                         f"{len(profile.excluded_platforms)} excluded; "
+                         f"sha256 {profile.sha256[:12]})")
             counts = collections.Counter(
                 self.platform_relevance(n.sha)["status"] for n in actionable
                 if n.match.status == "missing")
             lines.append("platform-scope: " + ", ".join(
                 f"{key}={counts.get(key, 0)}" for key in
-                ("DIRECT", "DEPENDENCY_CANDIDATE", "OUT_OF_SCOPE_BOARD",
-                 "SHARED_OR_UNKNOWN")))
+                ("DIRECT", "DEPENDENCY_CANDIDATE", "EXCLUDED_BOARD",
+                 "SCOPE_CONFLICT", "UNMATCHED_BOARD", "SHARED_OR_UNKNOWN")))
         if getattr(self, "advisor_model", None):
             advised_nodes = [n for n in actionable if n.advisor_decision]
             successful = [n for n in advised_nodes if not n.advisor_error]
@@ -5798,6 +5927,9 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 for match in relevance["matches"]:
                     lines.extend(self._worksheet_advisor_lines(
                         "platform-match", match["platform"] + " " + match["evidence"]))
+                for match in relevance["excluded_matches"]:
+                    lines.extend(self._worksheet_advisor_lines(
+                        "platform-exclusion", match["platform"] + " " + match["evidence"]))
                 for root in relevance["candidate_roots"]:
                     lines.extend(self._worksheet_advisor_lines(
                         "platform-candidate-root", root["sha"][:12] + " " +
@@ -6091,6 +6223,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "sha256": profile.sha256,
                 "source": profile.source,
                 "platform_count": len(profile.platforms),
+                "excluded_platform_count": len(profile.excluded_platforms),
                 "unmatched_board": profile.unmatched_board,
             }
             for sha, item in payload["commits"].items():
