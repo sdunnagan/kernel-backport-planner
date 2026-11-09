@@ -5,7 +5,93 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.31**.
+Current tool version: **0.4.33**.
+
+## OpenAI structured-output preflight (0.4.33)
+
+With `--advisor=openai`, normal planning performs a **small billable OpenAI
+preflight before creating a numbered planning directory or indexing Git**.
+It sends a synthetic input with the same Responses API Structured Outputs
+schema used by advisor evaluations. It checks the chosen model's availability,
+credentials, billing access, and ability to return a valid structured result.
+The actual response is discarded; no kernel data is transmitted by this check.
+
+To verify the setup independently, without doing a full planning run:
+
+```bash
+"$KERNEL_BACKPORT_PLANNER" \
+    --advisor=openai --advisor-model gpt-6.1-sol \
+    --advisor-preflight-only
+```
+
+This also checks an OpenAI fallback model if one is configured. On failure,
+planning aborts before the costly collection and without consuming a planning
+cycle. Local Ollama-only runs do not contact OpenAI. This is a connectivity and
+JSON-contract smoke test, **not** proof that a full kernel prompt fits model
+limits or that the model's real recommendations are correct. Every normal
+cloud planning run does one fresh preflight (a small additional API charge).
+
+## OpenAI API advisor (0.4.32)
+
+Inference is **local Ollama by default**. To opt into OpenAI, supply
+`--advisor=openai` and an `OPENAI_API_KEY` environment variable. The primary
+model defaults to `gpt-6.1-terra` when `--advisor-model` is omitted; you may
+choose another model available to your API account. This implementation uses
+OpenAI's **Responses API** directly via the Python standard library and
+Structured Outputs with the planner's existing evidence validations. There is
+no additional Python dependency. `store=false` is sent with each request.
+
+**A small evaluation first, not a full rebase:**
+
+```bash
+# Prefer an approved secret manager; for an interactive Bash session:
+read -rsp 'OpenAI API key: ' OPENAI_API_KEY; echo
+export OPENAI_API_KEY
+
+"$KERNEL_BACKPORT_PLANNER" \
+    --advisor=openai --advisor-model gpt-6.1-terra \
+    --advisor-benchmark-plan "$HOME/backport_plan.json" \
+    --benchmark-output "$HOME/openai-benchmark.jsonl" \
+    --advisor-limit 10 \
+    --repo "$HOME/projects/my-workspace/centos-stream-10"
+```
+
+Benchmark mode reconstructs evidence from the saved plan and local Git: it is
+**not** a full reproduction of the original advisor packets. For the most
+rigorous comparison use `--advisor-replay-trace` with an original advisor trace;
+those saved packets include the original system prompt and evidence.
+
+For a new full run, use `--advisor=openai --advisor-model gpt-6.1-terra`
+with the same base, target, repository, platform profile, and other planning
+flags as before. Optional hybrid routing keeps Qwen local and sends **only
+fallback cases** to OpenAI:
+
+```bash
+--advisor=ollama --advisor-model kernel-planner:32k \
+--advisor-base-url http://gondor:11434 \
+--advisor-fallback-provider openai \
+--advisor-fallback-model gpt-6.1-sol
+```
+
+The OpenAI output-token limit is controlled by `--openai-max-output-tokens`
+(default 8192, including reasoning tokens). Your existing per-request timeout,
+request-character budget, policy retry, prerequisite validation, and trace
+handling are retained. Authentication/model-access and exhausted-credit errors
+stop the full planner rather than generating a thousand invalid REVIEWs. Local Ollama settings such as `--advisor-keep-alive`
+are ignored for OpenAI requests. Cache keys distinguish provider and model.
+
+**Security and cost:** This feature is opt-in and does not upload anything
+until an OpenAI model is selected. OpenAI receives the advisor system prompt,
+commit metadata, patch excerpts, dependency evidence, and relevant platform
+profile details that appear in its packets. Set an API project budget and use
+`--advisor-limit` / `--advisor-fallback-limit` for controlled evaluations.
+Do not send confidential Red Hat material to a personal API account without
+explicit authorization. `--advisor-trace` captures raw evidence and responses
+locally, so its output deserves equal protection. `store=false` prevents
+storing API responses for later retrieval; it does **not** by itself establish
+zero retention, an employment-policy exception, or permission to send
+confidential material. Model decisions are still recommendations, not verified
+hardware-support determinations.
 
 ## Platform scope and selective fallback (0.4.31)
 

@@ -2773,10 +2773,6 @@ class Packaging0415Tests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Performance0416Tests(unittest.TestCase):
     """Performance measurements must be durable and avoid payload leakage."""
 
@@ -5058,3 +5054,281 @@ class ScopeAndFallback0431Tests(unittest.TestCase):
         self.assertIn("unknown board", prompt.lower())
         self.assertIn("PLATFORM POLICY RECHECK",
                       kbp.platform_policy_retry_prompt("original"))
+
+class OpenAIAdvisor0432Tests(unittest.TestCase):
+    def sample_response(self, content=None, status='completed'):
+        if content is None:
+            content = {
+                'decision': 'TAKE', 'rationale': 'Confirmed upstream dependency.',
+                'prerequisite_evidence_ids': [], 'binding_evidence_assessments': [],
+                'inbound_prerequisite_assessments': [], 'risks': [],
+            }
+        return {
+            'status': status,
+            'usage': {'input_tokens': 1234, 'output_tokens': 456},
+            'output': [{'type': 'reasoning', 'summary': []},
+                       {'type': 'message', 'content': [
+                           {'type': 'output_text', 'text': json.dumps(content)}]}],
+        }
+
+    def fake_urlopen(self, result, requests):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return json.dumps(result).encode('utf-8')
+        def fn(request, timeout):
+            requests.append((request, timeout))
+            return Response()
+        return fn
+
+    def test_provider_flag_and_model_defaults(self):
+        args = kbp.parse_args(['--base', 'v6.19', '--target', 'v7.0', '--advisor=openai', '--advisor-limit', '3'])
+        self.assertEqual(args.advisor, 'openai')
+        self.assertEqual(args.advisor_model, 'gpt-6.1-terra')
+        self.assertEqual(args.advisor_fallback_provider, 'ollama')
+        args = kbp.parse_args(['--base', 'v6.19', '--target', 'v7.0', '--advisor-model', 'kernel-planner:32k',
+                               '--advisor-fallback-provider', 'openai',
+                               '--advisor-fallback-model', 'gpt-6.1-sol'])
+        self.assertIsInstance(kbp.make_advisor_client(args, args.advisor_model),
+                              kbp.OllamaAdvisor)
+        self.assertIsInstance(kbp.make_advisor_client(args, args.advisor_fallback_model,
+                                                     fallback=True), kbp.OpenAIAdvisor)
+        with mock.patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                kbp.parse_args(['--base', 'v6.19', '--target', 'v7.0', '--advisor=openai', '--openai-max-output-tokens', '0'])
+
+    def test_request_stateless_secret_not_in_payload_and_strict_schema(self):
+        sent = []
+        advisor = kbp.OpenAIAdvisor('gpt-6.1-terra', 30, 5000)
+        response = self.sample_response()
+        schema = kbp.advisor_response_schema([], [])
+        with mock.patch.dict(kbp.os.environ, {'OPENAI_API_KEY': 'secret-test-key'}):
+            with mock.patch.object(kbp.urllib.request, 'urlopen',
+                                   side_effect=self.fake_urlopen(response, sent)):
+                answer = advisor.advise('Follow evidence.',
+                                        {'commit': {'sha': 'a'*40}}, schema)
+        self.assertEqual(answer['decision'], 'TAKE')
+        req, timeout = sent[0]
+        self.assertEqual(req.full_url, 'https://api.openai.com/v1/responses')
+        self.assertEqual(timeout, 30)
+        self.assertEqual(req.get_header('Authorization'), 'Bearer secret-test-key')
+        payload = json.loads(req.data)
+        self.assertNotIn('secret-test-key', json.dumps(payload))
+        self.assertIs(payload['store'], False)
+        self.assertEqual(payload['model'], 'gpt-6.1-terra')
+        self.assertEqual(payload['max_output_tokens'], 5000)
+        self.assertTrue(payload['text']['format']['strict'])
+        self.assertNotIn('uniqueItems', json.dumps(payload['text']['format']['schema']))
+        self.assertNotIn('maxItems', json.dumps(payload['text']['format']['schema']))
+        self.assertEqual(advisor.last_telemetry['prompt_eval_count'], 1234)
+        self.assertEqual(advisor.last_telemetry['eval_count'], 456)
+        self.assertIn('schema', json.dumps(payload))
+        self.assertIn('Follow evidence.', payload['instructions'])
+
+    def test_missing_api_key_fails_before_call(self):
+        advisor = kbp.OpenAIAdvisor('gpt-6.1-terra', 10)
+        with mock.patch.dict(kbp.os.environ, {}, clear=True):
+            with mock.patch.object(kbp.urllib.request, 'urlopen') as network:
+                with self.assertRaises(kbp.AdvisorError) as ctx:
+                    advisor.advise('test', {})
+        self.assertEqual(ctx.exception.kind, 'configuration')
+        network.assert_not_called()
+
+    def test_incomplete_response_requires_retry_or_review(self):
+        advisor = kbp.OpenAIAdvisor('gpt-6.1-terra', 10)
+        with mock.patch.dict(kbp.os.environ, {'OPENAI_API_KEY': 'test'}):
+            with mock.patch.object(kbp.urllib.request, 'urlopen',
+                    side_effect=self.fake_urlopen(self.sample_response(status='incomplete'), [])):
+                with self.assertRaises(kbp.AdvisorError) as ctx:
+                    advisor.advise('test', {})
+        self.assertEqual(ctx.exception.kind, 'invalid-response')
+
+    def test_http_quota_not_retryable_but_rate_limit_is(self):
+        import urllib.error
+        advisor = kbp.OpenAIAdvisor('gpt-6.1-terra', 10)
+        for code, body, retriable in [(429, b'{"error":{"code":"slow_down"}}', True),
+                                      (429, b'{"error":{"code":"credit_balance_exhausted"}}', False),
+                                      (401, b'{"error":{"code":"invalid_api_key"}}', False)]:
+            exc = urllib.error.HTTPError('https://api.openai.com/v1/responses', code,
+                                          'error', {}, io.BytesIO(body))
+            with mock.patch.dict(kbp.os.environ, {'OPENAI_API_KEY': 'test'}):
+                with mock.patch.object(kbp.urllib.request, 'urlopen', side_effect=exc):
+                    with self.assertRaises(kbp.AdvisorError) as ctx:
+                        advisor.advise('test', {})
+            self.assertEqual(ctx.exception.retryable, retriable)
+            if not retriable:
+                self.assertEqual(ctx.exception.kind, 'configuration')
+
+    def test_cloud_fallback_skips_ollama_model_discovery(self):
+        args = kbp.parse_args(['--base', 'v6.19', '--target', 'v7.0', '--advisor-model', 'kernel-planner:32k',
+            '--advisor-fallback-provider', 'openai',
+            '--advisor-fallback-model', 'gpt-6.1-terra'])
+        with mock.patch.dict(kbp.os.environ, {'OPENAI_API_KEY': 'test'}):
+            with mock.patch.object(kbp, 'verify_advisor_fallback_model') as verify:
+                with mock.patch.object(kbp, 'PerformanceRecorder'):
+                    # Trigger early exit after preflight to avoid an expensive run.
+                    with mock.patch.object(kbp, 'Git', side_effect=RuntimeError('stop')):
+                        with self.assertRaises(Exception):
+                            kbp.run_planner(args)
+                verify.assert_not_called()
+
+    def test_cache_identity_separates_providers(self):
+        planner = object.__new__(kbp.Planner)
+        planner.advisor_model = 'same-model-name'
+        planner.base, planner.target, planner.downstream = 'a', 'b', 'c'
+        planner._advisor_stage = 'primary'
+        planner.args = types.SimpleNamespace(advisor='ollama',
+                                             advisor_fallback_provider='openai')
+        local = planner.advisor_cache_key('a' * 40, {'evidence': 'same'})
+        planner.args.advisor = 'openai'
+        cloud = planner.advisor_cache_key('a' * 40, {'evidence': 'same'})
+        self.assertNotEqual(local, cloud)
+        planner._advisor_stage = 'fallback'
+        self.assertEqual(cloud, planner.advisor_cache_key('a'*40, {'evidence': 'same'}))
+
+    def test_openai_preflight_before_git_work(self):
+        args = kbp.parse_args(['--base', 'v6.19', '--target', 'v7.0',
+                               '--advisor=openai'])
+        with mock.patch.dict(kbp.os.environ, {}, clear=True):
+            with mock.patch.object(kbp, 'Git') as git:
+                with self.assertRaises(SystemExit) as ctx:
+                    kbp.run_planner(args)
+                self.assertIn('OPENAI_API_KEY', str(ctx.exception))
+                git.assert_not_called()
+
+
+class OpenAIAdvisor0433PreflightTests(unittest.TestCase):
+    @staticmethod
+    def response(content=None, status="completed"):
+        if content is None:
+            content = {"decision": "REVIEW", "rationale": "API preflight successful",
+                "prerequisite_evidence_ids": [],
+                "binding_evidence_assessments": [],
+                "inbound_prerequisite_assessments": [], "risks": []}
+        return {"status": status, "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps(content)}]}]}
+
+    @staticmethod
+    def fake_urlopen(payload, sent):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return json.dumps(payload).encode("utf-8")
+        def call(request, timeout):
+            sent.append((request, timeout))
+            return Response()
+        return call
+
+    def test_preflight_only_sends_real_schema_not_kernel_data(self):
+        args = kbp.parse_args(["--advisor=openai", "--advisor-model", "gpt-6.1-sol",
+                               "--advisor-preflight-only"])
+        sent = []
+        with mock.patch.dict(kbp.os.environ, {"OPENAI_API_KEY": "secret-test-key"}):
+            with mock.patch.object(kbp.urllib.request, "urlopen",
+                    side_effect=self.fake_urlopen(self.response(), sent)):
+                with mock.patch.object(kbp, "Git") as git:
+                    with mock.patch.object(kbp, "reserve_workspace_run") as reserve:
+                        self.assertEqual(kbp.main(["--advisor=openai", "--advisor-model",
+                            "gpt-6.1-sol", "--advisor-preflight-only"]), 0)
+                        git.assert_not_called()
+                        reserve.assert_not_called()
+        self.assertEqual(len(sent), 1)
+        request, timeout = sent[0]
+        body = json.loads(request.data)
+        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertIs(body["store"], False)
+        self.assertTrue(body["text"]["format"]["strict"])
+        self.assertEqual(body["text"]["format"]["schema"],
+                         kbp.openai_compatible_schema(kbp.advisor_response_schema([], [])))
+        self.assertTrue(body["input"].find('"preflight":true') >= 0
+                        or '"preflight": true' in body["input"])
+        self.assertNotIn("secret-test-key", json.dumps(body))
+        self.assertEqual(timeout, args.advisor_timeout)
+
+    def test_normal_cloud_run_preflights_before_planning(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                               "--advisor=openai", "--advisor-model", "gpt-6.1-sol"])
+        events = []
+        response = self.response()
+        def fake_network(request, timeout):
+            events.append("preflight")
+            return self.fake_urlopen(response, [])(request, timeout)
+        def fake_planner(_args):
+            events.append("planner")
+            return 0
+        with mock.patch.dict(kbp.os.environ, {"OPENAI_API_KEY": "test"}, clear=True):
+            with mock.patch.object(kbp.urllib.request, "urlopen", side_effect=fake_network):
+                with mock.patch.object(kbp, "run_planner", side_effect=fake_planner):
+                    self.assertEqual(kbp._run_normal_planning(args), 0)
+        self.assertEqual(events, ["preflight", "planner"])
+
+    def test_preflight_failure_aborts_before_git_or_workspace_reservation(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                               "--advisor=openai", "--advisor-model", "gpt-6.1-sol"])
+        import urllib.error
+        failures = [
+            (429, b'{"error":{"code":"credit_balance_exhausted"}}',
+             "credit_balance_exhausted"),
+            (400, b'{"error":{"message":"schema invalid"}}', "schema invalid"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(kbp.os.environ,
+                    {"OPENAI_API_KEY": "test", "KERNEL_WORKSPACE_DIR": tmp}):
+                for code, body, message in failures:
+                    with self.subTest(code=code):
+                        error = urllib.error.HTTPError(kbp.OpenAIAdvisor.API_URL,
+                            code, "error", {}, io.BytesIO(body))
+                        with mock.patch.object(kbp.urllib.request, "urlopen", side_effect=error):
+                            with mock.patch.object(kbp, "Git") as git:
+                                with mock.patch.object(kbp, "reserve_workspace_run") as reserve:
+                                    with self.assertRaises(SystemExit) as caught:
+                                        kbp._run_normal_planning(args)
+                                    self.assertIn(message, str(caught.exception))
+                                    self.assertIn("No Git analysis started", str(caught.exception))
+                                    git.assert_not_called()
+                                    reserve.assert_not_called()
+
+    def test_preflight_fails_on_invalid_structured_result_before_git(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                               "--advisor=openai", "--advisor-model", "gpt-6.1-sol"])
+        invalid = self.response(content={"decision": "TAKE", "rationale": "",
+            "prerequisite_evidence_ids": [], "binding_evidence_assessments": [],
+            "inbound_prerequisite_assessments": [], "risks": []})
+        with mock.patch.dict(kbp.os.environ, {"OPENAI_API_KEY": "test"}):
+            with mock.patch.object(kbp.urllib.request, "urlopen",
+                    side_effect=self.fake_urlopen(invalid, [])):
+                with mock.patch.object(kbp, "Git") as git:
+                    with self.assertRaisesRegex(SystemExit, "preflight field validation"):
+                        kbp._run_normal_planning(args)
+                    git.assert_not_called()
+
+    def test_openai_fallback_is_preflighted_too(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+            "--advisor-model", "kernel-planner:32k",
+            "--advisor-fallback-provider", "openai",
+            "--advisor-fallback-model", "gpt-6.1-sol"])
+        sent = []
+        with mock.patch.dict(kbp.os.environ, {"OPENAI_API_KEY": "test"}):
+            with mock.patch.object(kbp.urllib.request, "urlopen",
+                    side_effect=self.fake_urlopen(self.response(), sent)):
+                self.assertTrue(kbp.preflight_openai_advisors(args))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(json.loads(sent[0][0].data)["model"], "gpt-6.1-sol")
+        self.assertEqual(sent[0][1], args.advisor_fallback_timeout)
+
+    def test_local_only_never_uses_cloud(self):
+        args = kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+            "--advisor-model", "kernel-planner:32k"])
+        with mock.patch.dict(kbp.os.environ, {}, clear=True):
+            with mock.patch.object(kbp.urllib.request, "urlopen") as network:
+                self.assertFalse(kbp.preflight_openai_advisors(args))
+                network.assert_not_called()
+
+    def test_preflight_only_requires_a_cloud_provider(self):
+        with mock.patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                kbp.parse_args(["--advisor-preflight-only"])
+
+
+if __name__ == "__main__":
+    unittest.main()
