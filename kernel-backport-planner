@@ -43,8 +43,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.33"
-ADVISOR_PROMPT_VERSION = "21"
+VERSION = "0.4.34"
+ADVISOR_PROMPT_VERSION = "22"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -1603,8 +1603,10 @@ class Planner:
                 "apply only to fully identified board-leaf commits, not shared code. "
                 "Consumer roots are provenance, not verified prerequisites; "
                 "evidence-bound TAKE dependencies override exclusions. "
-                "Unknown board or shared-code scope is not a reason for REVIEW "
-                "or SKIP without a concrete technical issue."
+                "For unmatched board-leaf changes, the user-owned "
+                "unmatched_board policy is authoritative: REVIEW remains REVIEW, "
+                "SKIP remains SKIP, TAKE permits model evaluation. Shared "
+                "code is evaluated independently."
             ),
         }
 
@@ -3078,9 +3080,11 @@ class Planner:
                 "prerequisites; do not equate architecture support with board support. "
                 "Only explicit exclusions prove a board is outside user scope; "
                 "unlisted boards and shared code are not excluded by absent matches. "
-                "Favor TAKE for technically sound upstream changes; use REVIEW only "
-                "for specific unresolved technical or dependency questions. "
-                "Do not treat provenance edges as proof."
+                "Apply unmatched_board: REVIEW or SKIP deterministically for "
+                "unmatched board-only patches, unless a concrete, evidence-bound "
+                "TAKE-consumer prerequisite requires an evaluation. Favor TAKE for "
+                "technically sound shared infrastructure; do not treat provenance "
+                "edges as proof."
             )
             packet["commit"]["platform_relevance"] = relevance
         return packet
@@ -3110,9 +3114,28 @@ class Planner:
                 "inbound_prerequisite_assessments": [],
                 "risks": [],
             }
-        if commit.get("actual_inbound_take_prerequisite_count", 0):
+        # An explicit, evidence-backed TAKE prerequisite can justify a board
+        # patch even when the user asks to review otherwise unmatched boards.
+        # Provenance-only required_by edges do NOT qualify for this exemption.
+        if (commit.get("actual_inbound_take_prerequisite_count", 0) or
+                commit.get("verified_missing_dt_include_requirements")):
             return None
         profile = getattr(self, "platform_profile", None)
+        if (profile is not None and relevance.get("status") == "UNMATCHED_BOARD"
+                and profile.unmatched_board == "REVIEW"):
+            return {
+                "decision": "REVIEW",
+                "rationale": (
+                    "User-supplied unmatched_board: REVIEW policy: this is an "
+                    "unmatched board-only source change. No positive platform "
+                    "match or evidence-bound TAKE-consumer prerequisite was "
+                    "verified. Engineering scope approval is required; "
+                    "this is a policy review, not a model failure."
+                ),
+                "prerequisite_peers": [],
+                "inbound_prerequisite_assessments": [],
+                "risks": [],
+            }
         if (profile is not None and
                 (relevance.get("status") == "EXCLUDED_BOARD" or
                  (relevance.get("status") == "UNMATCHED_BOARD" and
@@ -3384,9 +3407,12 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
   leaf changes when no evidence-bound TAKE prerequisite requires them.
 - For CONFLICTING_PLATFORM_SCOPE, REVIEW until the user corrects overlapping
   positive and negative scope rules. Do not infer official product support.
-- For UNMATCHED_BOARD_LEAF, missing from the allowlist is not proof of
-  unsupported hardware. Favor TAKE for technically sound changes unless the
-  user explicitly configures the aggressive unmatched_board: SKIP policy.
+- For UNMATCHED_BOARD_LEAF, the explicit unmatched_board setting is
+  authoritative: TAKE allows model selection, REVIEW requires engineer scope
+  approval, and SKIP excludes unmatched board-only changes. Do not claim an
+  unmatched board is in the user's selected platform profile. An explicitly
+  evidence-backed TAKE-consumer prerequisite may exempt the patch from the
+  ordinary board policy; mere provenance cannot.
 - For VERIFY_PLATFORM_PREREQUISITE, inspect the actual code/prerequisite
   evidence. TAKE a shared/provider commit when necessary for a selected
   platform change. Do NOT take it based only on a provenance edge.
@@ -3396,8 +3422,10 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
   technical hazard or prerequisite question, naming exactly what is missing.
 - Never SKIP an evidence-bound REQUIRED prerequisite for an already-TAKE
   consumer. Reconcile conflicting recommendations using the existing rules.
-- A pure platform-scope question is NOT a technical REVIEW reason. Apply
-  the same bounded policy recheck used for the upstream-convergence policy.
+- A pure platform-scope question is NOT a *model* technical REVIEW reason;
+  unmatched_board: REVIEW is an explicit engineer-owned policy exception.
+  Other unsupported product-evidence-only REVIEWs still receive the bounded
+  upstream-convergence policy recheck.
 """
 
     @staticmethod
@@ -3447,6 +3475,37 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                               "provider_file": "present"})
         return facts
 
+    @staticmethod
+    def _platform_positive_claim_error(rationale: str, relevance: dict | None) -> str | None:
+        """Reject narrow *affirmative* allowlist claims contradicted by source.
+
+        This deliberately does not interpret broad hardware-support opinions.
+        A false positive is expensive: only explicit affirmative assertions
+        that the platform is selected/listed/included are rejected. Negated
+        assertions such as "not included in the allowlist" are not matched.
+        """
+        if not relevance or relevance.get("matches"):
+            return None
+        claims = (
+            r"\b(?:is|are|was|were)\s+(?:explicitly\s+|directly\s+|"
+            r"already\s+)?(?:selected|listed|included|configured)\s+"
+            r"(?:as\s+)?(?:a\s+)?(?:user[- ]selected\s+)?"
+            r"(?:platform\s+)?(?:in|by|on)\s+"
+            r"(?:(?:the|your)\s+)?(?:user[- ]selected\s+)?"
+            r"(?:selected\s+)?(?:platform\s+)?(?:profile|allowlist|list)\b",
+            r"\b(?:platform\s+(?:profile|allowlist)|user[- ]selected\s+"
+            r"(?:profile|platforms)|allowlist)\s+"
+            r"(?:explicitly\s+)?(?:includes?|lists?|contains?|selects?)\s+"
+            r"(?:this|the|that|a)\s+(?:board|platform|target|device)\b",
+        )
+        for pattern in claims:
+            if re.search(pattern, rationale, flags=re.IGNORECASE):
+                return ("advisor asserts a positive user platform-profile match "
+                        f"but deterministic status={relevance.get('status')} "
+                        "and matches=[]; correct the rationale using the "
+                        "supplied source evidence")
+        return None
+
     def validate_advisor_result(self, sha: str, result: dict) -> dict:
         if not isinstance(result, dict):
             raise AdvisorError(
@@ -3464,6 +3523,12 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             raise AdvisorError(
                 "advisor rationale is missing", kind="invalid-response", retryable=True
             )
+        if getattr(self, "platform_profile", None) is not None:
+            claim_error = self._platform_positive_claim_error(
+                rationale, self.platform_relevance(sha))
+            if claim_error:
+                raise AdvisorError(claim_error, kind="platform-source-claim",
+                                   retryable=True)
         raw_prereq_ids = result.get("prerequisite_evidence_ids", [])
         raw_inbound = result.get("inbound_prerequisite_assessments", [])
         raw_risks = result.get("risks", [])
@@ -3797,6 +3862,12 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                         request_prompt = (platform_policy_retry_prompt(prompt)
                             if getattr(self, "platform_profile", None) else
                             policy_retry_prompt(prompt))
+                    elif last_error.kind == "platform-source-claim":
+                        request_prompt = (prompt + "\nPLATFORM EVIDENCE RECHECK: "
+                            + str(last_error) + ". No selected platform match "
+                            "exists in the provided deterministic evidence. "
+                            "Correct the unsupported claim and reconsider "
+                            "the decision; do not invent supported boards.\n")
                     elif last_error.kind in ("binding-unassessed",
                                                    "binding-source-claim"):
                         # Include the validator's exact evidence IDs for both
@@ -4059,6 +4130,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         self, client: OllamaAdvisor, prompt: str, sha: str, *,
         reconsideration: bool = False,
         binding_conflict_context: list[dict] | None = None,
+        dependency_conflict_context: list[dict] | None = None,
     ) -> None:
         node = self.nodes[sha]
         packet = self.advisor_packet(sha)
@@ -4073,6 +4145,21 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "Give a concrete source-level explanation for REQUIRED or "
                 "NOT_REQUIRED. Product support status is irrelevant. "
                 "Do not invent downstream files or change evidence IDs.\n"
+            )
+        if dependency_conflict_context:
+            # Include exact blocked TAKE-consumer edges in the prompt and
+            # cache key. Unlike policy overrides, this recheck cannot force
+            # TAKE: the advisor must justify it from repository evidence.
+            packet["commit"]["dependency_conflict_context"] = (
+                dependency_conflict_context)
+            prompt += (
+                "\nDEPENDENCY CONTRADICTION RECHECK: A TAKE consumer has "
+                "a verified or explicitly recommended prerequisite which "
+                "you previously marked REVIEW/SKIP. Check the exact "
+                "dependency_conflict_context entries and eligible source "
+                "evidence. Do not turn the provider into TAKE merely because "
+                "of dependency provenance; explain any remaining technical "
+                "reason to REVIEW. Never invent a selected platform match.\n"
             )
         policy_result = self.advisor_policy_override(sha, packet)
         if policy_result is not None:
@@ -4272,6 +4359,48 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 client, prompt, peer_sha, reconsideration=True,
                 binding_conflict_context=context,
             )
+
+    def _advisor_reconcile_dependency_issues(
+        self, client: OllamaAdvisor, prompt: str,
+    ) -> None:
+        """One bounded source-evidence recheck for contradictory TAKE edges.
+
+        No automatic TAKE promotion: the unresolved contradiction survives in
+        the consistency audit if the model still recommends REVIEW/SKIP.
+        Only already-evaluated, actionable providers can be reconsidered;
+        an --advisor-limit does not silently add unevaluated candidates.
+        """
+        budget = getattr(self.args, "advisor_dependency_rechecks", 1)
+        if budget <= 0:
+            return
+        conflicting = collections.defaultdict(list)
+        for issue in self.advisor_consistency_issues:
+            if issue.get("kind") not in {
+                    "TAKE->REVIEW", "TAKE->SKIP", "DT_INCLUDE->REVIEW",
+                    "DT_INCLUDE->SKIP"}:
+                continue
+            provider = self.nodes.get(issue.get("prerequisite_sha"))
+            if (provider is None or provider.advisor_decision not in ("REVIEW", "SKIP")
+                    or provider.advisor_error_kind
+                    or provider.match.status != "missing"
+                    or not self.is_actionable_node(provider)):
+                continue
+            conflicting[provider.sha].append(issue)
+        for pos, (sha, issues) in enumerate(sorted(conflicting.items()), 1):
+            if pos > budget:
+                break
+            self.info(f"  advisor dependency recheck {pos}/{min(budget, len(conflicting))}: "
+                      f"{sha[:12]} ({len(issues)} blocked TAKE edge(s))")
+            if getattr(self, "performance", None):
+                self.performance.event("advisor_dependency_recheck",
+                                       sha=sha[:12], count=len(issues))
+            self._advisor_evaluate_one(
+                client, prompt, sha, reconsideration=True,
+                dependency_conflict_context=issues,
+            )
+        if conflicting:
+            self._advisor_resolve_rejected_prerequisites()
+            self._advisor_check_consistency()
 
     def _advisor_resolve_rejected_prerequisites(self) -> None:
         """Record unopposed NOT_REQUIRED decisions without hiding disagreements.
@@ -4868,7 +4997,35 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         self._advisor_reconcile_binding_conflicts(client, prompt)
         self._advisor_resolve_rejected_prerequisites()
         self._advisor_check_consistency()
+        self._advisor_reconcile_dependency_issues(client, prompt)
         self._advisor_fallback_pass(client)
+
+    def _advisor_execution_blockers(self) -> list[dict]:
+        """Execution readiness also requires successful, complete evaluation.
+
+        The model's fallback REVIEW on error is a *diagnostic placeholder*,
+        not an engineer's deliberate REVIEW recommendation. Partial advisor
+        runs and evidence-budget overflows must never report ready=true.
+        """
+        blockers = list(getattr(self, "advisor_consistency_issues", []))
+        if not getattr(self, "advisor_model", None):
+            return blockers
+        for sha in self.ordered_missing():
+            node = self.nodes.get(sha)
+            if node is None or not self.is_actionable_node(node) or node.match.status != "missing":
+                continue
+            if node.advisor_error_kind:
+                blockers.append({
+                    "kind": "ADVISOR->ERROR", "sha": sha,
+                    "error_kind": node.advisor_error_kind,
+                    "reason": node.advisor_error or "advisor evaluation failed",
+                })
+            elif node.advisor_decision is None:
+                blockers.append({
+                    "kind": "ADVISOR->UNEVALUATED", "sha": sha,
+                    "reason": "No completed advisor evaluation",
+                })
+        return blockers
 
     def aliases_for(self, sha: str) -> set[str]:
         aliases = {sha}
@@ -6035,6 +6192,14 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 )
             else:
                 lines.append("advisor-consistency: 0 unresolved TAKE->prerequisite issue(s)")
+            blockers = self._advisor_execution_blockers()
+            if blockers:
+                blocker_counts = collections.Counter(x["kind"] for x in blockers)
+                lines.append("advisor-execution: BLOCKED (" + ", ".join(
+                    f"{kind}={count}" for kind, count in sorted(blocker_counts.items())
+                ) + ")")
+            else:
+                lines.append("advisor-execution: READY (no advisor blockers)")
             if getattr(self, "advisor_failure_kinds", None):
                 lines.append(
                     "advisor-failures: "
@@ -6342,7 +6507,8 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "cache_hits": getattr(self, "advisor_cache_hits", 0),
                 "product": self.advisor_product_context(),
                 "consistency_issues": list(getattr(self, "advisor_consistency_issues", [])),
-                "execution_ready": not bool(getattr(self, "advisor_consistency_issues", [])),
+                "execution_blockers": self._advisor_execution_blockers(),
+                "execution_ready": not bool(self._advisor_execution_blockers()),
                 "cache_path": str(self.advisor_cache_path) if getattr(self, "advisor_cache_path", None) else None,
                 "error_log_path": str(self.advisor_error_log_path) if getattr(self, "advisor_error_log_path", None) else None,
                 "trace_path": str(self.advisor_trace_path) if getattr(self, "advisor_trace_path", None) else None,
@@ -7302,9 +7468,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="context token allowance for JSON output (default: 1024)",
     )
     p.add_argument(
-        "--advisor-max-request-chars", type=int, default=0,
-        help="optional complete advisor request character cap (0=disabled); "
-             "48000 is a conservative starting point for a 32K model, NOT a token limit",
+        "--advisor-dependency-rechecks", type=int, default=8,
+        help="maximum evidence-specific rechecks for REVIEW/SKIP providers "
+             "blocking TAKE consumers (default: 8; 0=disabled)",
+    )
+    p.add_argument(
+        "--advisor-max-request-chars", type=int, default=None,
+        help="complete advisor request character cap; default 120000 for "
+             "OpenAI and unlimited for Ollama (0 disables); explicit values "
+             "are never silently raised; NOT a token limit",
     )
     p.add_argument(
         "--advisor-benchmark-plan", metavar="PLAN.json",
@@ -7364,6 +7536,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         return args
     if args.advisor == "openai" and not args.advisor_model:
         args.advisor_model = "gpt-6.1-terra"
+    if args.advisor_max_request_chars is None:
+        args.advisor_max_request_chars = (120000 if args.advisor == "openai" else 0)
     if args.openai_max_output_tokens < 1:
         p.error("--openai-max-output-tokens must be positive")
     if args.platforms and not args.advisor_model:
@@ -7391,6 +7565,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         p.error("fallback context must exceed reserved output tokens")
     if args.advisor_max_request_chars < 0:
         p.error("--advisor-max-request-chars must be >= 0")
+    if args.advisor_dependency_rechecks < 0:
+        p.error("--advisor-dependency-rechecks must be >= 0")
     if args.advisor_context_tokens < 0 or args.advisor_output_reserve < 0:
         p.error("--advisor-context-tokens and --advisor-output-reserve must be >= 0")
     if args.advisor_context_tokens and (args.advisor_context_tokens <= args.advisor_output_reserve):

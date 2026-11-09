@@ -3124,7 +3124,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "21")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "22")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -4870,7 +4870,8 @@ class UserPlatformProfile0429Tests(unittest.TestCase):
         self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
         p.platform_profile = kbp.PlatformProfile("test", "a" * 64, "test", (), "REVIEW")
         packet["commit"]["actual_inbound_take_prerequisite_count"] = 0
-        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+        self.assertEqual(p.advisor_policy_override("a" * 40, packet)["decision"],
+                         "REVIEW")
 
     def test_mixed_or_architecture_only_commit_does_not_auto_skip(self):
         p = self.planner()
@@ -4966,16 +4967,22 @@ class ScopeAndFallback0431Tests(unittest.TestCase):
         self.assertEqual(p.platform_relevance("a" * 40)["status"],
                          "EXCLUDED_BOARD")
 
-    def test_unmatched_review_is_not_forced_review(self):
+    def test_unmatched_review_is_deterministic_scope_policy(self):
         p = self.planner(unmatched="REVIEW",
                          path="arch/arm64/boot/dts/vendor/other-model.dts")
         relevance = p.platform_relevance("a" * 40)
         self.assertEqual(relevance["status"], "UNMATCHED_BOARD")
-        self.assertIsNone(p.advisor_policy_override("a" * 40, {
-            "commit": {"platform_relevance": relevance,
-                       "scope": {}, "actual_inbound_take_prerequisite_count": 0}}))
-        self.assertIn("missing from the allowlist is not proof",
-                      p.advisor_system_prompt().lower())
+        packet = {"commit": {"platform_relevance": relevance, "scope": {},
+                             "actual_inbound_take_prerequisite_count": 0}}
+        result = p.advisor_policy_override("a" * 40, packet)
+        self.assertEqual(result["decision"], "REVIEW")
+        self.assertIn("unmatched_board: REVIEW", result["rationale"])
+        packet["commit"]["actual_inbound_take_prerequisite_count"] = 1
+        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
+        packet["commit"]["actual_inbound_take_prerequisite_count"] = 0
+        packet["commit"]["verified_missing_dt_include_requirements"] = [{
+            "take_consumer_shas": ["b" * 40]}]
+        self.assertIsNone(p.advisor_policy_override("a" * 40, packet))
 
     def test_old_aggressive_unmatched_skip_is_still_opt_in(self):
         p = self.planner(unmatched="SKIP",
@@ -5332,3 +5339,212 @@ class OpenAIAdvisor0433PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlannerCorrectness0434Tests(unittest.TestCase):
+    """Source-backed regressions from the completed GPT-6.1 Sol plan_03.
+
+    Original blocked providers: 960609b22be5 (Qualcomm Hamoa PCIe),
+    5722117235ac (TI AM62 R5F), f5d4227c6dca (Amlogic DTSI include).
+    """
+
+    @staticmethod
+    def bare_planner():
+        p = object.__new__(kbp.Planner)
+        p.nodes = {}
+        p.advisor_model = "gpt-6.1-sol"
+        p.platform_profile = None
+        p.args = types.SimpleNamespace(advisor_dependency_rechecks=8)
+        p.info = lambda text: None
+        p.is_actionable_node = lambda n: True
+        p.advisor_consistency_issues = []
+        p.ordered_missing = lambda: list(p.nodes)
+        return p
+
+    def test_openai_default_budget_and_explicit_override(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            params = ["--base", "v6.19", "--target", "v7.0",
+                      "--advisor", "openai", "--advisor-model", "gpt-6.1-sol"]
+            self.assertEqual(kbp.parse_args(params).advisor_max_request_chars,
+                             120000)
+            self.assertEqual(kbp.parse_args([*params, "--advisor-max-request-chars",
+                                             "48000"]).advisor_max_request_chars,
+                             48000)
+            self.assertEqual(kbp.parse_args([*params, "--advisor-max-request-chars",
+                                             "0"]).advisor_max_request_chars, 0)
+            self.assertEqual(kbp.parse_args(["--base", "v6.19", "--target", "v7.0",
+                                             "--advisor-model", "local:32k"])
+                             .advisor_max_request_chars, 0)
+
+    def test_readiness_blocks_evidence_failure_and_unevaluated(self):
+        p = self.bare_planner()
+        a, b = "a" * 40, "b" * 40
+        p.nodes = {sha: kbp.CommitNode(sha, sha) for sha in (a, b)}
+        p.nodes[a].advisor_decision = "REVIEW"
+        p.nodes[a].advisor_error = "required evidence exceeds 48000"
+        p.nodes[a].advisor_error_kind = "evidence-budget"
+        blocks = p._advisor_execution_blockers()
+        self.assertEqual({x["kind"] for x in blocks},
+                         {"ADVISOR->ERROR", "ADVISOR->UNEVALUATED"})
+        self.assertEqual(next(x for x in blocks if x["kind"] == "ADVISOR->ERROR")
+                         ["error_kind"], "evidence-budget")
+        p.nodes[a].advisor_error_kind = None
+        p.nodes[b].advisor_decision = "TAKE"
+        self.assertEqual(p._advisor_execution_blockers(), [])
+        p.advisor_consistency_issues = [{"kind": "TAKE->REVIEW"}]
+        self.assertEqual(len(p._advisor_execution_blockers()), 1)
+
+    def test_positive_profile_claim_is_rejected_only_when_unmatched(self):
+        relevance = {"status": "UNMATCHED_BOARD", "matches": []}
+        feedback = kbp.Planner._platform_positive_claim_error
+        self.assertIsNotNone(feedback(
+            "Orange Pi 5 is explicitly selected in the platform profile.",
+            relevance))
+        self.assertIsNotNone(feedback(
+            "The platform profile explicitly includes this board.", relevance))
+        self.assertIsNone(feedback(
+            "Orange Pi 5 is not included in the selected platform profile.",
+            relevance))
+        self.assertIsNone(feedback(
+            "The board is unmatched but not excluded, so TAKE can be considered.",
+            relevance))
+        self.assertIsNone(feedback(
+            "Orange Pi 5 is selected in the platform profile.",
+            {"status": "DIRECT", "matches": [{"platform": "Orange Pi 5"}]}))
+
+    def test_validator_rejects_fabricated_profile_match(self):
+        p = self.bare_planner()
+        sha = "a" * 40
+        p.platform_profile = kbp.PlatformProfile("selected", "b" * 64,
+                                                  "test", ())
+        p.platform_relevance = lambda sh: {
+            "status": "UNMATCHED_BOARD", "matches": []}
+        result = {"decision": "TAKE", "rationale": (
+            "The board is explicitly listed in the user selected platform profile."),
+            "prerequisite_evidence_ids": [],
+            "binding_evidence_assessments": [],
+            "inbound_prerequisite_assessments": [], "risks": []}
+        with self.assertRaises(kbp.AdvisorError) as caught:
+            p.validate_advisor_result(sha, result)
+        self.assertEqual(caught.exception.kind, "platform-source-claim")
+
+    def test_bounded_dependency_recheck_uses_exact_sol_issue_evidence(self):
+        p = self.bare_planner()
+        issue_specs = [
+            ("960609b22be5", "ac62730dbc71", "TAKE->REVIEW", "pcie3_port0"),
+            ("5722117235ac", "8fb034b8402e", "TAKE->REVIEW", "wkup_r5fss0"),
+            ("f5d4227c6dca", "126058f8d80a", "DT_INCLUDE->REVIEW",
+             "meson-gxl-s805y.dtsi"),
+        ]
+        calls = []
+        for prereq, consumer, kind, obj in issue_specs:
+            a, b = prereq.ljust(40, "0"), consumer.ljust(40, "1")
+            provider = kbp.CommitNode(a, "source provider")
+            provider.advisor_decision = "REVIEW"
+            p.nodes[a] = provider
+            taker = kbp.CommitNode(b, "TAKE consumer")
+            taker.advisor_decision = "TAKE"
+            p.nodes[b] = taker
+            p.advisor_consistency_issues.append({
+                "kind": kind, "prerequisite_sha": a,
+                "consumer_sha": b, "evidence_object": obj})
+        p._advisor_evaluate_one = lambda client, prompt, sha, **kwargs: calls.append(
+            (sha, kwargs["dependency_conflict_context"]))
+        p._advisor_resolve_rejected_prerequisites = lambda: None
+        p._advisor_check_consistency = lambda: None
+        p._advisor_reconcile_dependency_issues(None, "prompt")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual({context[0]["evidence_object"] for _, context in calls},
+                         {"pcie3_port0", "wkup_r5fss0", "meson-gxl-s805y.dtsi"})
+        p.args.advisor_dependency_rechecks = 1
+        calls.clear()
+        p._advisor_reconcile_dependency_issues(None, "prompt")
+        self.assertEqual(len(calls), 1)
+        p.args.advisor_dependency_rechecks = 0
+        calls.clear()
+        p._advisor_reconcile_dependency_issues(None, "prompt")
+        self.assertEqual(calls, [])
+
+    def test_dependency_recheck_never_resolves_by_fiat(self):
+        p = self.bare_planner()
+        sha = "a" * 40
+        provider = kbp.CommitNode(sha, "provider")
+        provider.advisor_decision = "REVIEW"
+        p.nodes[sha] = provider
+        p.advisor_consistency_issues = [{"kind": "DT_INCLUDE->REVIEW",
+                                         "prerequisite_sha": sha}]
+        p._advisor_evaluate_one = lambda *args, **kwargs: None
+        p._advisor_resolve_rejected_prerequisites = lambda: None
+        p._advisor_check_consistency = lambda: None
+        p._advisor_reconcile_dependency_issues(None, "prompt")
+        self.assertEqual(provider.advisor_decision, "REVIEW")
+        self.assertEqual(p.advisor_consistency_issues[0]["kind"], "DT_INCLUDE->REVIEW")
+
+    def test_policy_review_does_not_call_remote_model(self):
+        p = ScopeAndFallback0431Tests().planner(
+            unmatched="REVIEW", path="arch/arm64/boot/dts/vendor/other-board.dts")
+        sha = "a" * 40
+        p.advisor_packet = lambda _sha: {
+            "commit": {"platform_relevance": p.platform_relevance(sha),
+                       "actual_inbound_take_prerequisite_count": 0,
+                       "verified_missing_dt_include_requirements": [],
+                       "scope": {}}}
+        p.info = lambda *args: None
+        p._advisor_note_success = lambda node, result: setattr(
+            node, "advisor_decision", result["decision"])
+        class MustNotContactModel:
+            def advise(self, *args):
+                raise AssertionError("REVIEW policy must not use paid model")
+        p._advisor_evaluate_one(MustNotContactModel(), "prompt", sha)
+        self.assertEqual(p.nodes[sha].advisor_decision, "REVIEW")
+        self.assertEqual(p.nodes[sha].advisor_decision_model,
+                         "deterministic-policy")
+
+    def test_unsupported_profile_claim_gets_corrective_retry(self):
+        p = self.bare_planner()
+        sha = "a" * 40
+        p.nodes[sha] = kbp.CommitNode(sha, "board")
+        p.platform_profile = kbp.PlatformProfile("selected", "b" * 64,
+                                                  "test", ())
+        p.platform_relevance = lambda _sha: {
+            "status": "UNMATCHED_BOARD", "matches": []}
+        p.args = types.SimpleNamespace(advisor_retries=1,
+            advisor_retry_delay=0, advisor_context_tokens=0,
+            advisor_output_reserve=1024, advisor="openai")
+        p.advisor_calls = p.advisor_retries_used = 0
+        p.advisor_prerequisite_evidence = lambda sha: []
+        p.advisor_inbound_take_recommendations = lambda sha: []
+        p._advisor_hard_dt_include_facts = lambda sha: []
+        p._write_advisor_error_diagnostic = lambda *args: None
+        p._write_advisor_trace = lambda *args: None
+        class FakeCloud:
+            last_telemetry = None
+            def __init__(self):
+                self.prompts = []
+            def advise(self, prompt, packet, schema):
+                self.prompts.append(prompt)
+                return {"decision": "TAKE", "rationale": (
+                    "The board is selected in the platform profile." if
+                    len(self.prompts) == 1 else
+                    "The board is unmatched; the change is technically sound."),
+                    "prerequisite_evidence_ids": [],
+                    "binding_evidence_assessments": [],
+                    "inbound_prerequisite_assessments": [], "risks": []}
+        client = FakeCloud()
+        result = p._advisor_call_with_retries(client, "base prompt", sha, {})
+        self.assertEqual(result["decision"], "TAKE")
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("PLATFORM EVIDENCE RECHECK", client.prompts[1])
+
+    def test_mixed_shared_source_is_not_forced_review(self):
+        p = ScopeAndFallback0431Tests().planner(
+            unmatched="REVIEW", path="arch/arm64/boot/dts/vendor/other-model.dts")
+        sha = "a" * 40
+        p.nodes[sha].files.append("arch/arm64/boot/dts/vendor/soc.dtsi")
+        p._platform_match_cache.clear()
+        relevance = p.platform_relevance(sha)
+        self.assertEqual(relevance["status"], "SHARED_OR_UNKNOWN")
+        self.assertIsNone(p.advisor_policy_override(sha, {
+            "commit": {"platform_relevance": relevance,
+                       "actual_inbound_take_prerequisite_count": 0,
+                       "scope": {}}}))

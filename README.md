@@ -5,7 +5,62 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.33**.
+Current tool version: **0.4.34**.
+
+## Decision correctness and dependency rechecks (0.4.34)
+
+This release preserves the OpenAI integration and preflight from 0.4.33 and
+makes the *engineer's* platform policy authoritative. A configured
+`unmatched_board: REVIEW` now produces a **deterministic REVIEW** for a patch
+confined to unmatched `.dts`/`.dtso` board leaves. `SKIP` remains an explicit
+opt-in exclusion; `TAKE` allows the model to decide. Shared `.dtsi` files,
+drivers, and mixed shared-code patches are *not* automatically reviewed.
+A concrete, evidence-backed inbound recommendation from an already-TAKE
+consumer, or a verified missing DT source include needed by a TAKE consumer,
+exempts the provider from the ordinary board policy and permits an independent
+model decision. Mere dependency-discovery provenance does not qualify.
+
+For OpenAI primary advisors the **default** complete request-character budget
+is now **120000** when `--advisor-max-request-chars` is omitted. This is *not*
+a token limit. An explicitly supplied number, including `48000` from earlier
+launch scripts, **always takes precedence**; `0` disables this guard. Local
+Ollama's omitted-option default remains unlimited. To use the larger budget
+with your existing `run-backport-planner`, change the explicit line to:
+
+```bash
+    --advisor-max-request-chars 120000 \
+```
+
+Required evidence that cannot fit remains an `evidence-budget` advisor failure,
+recorded as a diagnostic REVIEW rather than silently truncated or reported as
+a valid model recommendation. JSON `advisor.execution_blockers` now includes
+unresolved graph contradictions, advisor failures (including budget failures),
+and unevaluated actionable candidates. `advisor.execution_ready` is **false**
+when any such blocker exists; the text worksheet reports this separately.
+The ordinary TAKE/SKIP/REVIEW counts still describe decisions, not build
+verification.
+
+After the initial advisor and graph checks, at most eight providers that remain
+REVIEW/SKIP while blocking a TAKE-consumer dependency get **one** targeted,
+source-evidence recheck each. Use `--advisor-dependency-rechecks N` to adjust
+this billable limit, or `0` to disable it. Rechecks carry the exact blocked
+edges in the model packet and therefore have separate cache identities. They
+never force a TAKE. Unresolved objections remain consistency blockers.
+The three cases from the Sol `backport_plan_03` archive (Hamoa PCIe, TI AM62
+R5F, and Amlogic DTS source include) are regression targets.
+
+The validator also rejects **explicit affirmative claims** that an unmatched
+board was selected in the user's profile when deterministic matching shows
+`matches=[]`. These receive a bounded corrective retry with the actual
+platform status. This deliberately narrow guard cannot prove every free-form
+rationale is factual, and it does not validate hardware support/certification.
+The prompt version is advanced to 22 so old model decisions cannot be silently
+reused under the revised policy.
+
+**Security:** Cloud advisor packets still transmit repository evidence and
+platform-profile context. Only send material authorized for external processing.
+**Status:** The changes are locally unit-tested, but not validated by a new
+full paid Sol run or by downstream build/backport tests.
 
 ## OpenAI structured-output preflight (0.4.33)
 
@@ -115,7 +170,7 @@ reported as `SCOPE_CONFLICT` for engineer review.
 ```yaml
 version: 1
 name: local-product-scope
-unmatched_board: TAKE  # default; REVIEW does not force a review
+unmatched_board: TAKE  # default; REVIEW now enforces engineer review
 platforms:
   - name: Example selected ARM board
     architecture: arm64
@@ -130,10 +185,11 @@ excluded_platforms:
 
 `unmatched_board: SKIP` remains an **explicit aggressive opt-in**: it skips
 unmatched board-leaf changes without positive linkage to selected platforms.
-`TAKE` (the default) and `REVIEW` leave these decisions to the advisor, with a
-TAKE preference absent concrete technical objections. This preserves existing
-`unmatched_board: REVIEW` input files without forcing a new planning cycle
-merely to alter their syntax. All source identifiers shown here are fictional.
+`TAKE` (the default) leaves these decisions to the advisor. Starting with
+0.4.34, `REVIEW` is deterministic for unmatched board-only changes without
+verified TAKE-consumer prerequisites. Existing `REVIEW` profiles will therefore
+produce different decisions by design. All source identifiers shown here are
+fictional.
 
 The new `EXCLUDED_BOARD`, `UNMATCHED_BOARD`, and `SCOPE_CONFLICT`
 classifications are visible in the worksheet and JSON plan alongside `DIRECT`,
@@ -699,8 +755,10 @@ DTS providers and unsupported automatic resolutions are surfaced explicitly.
 These changes can increase the size of the proposed plan. A zero consistency
 issue count means every active TAKE prerequisite has a viable earlier TAKE or
 an already-present peer, not that the final kernel has been compiled or tested.
-The JSON advisor section includes `execution_ready` and `consistency_issues`;
-when issues remain, the plan is not fully executable without manual review.
+The JSON advisor section includes `execution_ready`, `consistency_issues`,
+and (since 0.4.34) `execution_blockers`. Execution readiness also requires
+that no advisor errors or unevaluated actionable commits remain; failures
+reported as diagnostic REVIEW are *not* successful advisor recommendations.
 The generated worksheet and JSON plan describe the same frozen baseline.
 
 Version 0.4.15 fixes same-commit DT source includes: when a DTS and its
