@@ -4690,10 +4690,19 @@ class PlannerCompletionSound0427Tests(unittest.TestCase):
             with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
                 self.assertEqual(kbp.main(argv), 0)
                 sound.assert_called_once_with(True)
+        # Replay conflicts are an expected *result* of successful planning.
+        # Preserve rc=2 for automation, but use the completion ping.
         with mock.patch.object(kbp, "_run_normal_planning", return_value=2):
             with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
                 self.assertEqual(kbp.main(argv), 2)
-                sound.assert_called_once_with(False)
+                sound.assert_called_once_with(True)
+        # Errors still play the failure sound (including check command errors).
+        for rc in (1, 3):
+            with self.subTest(rc=rc):
+                with mock.patch.object(kbp, "_run_normal_planning", return_value=rc):
+                    with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
+                        self.assertEqual(kbp.main(argv), rc)
+                        sound.assert_called_once_with(False)
         with mock.patch.object(kbp, "_run_normal_planning", side_effect=RuntimeError("failed")):
             with mock.patch.object(kbp, "play_planner_completion_sound") as sound:
                 with self.assertRaisesRegex(RuntimeError, "failed"):

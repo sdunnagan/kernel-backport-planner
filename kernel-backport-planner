@@ -43,7 +43,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.34"
+VERSION = "0.4.34.1"
 ADVISOR_PROMPT_VERSION = "22"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
@@ -6696,6 +6696,10 @@ WORKSPACE_ERRORS = "advisor-errors.jsonl"
 # Match kernel-builder's desktop completion sounds. Missing audio is harmless.
 PLANNER_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
 
+# Planning is complete even when the backport replay exposes conflicts.
+# Keep the nonzero exit status for scripting, but do not play the failure sound.
+PLANNER_REPLAY_CONFLICT_RC = 2
+
 
 def play_planner_completion_sound(success: bool) -> None:
     """Notify once after a planning attempt, without changing its result."""
@@ -7270,7 +7274,7 @@ def run_planner(args: argparse.Namespace) -> int:
         rc = 0
         if any(n.replay == "conflict" for n in planner.nodes.values()
                if n.match.status == "missing"):
-            rc = 2
+            rc = PLANNER_REPLAY_CONFLICT_RC
         elif check_result is not None and check_result[0] != 0:
             rc = 3
         summary = performance.finish(summary_path)
@@ -7762,7 +7766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BaseException:
         play_planner_completion_sound(False)
         raise
-    play_planner_completion_sound(rc == 0)
+    # A fully generated plan with expected replay conflicts is a successful
+    # planning operation, even though the CLI reports those conflicts via rc=2.
+    play_planner_completion_sound(rc in (0, PLANNER_REPLAY_CONFLICT_RC))
     return rc
 
 

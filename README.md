@@ -5,7 +5,7 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.34**.
+Current tool version: **0.4.34.1**.
 
 ## Decision correctness and dependency rechecks (0.4.34)
 
@@ -414,6 +414,11 @@ when the complete planning operation finishes (including ZIP packaging):
 
 - Success: `/usr/share/sounds/freedesktop/stereo/complete.oga`
 - Failure: `/usr/share/sounds/freedesktop/stereo/service-logout.oga`
+
+A completed planning run plays the success sound even when simulated replay
+identifies conflicts and the CLI returns status 2. That exit status remains
+nonzero so scripts can detect unresolved conflicts. Genuine planner errors,
+failed checks, and exceptions still play the failure sound.
 
 The planner tries `canberra-gtk-play`, then `pw-play`, then `paplay`, using
 whichever audio player works. Missing files, unavailable audio, and playback
