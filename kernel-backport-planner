@@ -43,8 +43,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.34.1"
-ADVISOR_PROMPT_VERSION = "22"
+VERSION = "0.4.35"
+ADVISOR_PROMPT_VERSION = "23"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -326,6 +326,7 @@ class CommitNode:
     advisor_decision: str | None = None
     advisor_rationale: str | None = None
     advisor_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    advisor_followup_peers: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_binding_assessments: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_rejected_prerequisites: list[dict[str, str]] = dataclasses.field(default_factory=list)
     advisor_consumed_objects: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -415,11 +416,24 @@ ADVISOR_RESPONSE_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "followup_series_peers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "sha": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["sha", "reason"],
+                "additionalProperties": False,
+            },
+        },
         "risks": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "decision", "rationale", "prerequisite_evidence_ids",
-        "binding_evidence_assessments", "inbound_prerequisite_assessments", "risks"
+        "binding_evidence_assessments", "inbound_prerequisite_assessments",
+        "followup_series_peers", "risks"
     ],
     "additionalProperties": False,
 }
@@ -428,6 +442,7 @@ ADVISOR_RESPONSE_SCHEMA = {
 def advisor_response_schema(
     prerequisite_evidence: Sequence[dict[str, str]],
     inbound_recommendations: Sequence[dict[str, str]] = (),
+    followup_candidates: Sequence[dict[str, str]] = (),
 ) -> dict:
     """Build the per-commit structured-output schema.
 
@@ -472,6 +487,17 @@ def advisor_response_schema(
         inbound["maxItems"] = len(inbound_ids)
     else:
         inbound["maxItems"] = 0
+    followup = schema["properties"]["followup_series_peers"]
+    candidate_shas = list(dict.fromkeys(
+        record["sha"] for record in followup_candidates
+    ))
+    if candidate_shas:
+        followup["items"]["properties"]["sha"] = {
+            "type": "string", "enum": candidate_shas,
+        }
+        followup["maxItems"] = min(8, len(candidate_shas))
+    else:
+        followup["maxItems"] = 0
     return schema
 
 
@@ -1129,6 +1155,9 @@ def budget_advisor_packet(packet: dict, prompt: str, schema: dict,
     for peer in commit.get("same_series", []):
         if isinstance(peer, dict) and peer.get("patch_excerpt"):
             excerpts.append((peer, "patch_excerpt", "series-peer-diff"))
+    for peer in commit.get("followup_series_candidates", []):
+        if isinstance(peer, dict) and peer.get("patch_excerpt"):
+            excerpts.append((peer, "patch_excerpt", "followup-series-diff"))
     for peer in (commit.get("deterministic_consumer_context", {})
                  .get("consumers", [])):
         if isinstance(peer, dict) and peer.get("patch_excerpt"):
@@ -1403,6 +1432,9 @@ class Planner:
         self.advisor_failures = 0
         self.advisor_failure_kinds: collections.Counter[str] = collections.Counter()
         self.advisor_reconsiderations = 0
+        self.advisor_closure_rounds_run = 0
+        self.advisor_followup_discovered = 0
+        self.advisor_followup_rechecks = 0
         self.advisor_consistency_issues: list[dict[str, str]] = []
         self.advisor_error_log_path: Path | None = None
         self.advisor_error_log_entries = 0
@@ -1959,6 +1991,8 @@ class Planner:
                         and self.is_actionable_node(self.nodes[member_sha])
                     ),
                     "downstream_status": m.status,
+                    "advisor_decision": (self.nodes[member_sha].advisor_decision
+                                         if member_sha in self.nodes else None),
                     "changed_files": peer_files,
                     "scope": self.advisor_scope_context(peer_files),
                 }
@@ -1979,6 +2013,43 @@ class Planner:
                 "members": peers,
             })
         return groups
+
+    def advisor_followup_series_candidates(self, sha: str) -> list[dict[str, str]]:
+        """Expose bounded, actual upstream earlier-series commits for investigation.
+
+        Series order is *not* dependency proof. These peers can be suggested
+        only during a contradiction recheck, and will be evaluated separately.
+        Neither the model's suggestion nor this list ever implies TAKE.
+        """
+        node = self.nodes[sha]
+        found: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for label in sorted(node.series_ids):
+            members = getattr(self, "series_groups", {}).get(label, [])
+            number = next((no for no, peer in members if peer == sha), None)
+            if number is None:
+                continue
+            # Prefer nearby earlier patches, while keeping a firm per-node cap.
+            for patch, peer in sorted(members, reverse=True):
+                if patch >= number or peer in seen:
+                    continue
+                if self.match(peer).status == "present":
+                    continue
+                if not self.upstream_before(peer, sha):
+                    continue
+                if len(found) >= 8:
+                    break
+                seen.add(peer)
+                found.append({
+                    "sha": peer, "subject": self.subject(peer),
+                    "series": label, "patch": patch,
+                    "changed_files": self.changed_files(peer),
+                    # The full earlier patch may also appear in same_series.
+                    # Keep a bounded independent source excerpt for the lead.
+                    "patch_excerpt": self.patch_excerpt(
+                        peer, min(1600, self.args.advisor_max_peer_diff_chars)),
+                })
+        return found
 
     def advisor_allowed_prerequisite_peers(self, sha: str) -> list[str]:
         allowed: list[str] = []
@@ -3345,6 +3416,12 @@ Inbound prerequisite consistency:
   reason; do not dismiss it merely because this candidate is in an unsupported architecture tree.
 - If the inbound recommendation cannot be confidently reconciled, use REVIEW rather than SKIP.
 
+If commit.followup_series_candidates is provided during a dependency contradiction
+recheck, you may put up to 8 source-supported earlier missing series commits
+in followup_series_peers with an explicit technical reason for each. These are
+investigation leads, NOT proven prerequisites. Do not claim they're in the plan
+or auto-TAKE them. Return [] otherwise. Same-series ordering alone is never proof.
+
 The response must match the supplied JSON schema. Keep rationale concise and technical.
 """
         if not getattr(self, "platform_profile", None):
@@ -3530,9 +3607,11 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 raise AdvisorError(claim_error, kind="platform-source-claim",
                                    retryable=True)
         raw_prereq_ids = result.get("prerequisite_evidence_ids", [])
+        raw_followups = result.get("followup_series_peers", [])
         raw_inbound = result.get("inbound_prerequisite_assessments", [])
         raw_risks = result.get("risks", [])
-        if not isinstance(raw_prereq_ids, list) or not isinstance(raw_inbound, list) or not isinstance(raw_risks, list):
+        if (not isinstance(raw_prereq_ids, list) or not isinstance(raw_inbound, list)
+                or not isinstance(raw_risks, list) or not isinstance(raw_followups, list)):
             raise AdvisorError(
                 "advisor prerequisite_evidence_ids/inbound_prerequisite_assessments/risks must be arrays",
                 kind="invalid-response",
@@ -3704,6 +3783,31 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 retryable=True,
             )
 
+        followups: list[dict[str, str]] = []
+        # Normal primary evaluations have no follow-up list. Avoid needless
+        # Git/history/diff lookups for every one of ~1,000 commits.
+        eligible = ({item["sha"] for item in
+                     self.advisor_followup_series_candidates(sha)}
+                    if raw_followups else set())
+        if len(raw_followups) > 8:
+            raise AdvisorError("too many advisor follow-up candidates",
+                               kind="invalid-prerequisite", retryable=True)
+        used_followups: set[str] = set()
+        for item in raw_followups:
+            if not isinstance(item, dict):
+                raise AdvisorError("invalid series follow-up entry",
+                                   kind="invalid-prerequisite", retryable=True)
+            peer_sha = item.get("sha")
+            reason = item.get("reason")
+            if (peer_sha not in eligible or peer_sha in used_followups
+                    or not isinstance(reason, str) or not reason.strip()
+                    or len(reason) > 1000):
+                raise AdvisorError(
+                    "advisor follow-up requires a unique, actual missing earlier "
+                    "same-series commit and a technical reason",
+                    kind="invalid-prerequisite", retryable=True)
+            used_followups.add(peer_sha)
+            followups.append({"sha": peer_sha, "reason": reason.strip()})
         risks = [x.strip() for x in raw_risks if isinstance(x, str) and x.strip()]
         return {
             "decision": decision,
@@ -3713,6 +3817,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             "prerequisite_evidence_ids": [x for x in raw_prereq_ids
                                            if isinstance(x, str)] if decision != "SKIP" else [],
             "prerequisite_peers": prereqs,
+            "followup_series_peers": followups,
             "binding_evidence_assessments": binding_assessments,
             "inbound_prerequisite_assessments": inbound_assessments,
             "risks": risks,
@@ -3841,6 +3946,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         schema = advisor_response_schema(
             self.advisor_prerequisite_evidence(sha),
             self.advisor_inbound_take_recommendations(sha),
+            packet.get("commit", {}).get("followup_series_candidates", []),
         )
         last_error: AdvisorError | None = None
         policy_rechecks = 0
@@ -4018,6 +4124,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             f"Advisor failed ({exc.kind}); manual review required. {exc}"
         )
         node.advisor_prerequisites = []
+        node.advisor_followup_peers = []
         node.advisor_binding_assessments = []
         node.advisor_rejected_prerequisites = []
         node.advisor_inbound_assessments = []
@@ -4117,6 +4224,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         node.advisor_decision = result["decision"]
         node.advisor_rationale = result["rationale"]
         node.advisor_prerequisites = result["prerequisite_peers"]
+        node.advisor_followup_peers = result.get("followup_series_peers", [])
         node.advisor_binding_assessments = result.get("binding_evidence_assessments", [])
         node.advisor_rejected_prerequisites = []
         node.advisor_inbound_assessments = result["inbound_prerequisite_assessments"]
@@ -4147,6 +4255,8 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "Do not invent downstream files or change evidence IDs.\n"
             )
         if dependency_conflict_context:
+            packet["commit"]["followup_series_candidates"] = (
+                self.advisor_followup_series_candidates(sha))
             # Include exact blocked TAKE-consumer edges in the prompt and
             # cache key. Unlike policy overrides, this recheck cannot force
             # TAKE: the advisor must justify it from repository evidence.
@@ -4159,7 +4269,11 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "dependency_conflict_context entries and eligible source "
                 "evidence. Do not turn the provider into TAKE merely because "
                 "of dependency provenance; explain any remaining technical "
-                "reason to REVIEW. Never invent a selected platform match.\n"
+                "reason to REVIEW. Never invent a selected platform match. "
+                "You may nominate genuinely needed earlier patches from "
+                "followup_series_candidates, with a specific code-level reason. "
+                "These are INVESTIGATION LEADS, not evidence-backed TAKE "
+                "dependencies, and each will be independently evaluated.\n"
             )
         policy_result = self.advisor_policy_override(sha, packet)
         if policy_result is not None:
@@ -4177,6 +4291,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             schema = advisor_response_schema(
                 self.advisor_prerequisite_evidence(sha),
                 self.advisor_inbound_take_recommendations(sha),
+                packet.get("commit", {}).get("followup_series_candidates", []),
             )
             try:
                 # Leave room for one explicit policy correction on retry.
@@ -4444,7 +4559,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 consumer.advisor_rejected_prerequisites.append(rejected)
             consumer.advisor_prerequisites = active
 
-    def _advisor_promote_prerequisites(self) -> int:
+    def _advisor_promote_prerequisites(self, remaining: int | None = None) -> int:
         """Select evidence-backed earlier peers, without deciding TAKE for them.
 
         Advisor prerequisites are semantic claims, not automatically approved
@@ -4481,10 +4596,88 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 promoted += 1
                 self.info(f"  advisor promoted prerequisite candidate {peer_sha[:12]} "
                           f"for {consumer.sha[:12]} (pending independent evaluation)")
+                if remaining is not None and promoted >= remaining:
+                    self._record_advisor_prerequisite_recommendations(consumer.sha)
+                    return promoted
             # The peer was not previously actionable, so its inbound evidence
             # was deliberately omitted during the original recording pass.
             self._record_advisor_prerequisite_recommendations(consumer.sha)
         return promoted
+
+    def _advisor_promote_followup_peers(self, remaining: int) -> int:
+        """Admit model-nominated leads for independent analysis, never TAKE.
+
+        Only REVIEW/SKIP providers with actual blocked TAKE edges may admit
+        missing earlier series peers. These are actionable investigation
+        candidates with *tentative* provenance, not hard required_by edges.
+        Their original dependency remains unresolved until independently
+        evaluated and source-verified.
+        """
+        if remaining <= 0:
+            return 0
+        blocked = {
+            issue.get("prerequisite_sha") for issue in self.advisor_consistency_issues
+            if issue.get("kind") in {"TAKE->REVIEW", "TAKE->SKIP",
+                                    "DT_INCLUDE->REVIEW", "DT_INCLUDE->SKIP"}
+        }
+        added = 0
+        for sha in sorted(blocked):
+            provider = self.nodes.get(sha)
+            if provider is None or provider.advisor_decision not in {"REVIEW", "SKIP"}:
+                continue
+            eligible = {item["sha"] for item in
+                        self.advisor_followup_series_candidates(sha)}
+            for lead in provider.advisor_followup_peers:
+                peer_sha = lead["sha"]
+                if peer_sha not in eligible:
+                    continue
+                previous = self.nodes.get(peer_sha)
+                if previous is not None and (self.is_actionable_node(previous)
+                                              or previous.match.status == "present"):
+                    continue
+                peer = self.ensure_node(
+                    peer_sha, reason="advisor-investigation:series",
+                    required_by=provider.sha)
+                if self.is_actionable_node(peer):
+                    added += 1
+                    self.info(f"  advisor investigation candidate {peer_sha[:12]} "
+                              f"from blocked provider {sha[:12]} (no TAKE implied)")
+                    if added >= remaining:
+                        return added
+        return added
+
+    def _advisor_reconcile_followup_issues(self, client: OllamaAdvisor,
+                                           prompt: str) -> None:
+        """Recheck a blocked provider once after its new leads are evaluated."""
+        limit = getattr(self.args, "advisor_followup_rechecks", 8)
+        done = getattr(self, "_advisor_followup_rechecked", set())
+        if len(done) >= limit:
+            return
+        blocked = collections.defaultdict(list)
+        for issue in self.advisor_consistency_issues:
+            if issue.get("kind") in {"TAKE->REVIEW", "TAKE->SKIP",
+                                    "DT_INCLUDE->REVIEW", "DT_INCLUDE->SKIP"}:
+                blocked[issue["prerequisite_sha"]].append(issue)
+        for sha, issues in sorted(blocked.items()):
+            if sha in done or len(done) >= limit:
+                continue
+            provider = self.nodes.get(sha)
+            if provider is None or not provider.advisor_followup_peers:
+                continue
+            peers = [self.nodes.get(x["sha"]) for x in provider.advisor_followup_peers]
+            if not peers or any(peer is None or peer.advisor_decision is None
+                                for peer in peers):
+                continue
+            done.add(sha)
+            self.info(f"  advisor post-closure recheck {len(done)}/{limit}: "
+                      f"{sha[:12]} ({len(peers)} evaluated follow-up(s))")
+            self._advisor_evaluate_one(client, prompt, sha, reconsideration=True,
+                                       dependency_conflict_context=issues)
+        self._advisor_followup_rechecked = done
+        self.advisor_followup_rechecks = len(done)
+        if done:
+            self._advisor_resolve_rejected_prerequisites()
+            self._advisor_check_consistency()
 
     def _advisor_check_consistency(self) -> None:
         """Validate every TAKE edge against the actual executable JSON order.
@@ -4704,6 +4897,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         """Capture the primary decision before evaluating a different model."""
         fields = (
             "advisor_decision", "advisor_rationale", "advisor_prerequisites",
+            "advisor_followup_peers",
             "advisor_binding_assessments", "advisor_rejected_prerequisites",
             "advisor_inbound_assessments", "advisor_risks", "advisor_error",
             "advisor_error_kind", "advisor_attempts", "advisor_budget",
@@ -4998,6 +5192,58 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         self._advisor_resolve_rejected_prerequisites()
         self._advisor_check_consistency()
         self._advisor_reconcile_dependency_issues(client, prompt)
+
+        # Rechecks can introduce prerequisite recommendations that did not
+        # exist during the original closure. Close *after* rechecks as well.
+        # The two 0.4.34 TAKE->ABSENT providers arose at precisely this point.
+        max_new = getattr(self.args, "advisor_closure_max_new_commits", 32)
+        rounds = getattr(self.args, "advisor_closure_rounds", 8)
+        added_after_rechecks = 0
+        for round_no in range(1, rounds + 1):
+            remaining = max_new - added_after_rechecks
+            if remaining <= 0:
+                self.info("  advisor closure new-commit budget exhausted; "
+                          "remaining issues require engineering review")
+                break
+            promoted = self._advisor_promote_prerequisites(remaining)
+            leads = self._advisor_promote_followup_peers(max(0, remaining - promoted))
+            added_after_rechecks += promoted + leads
+            if not promoted and not leads:
+                break
+            self.advisor_closure_rounds_run = round_no
+            self.advisor_followup_discovered = (
+                getattr(self, "advisor_followup_discovered", 0) + leads)
+            self.dependency_closure()
+            self.build_series_index()
+            pending = [sha for sha in self.ordered_missing()
+                       if self.nodes[sha].advisor_decision is None]
+            if self.args.advisor_limit is not None:
+                pending = pending[:max(0, self.args.advisor_limit
+                                        - len(ordered) - advised_after_initial)]
+            if not pending:
+                self.info("  advisor closure has unevaluated new commits; "
+                          "execution readiness will remain blocked")
+                break
+            self.info(f"  advisor post-recheck closure {round_no}/{rounds}: "
+                      f"{len(pending)} new candidate(s)")
+            for sha in self.advisor_order(pending):
+                self._advisor_evaluate_one(client, prompt, sha)
+                advised_after_initial += 1
+            self._advisor_reconciliation_pass(client, prompt, list(dict.fromkeys(
+                [*ordered, *self.ordered_missing()])))
+            self._advisor_resolve_rejected_prerequisites()
+            self._advisor_check_consistency()
+            self._advisor_reconcile_followup_issues(client, prompt)
+        else:
+            self.info("  advisor post-recheck closure round limit reached; "
+                      "remaining issues require engineering review")
+        if added_after_rechecks and self.args.simulate:
+            self.reset_replay_annotations()
+            self.replay_final_verification = True
+            _, conflicts = self.replay_once()
+            self.info(f"  final post-recheck expanded-plan replay: {len(conflicts)} conflict(s)")
+        self._advisor_resolve_rejected_prerequisites()
+        self._advisor_check_consistency()
         self._advisor_fallback_pass(client)
 
     def _advisor_execution_blockers(self) -> list[dict]:
@@ -5202,12 +5448,15 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         evidence into a selected dependency.
         """
         return bool(re.fullmatch(r"(?:conflict-)?hunk-context:\d+", reason)
-                    or reason.startswith("dt-binding-candidate:"))
+                    or reason.startswith("dt-binding-candidate:")
+                    or reason.startswith("advisor-investigation:"))
 
     @classmethod
     def is_actionable_node(cls, node: CommitNode) -> bool:
         """Return true when a node belongs to the proposed backport plan."""
-        return node.direct or cls.dependency_kind(node) == "dependency"
+        return (node.direct or cls.dependency_kind(node) == "dependency"
+                or any(reason.startswith("advisor-investigation:")
+                       for reason in node.reasons))
 
     @staticmethod
     def dependency_kind(node: CommitNode) -> str:
@@ -6495,7 +6744,10 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                 "model_calls": getattr(self, "advisor_calls", 0),
                 "retries_used": getattr(self, "advisor_retries_used", 0),
                 "policy_rechecks": getattr(self, "advisor_policy_rechecks", 0),
-                "reconsiderations": getattr(self, "advisor_reconsiderations", 0),
+                "reconsiderations": self.advisor_reconsiderations,
+                "closure_rounds": getattr(self, "advisor_closure_rounds_run", 0),
+                "followup_candidates": getattr(self, "advisor_followup_discovered", 0),
+                "followup_rechecks": getattr(self, "advisor_followup_rechecks", 0),
                 "binding_disagreement_rechecks": getattr(self, "advisor_binding_rechecks", 0),
                 "binding_coverage_consumer_count": len(getattr(
                     self, "dt_binding_candidate_links", {})),
@@ -6536,6 +6788,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                     "series_ids": sorted(n.series_ids),
                     "advisor_decision": n.advisor_decision,
                     "advisor_rationale": n.advisor_rationale,
+                    "advisor_followup_peers": n.advisor_followup_peers,
                     "advisor_prerequisites": n.advisor_prerequisites,
                     "advisor_binding_assessments": n.advisor_binding_assessments,
                     "advisor_binding_coverage_candidates": list(getattr(
@@ -7477,6 +7730,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
              "blocking TAKE consumers (default: 8; 0=disabled)",
     )
     p.add_argument(
+        "--advisor-closure-rounds", type=int, default=8,
+        help="maximum post-recheck dependency closure passes (default: 8)",
+    )
+    p.add_argument(
+        "--advisor-closure-max-new-commits", type=int, default=32,
+        help="maximum new advisor-directed candidates after rechecks "
+             "(default: 32)",
+    )
+    p.add_argument(
+        "--advisor-followup-rechecks", type=int, default=8,
+        help="maximum additional rechecks of blocked providers after their "
+             "newly discovered upstream series peers are evaluated (default: 8)",
+    )
+    p.add_argument(
         "--advisor-max-request-chars", type=int, default=None,
         help="complete advisor request character cap; default 120000 for "
              "OpenAI and unlimited for Ollama (0 disables); explicit values "
@@ -7571,6 +7838,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         p.error("--advisor-max-request-chars must be >= 0")
     if args.advisor_dependency_rechecks < 0:
         p.error("--advisor-dependency-rechecks must be >= 0")
+    if (args.advisor_closure_rounds < 0
+            or args.advisor_closure_max_new_commits < 0
+            or args.advisor_followup_rechecks < 0):
+        p.error("advisor closure budgets must be >= 0")
     if args.advisor_context_tokens < 0 or args.advisor_output_reserve < 0:
         p.error("--advisor-context-tokens and --advisor-output-reserve must be >= 0")
     if args.advisor_context_tokens and (args.advisor_context_tokens <= args.advisor_output_reserve):

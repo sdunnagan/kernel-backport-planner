@@ -3124,7 +3124,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "22")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "23")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -5557,3 +5557,244 @@ class PlannerCorrectness0434Tests(unittest.TestCase):
             "commit": {"platform_relevance": relevance,
                        "actual_inbound_take_prerequisite_count": 0,
                        "scope": {}}}))
+
+
+class AdvisorClosure0435Tests(unittest.TestCase):
+    """Regression scenarios based on all eleven Sol plan_04 blocked edges.
+
+    These are graph/state-machine tests. They do not claim that the upstream
+    source code was independently verified or that Sol's decisions are correct.
+    """
+
+    def test_all_eleven_sol_0434_issues_remain_explicit_blockers(self):
+        specs = [
+            ('5ab246749569cff9f815618f02ba0d7cf20e5edd', '0a096ab7a3a6e2859c3c88988e548c5c213138bc', 'TAKE->REVIEW'),
+            ('370960c153db82fbdd55539be4d4eb41ef3a7e40', 'a22fd0e3c495dd2d706c49c26663476e24d96e7d', 'TAKE->REVIEW'),
+            ('1544bca2f188e47256b61ae5e24ea93a292bb559', '6f4b2a487352fa775bea4393d2455d334ccc97d4', 'TAKE->ABSENT'),
+            ('1544bca2f188e47256b61ae5e24ea93a292bb559', '106f43ab41fa968c5ce3920e281870b99a519b13', 'TAKE->ABSENT'),
+            ('8fb034b8402ead1028ed63394a177947b1450fcd', '5722117235aca01893dbda9dbc7e4790b0b9d43c', 'TAKE->REVIEW'),
+            ('469acaa12502e05eefd439693361fe4b851a4fd5', 'b693c703accb08cbd52f0b94d810d6abbca3bfb9', 'TAKE->REVIEW'),
+            ('8bc79ab67d78e2991b9d6cf0b63789189212375a', '90860aef630c5c9e58d05044f2866fcbfa7aa4d9', 'TAKE->REVIEW'),
+            ('d35abc0b1ddff64934dc6ab637f7b5ce1cd1d91f', '3d176751e541362ff40c2478d6a2de41f8c62318', 'TAKE->REVIEW'),
+            ('23e8b4371dbd5907d633262f36903144a378a114', 'b693c703accb08cbd52f0b94d810d6abbca3bfb9', 'TAKE->REVIEW'),
+            ('4cbc84471bb606ddfaf424709dd8d56b56d7ae7b', '90860aef630c5c9e58d05044f2866fcbfa7aa4d9', 'TAKE->REVIEW'),
+            ('126058f8d80aa7176bb230ca03ec939a70435177', 'f5d4227c6dcab047579cca7b8e31a476ecdebf7b', 'DT_INCLUDE->REVIEW'),
+        ]
+        self.assertEqual(len(specs), 11)
+        p = object.__new__(kbp.Planner)
+        p.nodes = {}
+        p.advisor_model = None
+        p.advisor_prerequisite_evidence = lambda _sha: []
+        for consumer_sha, provider_sha, kind in specs:
+            consumer = p.nodes.setdefault(consumer_sha,
+                kbp.CommitNode(consumer_sha, "TAKE consumer", direct=True))
+            consumer.advisor_decision = "TAKE"
+            if kind == "TAKE->ABSENT":
+                consumer.advisor_prerequisites.append({
+                    "sha": provider_sha, "evidence_id": "ev-" + provider_sha,
+                    "evidence_kind": "macro", "reason": "source use",})
+                continue
+            provider = p.nodes.setdefault(provider_sha,
+                kbp.CommitNode(provider_sha, "unresolved prerequisite", direct=True))
+            provider.advisor_decision = "REVIEW"
+            if kind == "DT_INCLUDE->REVIEW":
+                provider.add_reason(
+                    "dt-include:arch/arm64/boot/dts/amlogic/meson-gxl-s805y.dtsi",
+                    consumer_sha)
+            else:
+                consumer.advisor_prerequisites.append({
+                    "sha": provider_sha, "evidence_id": "ev-" + provider_sha,
+                    "evidence_kind": "function", "reason": "source use",})
+        p.ordered_missing = lambda: list(p.nodes)
+        p._advisor_check_consistency()
+        self.assertEqual(
+            collections.Counter(x["kind"] for x in p.advisor_consistency_issues),
+            {"TAKE->REVIEW": 8, "TAKE->ABSENT": 2,
+             "DT_INCLUDE->REVIEW": 1})
+        self.assertFalse(not p._advisor_execution_blockers())
+
+    def test_followup_candidates_are_bounded_verified_earlier_series_commits(self):
+        p = object.__new__(kbp.Planner)
+        first, second, current = "a" * 40, "b" * 40, "c" * 40
+        n = kbp.CommitNode(current, "crypto library", direct=True)
+        n.series_ids.add("S071")
+        p.nodes = {current: n}
+        p.series_groups = {"S071": [(2, first), (3, second), (4, current)]}
+        p.args = types.SimpleNamespace(advisor_max_peer_diff_chars=1000)
+        p.match = lambda sha: kbp.Match(status="present" if sha == first else "missing")
+        p.upstream_before = lambda sha, child: sha == second and child == current
+        p.subject = lambda sha: "rename conflicting sha1 symbol"
+        p.changed_files = lambda sha: ["lib/crypto/sha1.c"]
+        p.patch_excerpt = lambda sha, limit: "-void sha1_init(void)\n+void sha1_init_raw(void)"
+        leads = p.advisor_followup_series_candidates(current)
+        self.assertEqual([item["sha"] for item in leads], [second])
+        self.assertIn("sha1_init_raw", leads[0]["patch_excerpt"])
+        # Same-series adjacency alone does not create a graph node.
+        self.assertEqual(list(p.nodes), [current])
+
+    def test_structured_followup_contract_limits_shas_to_offered_leads(self):
+        lead = "a" * 40
+        schema = kbp.advisor_response_schema([], [], [
+            {"sha": lead, "subject": "rename conflicting symbol"}])
+        self.assertEqual(schema["properties"]["followup_series_peers"]["maxItems"], 1)
+        self.assertEqual(schema["properties"]["followup_series_peers"]
+                         ["items"]["properties"]["sha"]["enum"], [lead])
+        compatible = kbp.openai_compatible_schema(schema)
+        self.assertIn("followup_series_peers", compatible["required"])
+
+    def test_validator_rejects_unverified_model_suggested_sha(self):
+        p = object.__new__(kbp.Planner)
+        sha, earlier = "b" * 40, "a" * 40
+        p.nodes = {sha: kbp.CommitNode(sha, "source consumer", direct=True)}
+        p.platform_profile = None
+        p.advisor_prerequisite_evidence = lambda _sha: []
+        p.advisor_inbound_take_recommendations = lambda _sha: []
+        p.advisor_followup_series_candidates = lambda _sha: [
+            {"sha": earlier, "subject": "rename collision"}]
+        baseline = {"decision": "REVIEW", "rationale": "Unresolved symbol collision",
+                    "prerequisite_evidence_ids": [], "binding_evidence_assessments": [],
+                    "inbound_prerequisite_assessments": [], "risks": []}
+        fake = {**baseline, "followup_series_peers": [
+            {"sha": "f" * 40, "reason": "invented from memory"}]}
+        with self.assertRaises(kbp.AdvisorError):
+            p.validate_advisor_result(sha, fake)
+        vague = {**baseline, "followup_series_peers": [
+            {"sha": earlier, "reason": ""}]}
+        with self.assertRaises(kbp.AdvisorError):
+            p.validate_advisor_result(sha, vague)
+        valid = {**baseline, "followup_series_peers": [
+            {"sha": earlier, "reason": "Earlier sha1_init rename avoids API collision"}]}
+        result = p.validate_advisor_result(sha, valid)
+        self.assertEqual(result["followup_series_peers"][0]["sha"], earlier)
+        self.assertEqual(p.nodes[sha].advisor_decision, None)
+
+    def test_model_lead_is_tentative_investigation_not_hard_dependency(self):
+        provider_sha, consumer_sha, lead_sha = "b" * 40, "c" * 40, "a" * 40
+        p = object.__new__(kbp.Planner)
+        provider = kbp.CommitNode(provider_sha, "sha1 library", direct=True)
+        provider.advisor_decision = "REVIEW"
+        provider.advisor_followup_peers = [
+            {"sha": lead_sha, "reason": "rename conflict"}]
+        consumer = kbp.CommitNode(consumer_sha, "sha1 caller", direct=True)
+        consumer.advisor_decision = "TAKE"
+        p.nodes = {provider_sha: provider, consumer_sha: consumer}
+        p.advisor_consistency_issues = [{"kind": "TAKE->REVIEW",
+                                         "prerequisite_sha": provider_sha,
+                                         "consumer_sha": consumer_sha}]
+        p.advisor_followup_series_candidates = lambda sha: [{"sha": lead_sha}]
+        p.info = lambda _msg: None
+        def ensure(sha, reason, required_by):
+            peer = p.nodes.setdefault(sha, kbp.CommitNode(sha, "sha1 init rename"))
+            peer.add_reason(reason, required_by,
+                            tentative=p.is_tentative_dependency_reason(reason))
+            return peer
+        p.ensure_node = ensure
+        self.assertEqual(p._advisor_promote_followup_peers(1), 1)
+        new = p.nodes[lead_sha]
+        self.assertIsNone(new.advisor_decision)
+        self.assertEqual(new.required_by, set())
+        self.assertEqual(new.triggered_by, {provider_sha})
+        self.assertEqual(p.dependency_kind(new), "dependency-candidate")
+        self.assertTrue(p.is_actionable_node(new))
+        self.assertEqual(p._advisor_promote_followup_peers(1), 0)
+
+    def test_followup_recheck_waits_for_model_assessment_and_never_forces_take(self):
+        p = object.__new__(kbp.Planner)
+        provider_sha, lead_sha, consumer_sha = "b" * 40, "a" * 40, "c" * 40
+        provider = kbp.CommitNode(provider_sha, "provider", direct=True)
+        provider.advisor_decision = "REVIEW"
+        provider.advisor_followup_peers = [{"sha": lead_sha, "reason": "rename"}]
+        lead = kbp.CommitNode(lead_sha, "rename source")
+        lead.add_reason("advisor-investigation:series", provider_sha, tentative=True)
+        consumer = kbp.CommitNode(consumer_sha, "consumer", direct=True)
+        consumer.advisor_decision = "TAKE"
+        p.nodes = {provider_sha: provider, lead_sha: lead, consumer_sha: consumer}
+        p.args = types.SimpleNamespace(advisor_followup_rechecks=8)
+        p.advisor_consistency_issues = [{"kind": "TAKE->REVIEW",
+                                         "prerequisite_sha": provider_sha,
+                                         "consumer_sha": consumer_sha}]
+        p.info = lambda _msg: None
+        p._advisor_resolve_rejected_prerequisites = lambda: None
+        p._advisor_check_consistency = lambda: None
+        calls = []
+        p._advisor_evaluate_one = lambda *args, **kwargs: calls.append(args[2])
+        p._advisor_reconcile_followup_issues(None, "prompt")
+        self.assertEqual(calls, [])
+        lead.advisor_decision = "TAKE"
+        p._advisor_reconcile_followup_issues(None, "prompt")
+        p._advisor_reconcile_followup_issues(None, "prompt")
+        self.assertEqual(calls, [provider_sha])
+        self.assertEqual(provider.advisor_decision, "REVIEW")
+        self.assertEqual(p.advisor_followup_rechecks, 1)
+
+    def test_late_take_prerequisites_are_promoted_after_initial_rechecks(self):
+        """Reproduce plan_04's two TAKE->ABSENT providers added after closure."""
+        p = object.__new__(kbp.Planner)
+        consumer_sha, binding_sha, macro_sha = "c" * 40, "a" * 40, "b" * 40
+        consumer = kbp.CommitNode(consumer_sha, "TI board", direct=True)
+        p.nodes = {consumer_sha: consumer}
+        p.advisor_model = "model"
+        p.args = types.SimpleNamespace(advisor_commit=None, advisor_limit=None,
+            advisor_closure_rounds=8, advisor_closure_max_new_commits=8,
+            advisor_followup_rechecks=0, simulate=False)
+        p.info = lambda _msg: None
+        p.ordered_missing = lambda: [sha for sha in (binding_sha, macro_sha, consumer_sha)
+                                      if sha in p.nodes]
+        p.advisor_order = lambda seq: list(seq)
+        p.advisor_system_prompt = lambda: "advisor"
+        p.advisor_prerequisite_evidence = lambda sha: ([
+            {"peer_sha": binding_sha, "evidence_id": "ev-binding",
+             "kind": "compatible-binding", "object": "ti,am62d2-evm",
+             "selected_use": "board compatible", "peer_provides": "schema"},
+            {"peer_sha": macro_sha, "evidence_id": "ev-macro",
+             "kind": "macro", "object": "AM62DX_IOPAD",
+             "selected_use": "macro use", "peer_provides": "macro"}]
+            if sha == consumer_sha else [])
+        p.advisor_allowed_prerequisite_peers = lambda sha: (
+            [binding_sha, macro_sha] if sha == consumer_sha else [])
+        p._record_advisor_prerequisite_recommendations = lambda sha: None
+        p._advisor_reconciliation_pass = lambda *args: None
+        p._advisor_reconcile_binding_conflicts = lambda *args: None
+        p.dependency_closure = lambda: None
+        p.build_series_index = lambda: None
+        p._advisor_fallback_pass = lambda *args: None
+        calls = []
+        def evaluate(client, prompt, sha):
+            calls.append(sha)
+            p.nodes[sha].advisor_decision = "TAKE"
+        p._advisor_evaluate_one = evaluate
+        def ensure(sha, reason, required_by):
+            node = p.nodes.setdefault(sha, kbp.CommitNode(sha, "source peer"))
+            node.add_reason(reason, required_by)
+            return node
+        p.ensure_node = ensure
+        def inject(client, prompt):
+            consumer.advisor_prerequisites = [
+                {"sha": binding_sha, "evidence_id": "ev-binding",
+                 "evidence_kind": "compatible-binding"},
+                {"sha": macro_sha, "evidence_id": "ev-macro",
+                 "evidence_kind": "macro"}]
+            consumer.advisor_binding_assessments = [{
+                "evidence_id": "ev-binding", "disposition": "REQUIRED",
+                "reason": "selected DTS compatible"}]
+            p._advisor_check_consistency()
+        p._advisor_reconcile_dependency_issues = inject
+        with mock.patch.object(kbp, "make_advisor_client", return_value=object()):
+            p.run_advisor()
+        self.assertEqual(calls, [consumer_sha, binding_sha, macro_sha])
+        self.assertEqual(p.advisor_consistency_issues, [])
+        self.assertTrue(all(p.nodes[sha].advisor_decision == "TAKE"
+                            for sha in (consumer_sha, binding_sha, macro_sha)))
+        self.assertEqual(p.advisor_closure_rounds_run, 1)
+
+    def test_zero_closure_budgets_are_valid_and_negative_values_rejected(self):
+        base = ["--base", "v6.19", "--target", "v7.0"]
+        args = kbp.parse_args([*base, "--advisor-closure-rounds", "0",
+                                  "--advisor-closure-max-new-commits", "0",
+                                  "--advisor-followup-rechecks", "0"])
+        self.assertEqual(args.advisor_closure_rounds, 0)
+        for flag in ("--advisor-closure-rounds", "--advisor-closure-max-new-commits",
+                     "--advisor-followup-rechecks"):
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    kbp.parse_args([*base, flag, "-1"])

@@ -5,7 +5,58 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.34.1**.
+Current tool version: **0.4.35**.
+
+## Bounded dependency closure after advisor rechecks (0.4.35)
+
+Version 0.4.35 addresses two problems found in the complete GPT-6.1 Sol
+`backport_plan_04` archive. First, a targeted recheck sometimes adds a new
+TAKE prerequisite **after** the original advisor-promotion loop has finished.
+The planner now performs additional, bounded dependency closure **after**
+targeted rechecks, independently evaluates newly admitted provider commits,
+rebuilds its static dependency and series information, and reruns replay
+verification if the selected graph expands. This targets the two previously
+absent TI AM62D2 binding/macro providers.
+
+Second, a REVIEW provider can have its own concrete integration obstacle in
+an earlier patch that never entered the graph. During a dependency-conflict
+recheck, the advisor now receives a bounded selection of **actual, missing,
+earlier commits in the same upstream patch series**, with their upstream SHAs
+and excerpts. A new structured-output `followup_series_peers` field lets it
+nominate up to eight such commits with a technical explanation. The planner
+validates each SHA against the Git series and ancestry, then introduces the
+selected peers as **investigation candidates** for independent evaluation.
+These are *tentative leads*, **not** verified required dependencies and **not**
+automatic TAKEs. Normal source-backed prerequisite evidence retains the
+stronger required-by relationship. A targeted second recheck can reconsider
+an unresolved provider after the candidate decisions are available. Remaining
+technical contradictions continue blocking `advisor.execution_ready`.
+
+The new controls are:
+
+```text
+--advisor-closure-rounds 8
+--advisor-closure-max-new-commits 32
+--advisor-followup-rechecks 8
+```
+
+The first two bound post-recheck closure iterations and advisor-directed graph
+growth; the third caps additional billable rechecks of blocked providers after
+their new investigation candidates have been evaluated. Existing
+`--advisor-dependency-rechecks 8` still limits the initial source-specific
+recheck pass. Set any new control to `0` to disable that mechanism. A
+`--advisor-limit` still prevents unbounded model evaluation, but may leave
+new commits unevaluated and thus prevents execution readiness.
+
+Prompt version **23** invalidates old model-cache entries. JSON reports
+include `advisor.closure_rounds`, `advisor.followup_candidates`, and
+`advisor.followup_rechecks`, plus `advisor_followup_peers` for individual
+commits. These additions do **not** assert that Git replay, DT compilation,
+or any downstream build has succeeded. The 11 unresolved edges from the Sol
+0.4.34 run are covered by graph-consistency regression cases, but only a new
+full plan against the actual upstream/downstream repositories can establish
+whether those cases have been resolved. No live paid OpenAI requests were
+performed during this implementation.
 
 ## Decision correctness and dependency rechecks (0.4.34)
 
