@@ -5,7 +5,49 @@ kernel subsystem updates. It is intended as a replacement/companion for
 path-only tools such as `find-backports` when a subsystem rebase needs upstream
 prerequisites that do not themselves touch the requested focus paths.
 
-Current tool version: **0.4.35**.
+Current tool version: **0.4.36**.
+
+## Board-scoped DT selection and patch-context dependencies (0.4.36)
+
+The first supervised `kernel-backporter` dry run of `backport_plan_05` exposed
+an overly broad Rockchip dependency chain. The regulator-node cleanup
+(`5c96e6330197`) touched many board files, including one that referred to an
+ArmSoM LM7 DTSI. The old planner treated the pre-existing include in that
+upstream board file as a hard dependency and recommended importing the LM7
+board provider (`4b6167b3a00f`) even though the consumer was not established
+as relevant to the configured platforms. The Rock 5B refactor
+(`aadfbdcf7e1e`) showed the same issue at the selection root.
+
+Version 0.4.36 separates **board policy** from **upstream patch context**:
+
+- DT-only changes to board DTS/DTSO files (optionally with DT Makefile
+  registration), board-qualified DTSI files such as
+  `rk3588-armsom-lm7.dtsi` or `rk3588-rock-5b.dtsi`, and mixed multi-board
+  cleanups are now subject to `unmatched_board` when no positive platform
+  match exists. A dependency candidate's *provenance* root does not bypass
+  this policy. Explicit `unmatched_board: REVIEW` therefore yields an
+  engineer-owned REVIEW instead of an unexamined TAKE.
+- Patches confined to SoC-level DTSI files (for example `rk3576.dtsi` or
+  `rk3576-pinctrl.dtsi`) remain eligible as shared infrastructure. The
+  board/SoC filename heuristic is intentionally conservative; naming alone
+  is not proof of product support or semantic necessity.
+- A missing DT include is treated as a hard source prerequisite **only if
+  the consumer patch introduces the include**. An include inherited from the
+  upstream file's earlier history is recorded as `patch-context-dt-include`
+  in the worksheet and `patch_context_dt_includes` in JSON. It can explain
+  cherry-pick conflicts or hunk prerequisites, but no longer automatically
+  imports unrelated boards as hard semantic dependencies.
+- Newly added DT includes still receive exact-path upstream provider
+  discovery, independent advisor evaluation, ordering, and consistency
+  checks. A TAKE for a genuinely selected consumer can still justify a board
+  provider despite the ordinary unmatched-board policy.
+
+These changes affect advisor decisions by design. The prompt version is 24,
+so previous advisor-cache results are not silently reused. Run a new plan
+before executing changed selections. `execution_ready` continues to mean
+only *known* dependency consistency; engineering review, conflict resolution,
+and kernel builds are still required. Do not substitute these rules for
+verified product support data.
 
 ## Bounded dependency closure after advisor rechecks (0.4.35)
 
@@ -211,11 +253,12 @@ remain candidates for engineer approval, not mandatory cherry-picks.
 New optional `excluded_platforms` entries have the same syntax as `platforms`.
 They express *explicit negative scope* using public or otherwise authorized
 user knowledge. A deterministic exclusion requires a commit confined to
-board-leaf `.dts`/`.dtso` files **all** identified by exclusion evidence, no
-positive profile match, and no candidate or evidence-bound TAKE prerequisite
-that would require retaining it. Changes to shared `.dtsi`, drivers, and
-mixed-board commits are not excluded merely because an excluded platform
-appears in the patch. Overlapping selected and excluded board matches are
+board-scoped `.dts`/`.dtso` or clearly board-qualified `.dtsi` files
+**all** identified by exclusion evidence, no
+positive profile match, and no evidence-bound TAKE prerequisite that would
+require retaining it. Shared SoC `.dtsi`, driver changes, and partially
+excluded mixed-board changes are not excluded merely because an excluded
+platform appears in the patch. Overlapping selected and excluded board matches are
 reported as `SCOPE_CONFLICT` for engineer review.
 
 ```yaml
@@ -235,9 +278,9 @@ excluded_platforms:
 ```
 
 `unmatched_board: SKIP` remains an **explicit aggressive opt-in**: it skips
-unmatched board-leaf changes without positive linkage to selected platforms.
+unmatched board-scoped DT changes without positive linkage to selected platforms.
 `TAKE` (the default) leaves these decisions to the advisor. Starting with
-0.4.34, `REVIEW` is deterministic for unmatched board-only changes without
+0.4.34, `REVIEW` is deterministic for unmatched board changes without
 verified TAKE-consumer prerequisites. Existing `REVIEW` profiles will therefore
 produce different decisions by design. All source identifiers shown here are
 fictional.
@@ -396,23 +439,24 @@ existing plan snapshots and backporter journals are never rewritten.
 - **DEPENDENCY_CANDIDATE:** Discovery provenance reaches a matching platform
   commit. The advisor must examine whether this is a *real* prerequisite;
   matching symbols, common files or a `required_by` edge alone do not prove it.
-- **EXCLUDED_BOARD:** Explicitly excluded board-leaf `.dts`/`.dtso` changes
+- **EXCLUDED_BOARD:** Explicitly excluded board-scoped DT source changes
   with no competing selected-platform evidence or required TAKE prerequisite.
   Normally a deterministic SKIP; an inbound TAKE prerequisite requires advisor
   reconciliation first.
 - **SCOPE_CONFLICT:** The same board is selected and excluded. Engineer review
   is required to correct the user profile; no selection is silently inferred.
-- **UNMATCHED_BOARD:** Board-leaf sources not identified by either list. This
+- **UNMATCHED_BOARD:** Board-scoped DT sources not identified by either list,
+  including board-qualified DTSI files and multi-board DT-only cleanups. This
   is not proof of unsupported hardware. The default `unmatched_board: TAKE`
   favors inclusion when technically sound. The aggressive `SKIP` option
   excludes such unmatched leaf changes absent an inbound TAKE prerequisite.
-- **SHARED_OR_UNKNOWN:** Shared drivers, kernel infrastructure, `.dtsi` files,
-  mixed-source commits, and unclear platform ownership are not automatically
+- **SHARED_OR_UNKNOWN:** Shared drivers, kernel infrastructure, SoC-level
+  `.dtsi` files, mixed DT/non-DT commits, and unclear platform ownership are not automatically
   skipped. Their technical relevance and actual prerequisites remain for the
   advisor and engineer to evaluate.
 
 The matcher also inspects `excluded_platforms` and requires all changed
-board-leaf files to be accounted for before a deterministic exclusion.
+board-scoped files to be accounted for before a deterministic exclusion.
 
 The source matcher checks the **full** user profile, including when the bounded
 advisor packet previews only the first 32 applicable entries. A profile is not
@@ -798,9 +842,11 @@ existing `--format` and `--worksheet-output` options remain unchanged; the two o
 paths must be distinct.
 
 Version 0.4.14 closes gaps exposed by plan-driven execution. It resolves DTS/DTSI
-preprocessor includes from the full upstream source to exact file-adding commits
+preprocessor includes introduced by the selected patch to exact file-adding commits
 when those files are absent from the frozen downstream baseline. The provider is
 selected as a dependency, but still receives an independent advisor decision.
+As of 0.4.36, includes present only in the prior upstream file are recorded
+as non-binding patch-application context rather than required provider edges.
 Advisor-nominated same-series prerequisites are similarly promoted for bounded
 follow-up evaluation only when tied to deterministic evidence. TAKE is never
 assigned simply because another commit requests the peer. The final consistency

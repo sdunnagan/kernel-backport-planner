@@ -43,8 +43,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-VERSION = "0.4.35"
-ADVISOR_PROMPT_VERSION = "23"
+VERSION = "0.4.36"
+ADVISOR_PROMPT_VERSION = "24"
 
 DT_INCLUDE_CLOSURE_MAX_FILES = 64
 
@@ -343,6 +343,9 @@ class CommitNode:
     advisor_fallback_history: list[dict] = dataclasses.field(default_factory=list)
     advisor_escalation_reasons: list[str] = dataclasses.field(default_factory=list)
     symbol_dependency_proofs: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    # Informational: pre-existing DT includes encountered in patch context,
+    # not verified source dependencies introduced by this commit.
+    dt_patch_context_includes: list[dict[str, str]] = dataclasses.field(default_factory=list)
 
     def add_reason(
         self, reason: str, parent: str | None = None, *, tentative: bool = False
@@ -1587,12 +1590,58 @@ class Planner:
             ),
         }
 
+    @staticmethod
+    def _board_qualified_dtsi(path: str) -> bool:
+        """Recognize *clearly* board-qualified DTSI names, not SoC includes.
+
+        A DTSI extension does not imply shared infrastructure.  Conversely,
+        generic SoC/pinctrl DTSI files must not become board-only merely
+        because they live under boot/dts.  This is intentionally conservative;
+        uncertain names remain SHARED_OR_UNKNOWN for advisor evaluation.
+        """
+        if not re.fullmatch(r"arch/[^/]+/boot/dts/.+\.dtsi", path):
+            return False
+        name = posixpath.basename(path)[:-5]
+        # SoC-family prefix, followed by a *device/board* qualifier.  Keep
+        # common SoC fragments out of the platform-policy board gate.
+        match = re.match(
+            r"^(?:rk\d{4}[a-z]?s?|px30|sm\d{4}|sc\d{4}|sdm\d{3,4}|"
+            r"qcs\d{3,4}|mt\d{4}|imx\d+[a-z0-9]*|k3-[a-z0-9]+)-(.+)$",
+            name, flags=re.IGNORECASE,
+        )
+        if not match:
+            return False
+        qualifier = match.group(1).lower()
+        shared = {
+            "pinctrl", "clock", "clocks", "power", "gpu", "cpu", "cpus",
+            "main", "mcu", "wkup", "bus", "soc", "dmc", "audio", "display",
+            "usb", "storage", "thermal", "iommu", "pmu", "interconnect",
+        }
+        return qualifier.split("-", 1)[0] not in shared
+
+    @classmethod
+    def _board_scoped_dt_files(cls, files: Sequence[str]) -> bool:
+        """Detect DT-only board/refactor patches, including mixed board cleanups.
+
+        These are candidates for user board policy, NOT proof of unsupported
+        hardware.  SoC-only DTSI and patches mixing drivers with DT sources
+        remain independently evaluated shared work.
+        """
+        return (bool(files) and all(
+            re.fullmatch(r"arch/[^/]+/boot/dts/.+\.dts(?:i|o)?", path)
+            or re.fullmatch(r"arch/[^/]+/boot/dts/.+/Makefile", path)
+            for path in files
+        ) and any(
+            path.endswith((".dts", ".dtso")) or cls._board_qualified_dtsi(path)
+            for path in files
+        ))
+
     def platform_relevance(self, sha: str) -> dict | None:
         """Classify matching evidence, not certification or dependency proof.
 
-        An unmatched board *leaf* is distinguishable from shared code. Matching
-        a symbol in added text or a user path glob is positive evidence only;
-        deterministic required_by edges are provenance, not a verified need.
+        Board-scoped changes include DTSI board refactors and pure-DT multi-
+        board cleanups, but not common SoC-only DTSI providers. Provenance
+        roots cannot exempt an unlisted board from explicit user policy.
         """
         profile = getattr(self, "platform_profile", None)
         if profile is None:
@@ -1602,10 +1651,7 @@ class Planner:
         matches = self._platform_matches(sha, files)
         excluded = self._platform_excluded_matches(sha, files)
         roots = self._platform_candidate_roots(sha) if not matches else []
-        board_only = bool(files) and all(
-            re.fullmatch(r"arch/[^/]+/boot/dts/.+\.dts(?:o)?", path)
-            for path in files
-        )
+        board_only = self._board_scoped_dt_files(files)
         excluded_board = (board_only and bool(excluded) and
                           self._excluded_board_covers_all(sha, files, excluded))
         # A user can supply overlapping positive and negative globs. Do not
@@ -1614,12 +1660,15 @@ class Planner:
             status = "SCOPE_CONFLICT"
         elif matches:
             status = "DIRECT"
-        elif roots:
-            status = "DEPENDENCY_CANDIDATE"
         elif excluded_board:
             status = "EXCLUDED_BOARD"
         elif board_only:
+            # A provenance root is not an allowlist match.  In particular,
+            # a board-only DTSI rename does not become generic infrastructure
+            # because another unlisted board patch depends on it.
             status = "UNMATCHED_BOARD"
+        elif roots:
+            status = "DEPENDENCY_CANDIDATE"
         else:
             status = "SHARED_OR_UNKNOWN"
         return {
@@ -1635,10 +1684,12 @@ class Planner:
                 "apply only to fully identified board-leaf commits, not shared code. "
                 "Consumer roots are provenance, not verified prerequisites; "
                 "evidence-bound TAKE dependencies override exclusions. "
-                "For unmatched board-leaf changes, the user-owned "
-                "unmatched_board policy is authoritative: REVIEW remains REVIEW, "
-                "SKIP remains SKIP, TAKE permits model evaluation. Shared "
-                "code is evaluated independently."
+                "For board-scoped DT changes (including board DTSI files and "
+                "multi-board-only cleanups), the user-owned unmatched_board "
+                "policy is authoritative even when discovery provenance points "
+                "to a selected consumer: REVIEW remains REVIEW, SKIP remains "
+                "SKIP, TAKE permits model evaluation. SoC-only DTSI and "
+                "shared code are evaluated independently."
             ),
         }
 
@@ -3127,6 +3178,7 @@ class Planner:
                     self, "dt_binding_candidate_links", {}).get(sha, [])),
                 "verified_missing_dt_include_requirements": (
                     self._advisor_hard_dt_include_facts(sha)),
+                "patch_context_dt_includes": list(n.dt_patch_context_includes),
                 "deterministic_dt_include_requirements": [
                     {"include_path": reason[len("dt-include:"):],
                      "take_consumer_shas": sorted(
@@ -3152,7 +3204,8 @@ class Planner:
                 "Only explicit exclusions prove a board is outside user scope; "
                 "unlisted boards and shared code are not excluded by absent matches. "
                 "Apply unmatched_board: REVIEW or SKIP deterministically for "
-                "unmatched board-only patches, unless a concrete, evidence-bound "
+                "unmatched board-scoped DT patches, including board-qualified "
+                "DTSI files and multi-board cleanups, unless a concrete, evidence-bound "
                 "TAKE-consumer prerequisite requires an evaluation. Favor TAKE for "
                 "technically sound shared infrastructure; do not treat provenance "
                 "edges as proof."
@@ -3198,7 +3251,8 @@ class Planner:
                 "decision": "REVIEW",
                 "rationale": (
                     "User-supplied unmatched_board: REVIEW policy: this is an "
-                    "unmatched board-only source change. No positive platform "
+                    "unmatched board-scoped DT source change (which may involve "
+                    "a board DTSI or multiple boards). No positive platform "
                     "match or evidence-bound TAKE-consumer prerequisite was "
                     "verified. Engineering scope approval is required; "
                     "this is a policy review, not a model failure."
@@ -3215,7 +3269,7 @@ class Planner:
                 "decision": "SKIP",
                 "rationale": (
                     "User-supplied platform policy: this commit changes only "
-                    "board-leaf DTS/DTSO files without a configured positive "
+                    "board-scoped DT source files without a configured positive "
                     "platform match or required TAKE prerequisite. It is "
                     "explicitly excluded by the profile, or the engineer set "
                     "unmatched_board: SKIP (aggressive unlisted-board policy)."
@@ -3486,13 +3540,19 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
   positive and negative scope rules. Do not infer official product support.
 - For UNMATCHED_BOARD_LEAF, the explicit unmatched_board setting is
   authoritative: TAKE allows model selection, REVIEW requires engineer scope
-  approval, and SKIP excludes unmatched board-only changes. Do not claim an
+  approval, and SKIP excludes unmatched board-scoped DT changes, including
+  board-qualified DTSI files and multi-board-only cleanups. Do not claim an
   unmatched board is in the user's selected platform profile. An explicitly
   evidence-backed TAKE-consumer prerequisite may exempt the patch from the
   ordinary board policy; mere provenance cannot.
 - For VERIFY_PLATFORM_PREREQUISITE, inspect the actual code/prerequisite
   evidence. TAKE a shared/provider commit when necessary for a selected
   platform change. Do NOT take it based only on a provenance edge.
+- Distinguish a semantic dependency from patch-application context. An
+  unchanged DTS #include in a file touched by a broad cleanup is not proof
+  that the unrelated board provider is required by the desired downstream
+  feature; patch_context_dt_includes are informational only. A newly added
+  include in a selected consumer is stronger dependency evidence.
 - For SHARED_OR_UNKNOWN_RELEVANCE, favor TAKE for technically sound generic
   subsystem fixes and infrastructure. Missing board-specific evidence alone
   is neither SKIP nor REVIEW evidence. Use REVIEW for a specific unresolved
@@ -5806,6 +5866,33 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                         added += 1
         return added
 
+    def _dt_new_includes_by_path(self, sha: str) -> dict[str, set[str]]:
+        """Parse added #include lines from the entire commit, per touched file.
+
+        An include existing only in upstream's final file text is not a new
+        prerequisite of a cleanup patch.  It may be context needed to apply
+        the *unmodified* upstream patch and deserves engineering attention,
+        but is not sufficient to import unrelated board support.
+        """
+        cache = getattr(self, "_dt_new_includes_cache", None)
+        if cache is None:
+            cache = self._dt_new_includes_cache = {}
+        if sha not in cache:
+            patch = self.git.run([
+                "show", "--format=", "--no-ext-diff", "--unified=0", sha,
+            ])
+            current = None
+            additions: dict[str, set[str]] = collections.defaultdict(set)
+            for line in patch.splitlines():
+                match = DIFF_FILE_RE.match(line)
+                if match:
+                    current = match.group(2)
+                elif (current and line.startswith("+") and
+                      not line.startswith("+++")):
+                    additions[current].update(self._include_paths(line[1:]))
+            cache[sha] = dict(additions)
+        return cache[sha]
+
     def add_dt_include_dependencies(self, snapshot: Sequence[CommitNode]) -> int:
         """Resolve missing DT source includes to their exact introducing commits.
 
@@ -5822,6 +5909,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
         for node in snapshot:
             if node.match.status != "missing":
                 continue
+            added_includes = self._dt_new_includes_by_path(node.sha)
             for use_path in node.files:
                 if not self._is_dt_source_path(use_path):
                     continue
@@ -5836,6 +5924,18 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                     if not resolved or resolved == use_path:
                         continue
                     if self._tree_file_text(self.replay_start, resolved) is not None:
+                        continue
+                    if include not in added_includes.get(use_path, set()):
+                        # Upstream's file contains the include, but this commit
+                        # did not introduce it. This is at most cherry-pick
+                        # context for the touched board, not a new semantic
+                        # source dependency of the commit being evaluated.
+                        detail = {
+                            "use_path": use_path, "include_path": resolved,
+                            "reason": "include not introduced by this patch",
+                        }
+                        if detail not in node.dt_patch_context_includes:
+                            node.dt_patch_context_includes.append(detail)
                         continue
                     # The consumer may add the included file in the same patch.
                     # That file is available during its cherry-pick, not a
@@ -6523,6 +6623,12 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
             if n.replay != "not-run":
                 extra = f" ({', '.join(n.conflict_files)})" if n.conflict_files else ""
                 lines.append(f"      replay: {n.replay}{extra}")
+            for item in n.dt_patch_context_includes:
+                lines.extend(self._worksheet_advisor_lines(
+                    "patch-context-dt-include",
+                    f'{item["use_path"]} -> {item["include_path"]} '
+                    "(unchanged include; not a hard prerequisite)",
+                ))
             if n.merge_risk:
                 lines.append("      later merge-resolution risk: " + ", ".join(x[:12] for x in n.merge_risk))
             if n.subject_hints:
@@ -6810,6 +6916,7 @@ USER-OWNED PLATFORM SCOPE MODE (OVERRIDES UPSTREAM-CONVERGENCE BIAS ABOVE):
                     "advisor_escalation_reasons": n.advisor_escalation_reasons,
                     "advisor_budget": getattr(n, "advisor_budget", None),
                     "symbol_dependency_proofs": n.symbol_dependency_proofs,
+                    "patch_context_dt_includes": n.dt_patch_context_includes,
                 }
                 for sha, n in self.nodes.items()
             },

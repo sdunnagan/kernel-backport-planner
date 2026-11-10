@@ -77,6 +77,7 @@ class CandidateSelectionTests(unittest.TestCase):
         expanded = []
         planner.add_explicit_fixes_closure = lambda frontier: expanded.extend(n.sha for n in frontier) or 0
         planner.add_static_dependencies = lambda frontier: 0
+        planner.add_dt_include_dependencies = lambda frontier: 0
 
         kbp.Planner.dependency_closure(planner)
         self.assertEqual(expanded, [direct.sha])
@@ -3124,7 +3125,7 @@ class AdvisorPolicy0418Tests(unittest.TestCase):
         self.assertFalse(kbp.policy_only_review_objection(result))
 
     def test_prompt_has_updated_policy_and_cache_version(self):
-        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "23")
+        self.assertEqual(kbp.ADVISOR_PROMPT_VERSION, "24")
         prompt = kbp.Planner.advisor_system_prompt(None)
         self.assertIn("SKIP or REVIEW merely because", prompt)
         self.assertIn("unresolved technical or dependency question", prompt)
@@ -5545,18 +5546,18 @@ class PlannerCorrectness0434Tests(unittest.TestCase):
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("PLATFORM EVIDENCE RECHECK", client.prompts[1])
 
-    def test_mixed_shared_source_is_not_forced_review(self):
+    def test_mixed_dt_board_and_soc_source_requires_scope_review(self):
         p = ScopeAndFallback0431Tests().planner(
             unmatched="REVIEW", path="arch/arm64/boot/dts/vendor/other-model.dts")
         sha = "a" * 40
         p.nodes[sha].files.append("arch/arm64/boot/dts/vendor/soc.dtsi")
         p._platform_match_cache.clear()
         relevance = p.platform_relevance(sha)
-        self.assertEqual(relevance["status"], "SHARED_OR_UNKNOWN")
-        self.assertIsNone(p.advisor_policy_override(sha, {
+        self.assertEqual(relevance["status"], "UNMATCHED_BOARD")
+        self.assertEqual(p.advisor_policy_override(sha, {
             "commit": {"platform_relevance": relevance,
                        "actual_inbound_take_prerequisite_count": 0,
-                       "scope": {}}}))
+                       "scope": {}}})["decision"], "REVIEW")
 
 
 class AdvisorClosure0435Tests(unittest.TestCase):
@@ -5798,3 +5799,144 @@ class AdvisorClosure0435Tests(unittest.TestCase):
             with mock.patch("sys.stderr", new_callable=io.StringIO):
                 with self.assertRaises(SystemExit):
                     kbp.parse_args([*base, flag, "-1"])
+
+class BoardScopeAndDTContext0436Tests(unittest.TestCase):
+    """Rock 5B/ArmSoM regression: source prerequisites vs patch context."""
+
+    def test_board_dtsi_and_multi_board_cleanup_are_scoped(self):
+        p = ScopeAndFallback0431Tests().planner(unmatched="REVIEW")
+        examples = {
+            "4b" : ["arch/arm64/boot/dts/rockchip/rk3588-armsom-lm7.dtsi"],
+            "8b" : ["arch/arm64/boot/dts/rockchip/rk3588-rock-5b.dtsi"],
+            "5c" : ["arch/arm64/boot/dts/rockchip/rk3588-armsom-w3.dts",
+                    "arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dts",
+                    "arch/arm64/boot/dts/rockchip/rk3588s-nanopi-r6.dtsi"],
+        }
+        p._platform_candidate_roots = lambda sha: [{
+            "sha": "a" * 40, "platform": "selected elsewhere",
+            "confidence": "provenance_only",
+        }]
+        for key, files in examples.items():
+            sha = (key * 20)[:40]
+            p.nodes[sha] = kbp.CommitNode(sha, key, files=files)
+            relevance = p.platform_relevance(sha)
+            self.assertEqual(relevance["status"], "UNMATCHED_BOARD", key)
+            self.assertTrue(relevance["candidate_roots"], key)
+            packet = {"commit": {"platform_relevance": relevance,
+                                 "actual_inbound_take_prerequisite_count": 0,
+                                 "scope": {}}}
+            self.assertEqual(p.advisor_policy_override(sha, packet)["decision"],
+                             "REVIEW", key)
+
+    def test_board_and_dt_makefile_registration_remain_scoped(self):
+        p = ScopeAndFallback0431Tests().planner(unmatched="REVIEW")
+        sha = "c" * 40
+        p.nodes[sha] = kbp.CommitNode(sha, "new unlisted board", files=[
+            "arch/arm64/boot/dts/rockchip/rk3588-armsom-lm7.dtsi",
+            "arch/arm64/boot/dts/rockchip/rk3588-armsom-w3.dts",
+            "arch/arm64/boot/dts/rockchip/Makefile",
+        ])
+        self.assertEqual(p.platform_relevance(sha)["status"], "UNMATCHED_BOARD")
+
+    def test_soc_only_dt_infrastructure_is_not_board_leaf(self):
+        p = ScopeAndFallback0431Tests().planner(unmatched="REVIEW")
+        for i, path in enumerate((
+            "arch/arm64/boot/dts/rockchip/rk3576.dtsi",
+            "arch/arm64/boot/dts/rockchip/rk3576-pinctrl.dtsi",
+            "arch/arm64/boot/dts/ti/k3-am62-main.dtsi",
+            "arch/arm64/boot/dts/rockchip/rk3588s.dtsi",
+        )):
+            sha = str(i) * 40
+            p.nodes[sha] = kbp.CommitNode(sha, path, files=[path])
+            self.assertEqual(p.platform_relevance(sha)["status"],
+                             "SHARED_OR_UNKNOWN", path)
+
+    def test_selected_board_still_matches_directly(self):
+        p = ScopeAndFallback0431Tests().planner(unmatched="REVIEW")
+        sha = "a" * 40
+        p.nodes[sha] = kbp.CommitNode(sha, "selected", files=[
+            "arch/arm64/boot/dts/vendor/selected-board-a.dts"])
+        self.assertEqual(p.platform_relevance(sha)["status"], "DIRECT")
+
+    def test_unchanged_include_in_cleanup_is_patch_context_not_hard_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = DependencyClosure0415Tests().git_repo(tmp)
+            folder = root / "arch/arm64/boot/dts/rockchip"
+            folder.mkdir(parents=True)
+            (folder / "rk3588-armsom-lm7.dtsi").write_text('/ { lm7 { }; };\n')
+            (folder / "rk3588-armsom-w3.dts").write_text(
+                '/dts-v1/;\n#include "rk3588-armsom-lm7.dtsi"\n'
+                '/ { regulator { regulator-name = "old"; }; };\n')
+            commit("Add ArmSoM board and DTSI")
+            (folder / "rk3588-armsom-w3.dts").write_text(
+                '/dts-v1/;\n#include "rk3588-armsom-lm7.dtsi"\n'
+                '/ { regulator { regulator-name = "new"; }; };\n')
+            cleanup_sha = commit("Adapt regulator nodenames")
+            use_path = "arch/arm64/boot/dts/rockchip/rk3588-armsom-w3.dts"
+            provider_path = "arch/arm64/boot/dts/rockchip/rk3588-armsom-lm7.dtsi"
+            n = kbp.CommitNode(cleanup_sha, "cleanup", direct=True, files=[use_path])
+            p = object.__new__(kbp.Planner)
+            p.git, p.replay_start, p.nodes = kbp.Git(root), baseline, {cleanup_sha: n}
+            p._tree_file_text = lambda tree, path: p.git.run([
+                "show", f"{tree}:{path}"], check=False) or None
+            p.ensure_node = lambda *args, **kwargs: self.fail(
+                "An unchanged include must not promote an unrelated provider")
+            self.assertEqual(p.add_dt_include_dependencies([n]), 0)
+            self.assertEqual(n.required_by, set())
+            self.assertEqual(n.dt_patch_context_includes, [{
+                "use_path": use_path,
+                "include_path": provider_path,
+                "reason": "include not introduced by this patch",
+            }])
+            self.assertEqual(p.add_dt_include_dependencies([n]), 0)
+            self.assertEqual(len(n.dt_patch_context_includes), 1)
+            n.advisor_decision = "TAKE"
+            p.ordered_missing = lambda: [cleanup_sha]
+            p._advisor_check_consistency()
+            self.assertEqual(p.advisor_consistency_issues, [])
+
+    def test_newly_added_include_still_creates_hard_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = DependencyClosure0415Tests().git_repo(tmp)
+            folder = root / "arch/arm64/boot/dts/rockchip"
+            folder.mkdir(parents=True)
+            use_path = "arch/arm64/boot/dts/rockchip/rk3588-armsom-w3.dts"
+            provider_path = "arch/arm64/boot/dts/rockchip/rk3588-armsom-lm7.dtsi"
+            (folder / "rk3588-armsom-w3.dts").write_text('/dts-v1/;\n/ { };\n')
+            baseline = commit("Base board")
+            (folder / "rk3588-armsom-lm7.dtsi").write_text('/ { lm7 { }; };\n')
+            provider_sha = commit("Add exact included file")
+            (folder / "rk3588-armsom-w3.dts").write_text(
+                '/dts-v1/;\n#include "rk3588-armsom-lm7.dtsi"\n/ { };\n')
+            consumer_sha = commit("Add explicit include")
+            consumer = kbp.CommitNode(consumer_sha, "consumer", direct=True,
+                                      files=[use_path])
+            p = object.__new__(kbp.Planner)
+            p.git, p.replay_start, p.nodes = kbp.Git(root), baseline, {consumer_sha: consumer}
+            provider = kbp.CommitNode(provider_sha, "provider", files=[provider_path])
+            def ensure(sha, reason, required_by):
+                self.assertEqual(sha, provider_sha)
+                provider.add_reason(reason, required_by)
+                p.nodes[sha] = provider
+                return provider
+            p.ensure_node = ensure
+            self.assertEqual(p.add_dt_include_dependencies([consumer]), 1)
+            self.assertEqual(provider.required_by, {consumer_sha})
+            self.assertIn("dt-include:" + provider_path, provider.reasons)
+            self.assertFalse(consumer.dt_patch_context_includes)
+
+    def test_c_parser_ignores_unchanged_include_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git, commit, baseline = DependencyClosure0415Tests().git_repo(tmp)
+            folder = root / "arch/arm64/boot/dts/rockchip"
+            folder.mkdir(parents=True)
+            path = folder / "rk3588-rock-5b.dts"
+            path.write_text('#include "rk3588.dtsi"\n/ { };\n')
+            commit("base board")
+            path.write_text('#include "rk3588.dtsi"\n/ { model = "updated"; };\n')
+            sha = commit("update model")
+            p = object.__new__(kbp.Planner)
+            p.git = kbp.Git(root)
+            includes = p._dt_new_includes_by_path(sha)
+            self.assertNotIn("rk3588.dtsi", includes.get(
+                "arch/arm64/boot/dts/rockchip/rk3588-rock-5b.dts", set()))
